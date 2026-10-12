@@ -125,6 +125,8 @@ declare module 'claude-code' {
       sessionStartedAt: number
       /** Card ids the person said should apply: sent with every request this session. */
       pinned: string[]
+      keyLater: boolean
+      hasKey: boolean
     }
   }
 }

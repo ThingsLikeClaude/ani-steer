@@ -61,6 +61,8 @@ const isBandOpen = atom({ plugin: 'jev-steer', key: 'isBandOpen' } as const, fal
 const display = atom({ plugin: 'jev-steer', key: 'display' } as const, DEFAULT_DISPLAY)
 const expandedSections = atom({ plugin: 'jev-steer', key: 'expandedSections' } as const, [] as string[])
 const pinned = atom({ plugin: 'jev-steer', key: 'pinned' } as const, [] as string[])
+const keyLater = atom({ plugin: 'jev-steer', key: 'keyLater' } as const, false)
+const hasKey = atom({ plugin: 'jev-steer', key: 'hasKey' } as const, true)
 
 let project = 'unknown'
 let root = ''
@@ -432,8 +434,9 @@ type Result = { judgments: Judgment[]; candidates: Card[]; reqIds: string[] }
  */
 async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'submit' | 'commit' = 'submit', prevAttached: readonly string[] = []): Promise<Result | null> {
   const key = await $.env.get('TYPESAFE_API_KEY')
+  await update($, hasKey, () => Boolean(key))
   if (!key) {
-    await update($, view, v => ({ ...v, error: 'Jev 키가 없어요 · /jev-key로 설정' }))
+    await update($, view, v => ({ ...v, error: 'Jev 키가 없어요 · /jev-steer:ani-key로 설정' }))
     return null
   }
   const seq = mode === 'commit' ? latestSeq : ++latestSeq
@@ -935,6 +938,7 @@ async function loadReqs($: EngineInterface): Promise<Requirement[]> {
 async function ping($: EngineInterface) {
   const key = await $.env.get('TYPESAFE_API_KEY')
   const at = await $.clock.now()
+  await update($, hasKey, () => Boolean(key))
   if (!key) return update($, beat, () => ({ ok: false, ms: 0, at, detail: '키 없음' }))
   try {
     const res = await $.http.fetch(JEV_URL, {
@@ -995,6 +999,7 @@ export const register: Register = on => {
     if ((await $.store.get('isBandOpen')) === true) await update($, isBandOpen, () => true)
     await $.command.register({ name: 'steer', description: 'ani: 기억한 교훈 보기·정리' })
     await $.command.register({ name: 'ani', description: 'ani 패널 열기' })
+    { const k = await $.env.get('TYPESAFE_API_KEY'); await update($, hasKey, () => Boolean(k)) }
     // The pane is where ani lives: open it beside the transcript from the start.
     if ((await read($, display)).pane) $.clock.after(0, () => $.ui.open({ id: PANE, title: TITLE }))
     $.clock.after(0, () => backfill($))
@@ -1142,6 +1147,31 @@ export const register: Register = on => {
           <Client key="opener" module="./opener.ts" props={{ text: st.inventory }} />
         </Box>
       )
+      // No Jev key: nothing ani does works yet. Ask once a session, like a permission prompt.
+      if (!(await read($, hasKey)) && !(await read($, keyLater))) {
+        const color = STATE_COLOR.ask
+        const card = askCardSvg(full - 40, {
+          question: 'Jev 키가 있어야 ani가 교훈을 골라 붙일 수 있어요',
+          lesson: '키 없이는 교정 기록·교훈 판단·승격이 모두 멈춰 있어요',
+          intent: 'typesafe.ai 에서 키를 발급받아 숨김 입력창에 붙여넣어요',
+          why: '키는 채팅에 남지 않고 ~/.claude/settings.json 에만 저장돼요',
+          color,
+        })
+        return (
+          <Box flexDirection="column" width={e.props.bodyColumns} gap={1}>
+            <Box key="nokey" flexDirection="column" borderStyle="round" borderColor={color} paddingX={2} paddingY={1} gap={1}>
+              <Svg source={card.source} width={card.width} height={card.height} alt="Jev 키가 필요해요" />
+              <Box flexDirection="row" alignItems="center" gap={1}>
+                {[
+                  <Button key="k-yes" variant="primary" hotkey="1" label="키 설정하기" onPress={() => { void $.prompt.submit({ text: '/jev-steer:ani-key' }) }} />,
+                  <Button key="k-no" variant="secondary" hotkey="2" label="나중에" onPress={() => update($, keyLater, () => true)} />,
+                ]}
+              </Box>
+            </Box>
+            {line}
+          </Box>
+        )
+      }
       const pCand = (await loadPrinciples($)).find(p => p.status === 'candidate')
       const misfitNeed = (await loadNeeds($)).find(n => n.status === 'confirmed' && (n.misfit ?? 0) >= 3)
       if (pCand || misfitNeed) {
