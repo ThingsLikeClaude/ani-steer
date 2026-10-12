@@ -1,0 +1,7 @@
+{
+  "name": "ani-steer",
+  "owner": { "name": "ThingsLikeClaude" },
+  "plugins": [
+    { "name": "jev-steer", "source": "./plugins/jev-steer", "description": "ani: 교정 기록과 Jev 기반 교훈 주입 패널" }
+  ]
+}
