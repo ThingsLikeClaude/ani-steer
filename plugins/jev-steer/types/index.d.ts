@@ -38,6 +38,8 @@ export type Card = {
   isPromotionDeclined?: boolean
   /** How often the person corrected in the opposite direction right after it was attached. */
   reversals?: number
+  /** Over capacity: kept, not attached, still matched against new corrections so a repeat can revive it. */
+  isArchived?: boolean
 }
 
 export type Judgment = {
