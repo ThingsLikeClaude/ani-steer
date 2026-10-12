@@ -81,6 +81,16 @@ let attachedReqIds: string[] = []
 
 // ── memory ──────────────────────────────────────────────────────────────
 
+/**
+ * A `$.store` read does not subscribe a drawing the way a `$.state` read does,
+ * so every write asks the band and the pane to draw again; otherwise a pressed
+ * card stays on screen until something else redraws it.
+ */
+async function save($: EngineInterface, key: string, value: unknown) {
+  await $.store.set(key, value)
+  $.ui.invalidate('ui.render')
+}
+
 async function ownCards($: EngineInterface): Promise<Card[]> {
   return ((await $.store.get('cards')) as Card[] | undefined) ?? []
 }
@@ -106,7 +116,7 @@ async function loadCards($: EngineInterface): Promise<Card[]> {
 async function editCard($: EngineInterface, id: string, change: Partial<Card> | null) {
   const own = await ownCards($)
   const next = change === null ? own.filter(c => c.id !== id) : own.map(c => (c.id === id ? { ...c, ...change } : c))
-  await $.store.set('cards', next)
+  await save($, 'cards', next)
   if (change === null) {
     await update($, pinned, ids => ids.filter(x => x !== id))
     await update($, view, v => (v.recorded?.cardId === id ? { ...v, recorded: null } : v))
@@ -148,7 +158,7 @@ async function remember($: EngineInterface, prompt: string, answers: Answers, ca
   const answer = lastAnswer
   const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
   const logIt = async (cardId: string) => {
-    await $.store.set('feedbackLog', [{ at: now, text: prompt, cardId, project }, ...fb].slice(0, 500))
+    await save($, 'feedbackLog', [{ at: now, text: prompt, cardId, project }, ...fb].slice(0, 500))
     $.clock.after(0, () => enrichFeedback($, now, prompt))
   }
 
@@ -173,7 +183,7 @@ async function remember($: EngineInterface, prompt: string, answers: Answers, ca
       isMuted: false,
       isArchived: false,
     }
-    await $.store.set('cards', enforceCapacity(own.map(c => (c.id === dup.id ? merged : c))))
+    await save($, 'cards', enforceCapacity(own.map(c => (c.id === dup.id ? merged : c))))
     $.clock.after(0, () => structure($, merged.id, intentPrompt, answer, prompt, merged))
     await logIt(merged.id)
     return merged
@@ -181,7 +191,7 @@ async function remember($: EngineInterface, prompt: string, answers: Answers, ca
 
   // Not the same mistake as a lesson: it stays a case with one judgment. Two
   // judgments that say the same thing become a lesson candidate (pairUp).
-  await $.store.set('feedbackLog', [{ at: now, text: prompt, cardId: '', project, kind: kindOf(answers), scope: scopeOf(answers) }, ...fb].slice(0, 500))
+  await save($, 'feedbackLog', [{ at: now, text: prompt, cardId: '', project, kind: kindOf(answers), scope: scopeOf(answers) }, ...fb].slice(0, 500))
   $.clock.after(0, () => enrichFeedback($, now, prompt))
   return null
 }
@@ -217,8 +227,8 @@ async function pairUp($: EngineInterface, at: number) {
   const id = `C-${at}`
   const cand: Candidate = { id, cases: [best.o.at, at], kind: me.kind ?? best.o.kind ?? 'intent', scope: me.scope ?? best.o.scope ?? 'personal-project' }
   const cands = ((await $.store.get('candidates')) as Candidate[] | undefined) ?? []
-  await $.store.set('candidates', [...cands, cand])
-  await $.store.set('feedbackLog', fb.map(f => (f.at === at || f.at === best.o.at ? { ...f, candidateId: id } : f)))
+  await save($, 'candidates', [...cands, cand])
+  await save($, 'feedbackLog', fb.map(f => (f.at === at || f.at === best.o.at ? { ...f, candidateId: id } : f)))
   // The lesson text, drafted from both cases by the small model.
   const r = await $.model.complete({
     model: 'haiku',
@@ -234,7 +244,7 @@ async function pairUp($: EngineInterface, at: number) {
     const t = JSON.parse(r.text.match(/\{[\s\S]*\}/)?.[0] ?? '') as { intent?: string; why?: string; lesson?: string; short?: string }
     const short = t.short && [...t.short].length <= SHORT_MAX ? t.short : undefined
     const now = ((await $.store.get('candidates')) as Candidate[] | undefined) ?? []
-    await $.store.set('candidates', now.map(c => (c.id === id ? { ...c, intent: t.intent, why: t.why, lesson: t.lesson, short } : c)))
+    await save($, 'candidates', now.map(c => (c.id === id ? { ...c, intent: t.intent, why: t.why, lesson: t.lesson, short } : c)))
   } catch {
     // stays a candidate without wording; the card falls back to the judgments
   }
@@ -264,16 +274,16 @@ async function acceptCandidate($: EngineInterface, id: string) {
     lesson: c.lesson ?? cases.map(f => f.judgment).filter(Boolean).join(' / '),
     short: c.short,
   }
-  await $.store.set('cards', enforceCapacity([...(await ownCards($)), card]))
-  await $.store.set('feedbackLog', fb.map(f => (c.cases.includes(f.at) ? { ...f, cardId: card.id, candidateId: undefined } : f)))
-  await $.store.set('candidates', cands.filter(x => x.id !== id))
+  await save($, 'cards', enforceCapacity([...(await ownCards($)), card]))
+  await save($, 'feedbackLog', fb.map(f => (c.cases.includes(f.at) ? { ...f, cardId: card.id, candidateId: undefined } : f)))
+  await save($, 'candidates', cands.filter(x => x.id !== id))
   if (!card.short) $.clock.after(0, () => shorten($))
 }
 
 /** Not yet: the two cases go back to waiting, and this pair is not offered again. */
 async function declineCandidate($: EngineInterface, id: string) {
   const cands = ((await $.store.get('candidates')) as Candidate[] | undefined) ?? []
-  await $.store.set('candidates', cands.map(c => (c.id === id ? { ...c, isDeclined: true } : c)))
+  await save($, 'candidates', cands.map(c => (c.id === id ? { ...c, isDeclined: true } : c)))
 }
 
 /**
@@ -323,7 +333,7 @@ const SHORT_MAX = 24
 
 async function setFeedback($: EngineInterface, at: number, change: Partial<Feedback>) {
   const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
-  await $.store.set('feedbackLog', fb.map(f => (f.at === at ? { ...f, ...change } : f)))
+  await save($, 'feedbackLog', fb.map(f => (f.at === at ? { ...f, ...change } : f)))
 }
 
 /**
@@ -382,7 +392,7 @@ async function shorten($: EngineInterface) {
           '상황과 행동만 남기고 수식어는 버리세요. 말줄임표 금지. 요약문만 답하세요.',
         prompt: c.lesson as string,
       })
-      await $.store.set('shortenLast', { at: await $.clock.now(), id: c.id, ok: r.isAnswered, text: r.isAnswered ? r.text.slice(0, 200) : String(r.reason) })
+      await save($, 'shortenLast', { at: await $.clock.now(), id: c.id, ok: r.isAnswered, text: r.isAnswered ? r.text.slice(0, 200) : String(r.reason) })
       if (!r.isAnswered) continue
       const t = r.text.trim().replace(/^["'“”]+|["'“”.]+$/g, '').split('\n')[0].trim()
       if (t && [...t].length <= SHORT_MAX && !t.includes('…')) best = t
@@ -488,7 +498,7 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
     const beatMs = (await $.clock.now()) - started
     await update($, beat, () => ({ ok: res.ok, ms: beatMs, at: started, detail: res.ok ? undefined : `HTTP ${res.status}` }))
     if (!res.ok) {
-      await $.store.set('lastError', { status: res.status, body: res.text.slice(0, 300), at: started })
+      await save($, 'lastError', { status: res.status, body: res.text.slice(0, 300), at: started })
       throw new Error(res.status >= 500 ? `Jev가 잠시 응답하지 않아요 (${res.status})` : `Jev 오류 ${res.status}`)
     }
     const answers = (JSON.parse(res.text) as { answers: Answers }).answers
@@ -512,7 +522,7 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
     for (const [i, c] of attachedBefore.entries()) {
       if (noul(answers, `p${i}_reverses`) < 0.6) continue
       const labels = ((await $.store.get('labels')) as Label[] | undefined) ?? []
-      await $.store.set('labels', [...labels, { cardId: c.id, verdict: 'apply', isRight: false, same: 0, satisfy: 0, flip: 1, ts: started } as Label].slice(-2000))
+      await save($, 'labels', [...labels, { cardId: c.id, verdict: 'apply', isRight: false, same: 0, satisfy: 0, flip: 1, ts: started } as Label].slice(-2000))
       const reversals = (c.reversals ?? 0) + 1
       await editCard($, c.id, { reversals, ...(reversals >= 2 ? { isMuted: true } : {}) })
       if (shown.toast) $.ui.toast(reversals >= 2 ? `ani · "${c.short ?? c.lesson ?? c.text}" 반대 피드백 2번 · 이 교훈을 껐어요` : `ani · "${c.short ?? c.lesson ?? c.text}"은 이번엔 잘못 붙였어요 · 기록했어요`, { timeoutMs: 5000 })
@@ -530,7 +540,7 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
       const need = ns.find(n => n.status === 'confirmed')
       if (need) {
         const fitAns = await askJev($, { correction: prompt.slice(0, 1500) }, { fit: { type: 'noul', instructions: `Is this correction consistent with what the user says they want underneath: "${need.text}"`, criteria: { true: 'consistent', false: 'points somewhere else' } } })
-        if (fitAns && noul(fitAns, 'fit') < 0.3) await $.store.set('needs', ns.map(n => (n.id === need.id ? { ...n, misfit: (n.misfit ?? 0) + 1 } : n)))
+        if (fitAns && noul(fitAns, 'fit') < 0.3) await save($, 'needs', ns.map(n => (n.id === need.id ? { ...n, misfit: (n.misfit ?? 0) + 1 } : n)))
       }
     }
     const judgments = judge(candidates, answers).filter(j => j.id !== recorded?.cardId)
@@ -607,7 +617,7 @@ async function findPrinciple($: EngineInterface, ruleId: string) {
   if (!answers) return
   const fit = active.map((p, i) => ({ p, v: noul(answers, `a${i}`) })).sort((a, b) => b.v - a.v)[0]
   if (fit && fit.v >= 0.7) {
-    await $.store.set('principles', ps.map(p => (p.id === fit.p.id ? { ...p, from: [...p.from, me.id] } : p)))
+    await save($, 'principles', ps.map(p => (p.id === fit.p.id ? { ...p, from: [...p.from, me.id] } : p)))
     return
   }
   const pair = loose.map((c, i) => ({ c, v: noul(answers, `l${i}`) })).sort((a, b) => b.v - a.v)[0]
@@ -621,12 +631,12 @@ async function findPrinciple($: EngineInterface, ruleId: string) {
   })
   const text = r.isAnswered ? r.text.trim().split('\n')[0].replace(/^["'“”]+|["'“”]+$/g, '') : `${ruleText(pair.c)} / ${ruleText(me)}`
   const now = await $.clock.now()
-  await $.store.set('principles', [...ps, { id: `P-${now}`, text, from: [pair.c.id, me.id], status: 'candidate', ts: now }])
+  await save($, 'principles', [...ps, { id: `P-${now}`, text, from: [pair.c.id, me.id], status: 'candidate', ts: now }])
 }
 
 async function setPrinciple($: EngineInterface, id: string, status: Principle['status']) {
   const ps = await loadPrinciples($)
-  await $.store.set('principles', ps.map(p => (p.id === id ? { ...p, status } : p)))
+  await save($, 'principles', ps.map(p => (p.id === id ? { ...p, status } : p)))
   if (status === 'active') $.clock.after(0, () => proposeNeeds($))
 }
 
@@ -660,7 +670,7 @@ async function proposeNeeds($: EngineInterface) {
       status: 'hypothesis',
       ts: now,
     }))
-    await $.store.set('needs', [...ns, ...fresh])
+    await save($, 'needs', [...ns, ...fresh])
   } catch {
     // no hypotheses this time
   }
@@ -669,14 +679,14 @@ async function proposeNeeds($: EngineInterface) {
 /** Confirm one hypothesis (the others are set aside), or discard one. */
 async function setNeed($: EngineInterface, id: string, status: Need['status']) {
   const ns = await loadNeeds($)
-  await $.store.set('needs', ns.map(n => (n.id === id ? { ...n, status, misfit: 0 } : status === 'confirmed' && n.status === 'hypothesis' ? { ...n, status: 'discarded' } : n)))
+  await save($, 'needs', ns.map(n => (n.id === id ? { ...n, status, misfit: 0 } : status === 'confirmed' && n.status === 'hypothesis' ? { ...n, status: 'discarded' } : n)))
 }
 
 /** The person's own words, kept as they are: "근원 욕구: …" in a prompt. */
 async function writeNeed($: EngineInterface, text: string) {
   const ns = await loadNeeds($)
   const now = await $.clock.now()
-  await $.store.set('needs', [...ns.map(n => (n.status === 'discarded' ? n : { ...n, status: 'discarded' as const })), { id: `N-${now}`, text, from: [], status: 'confirmed', misfit: 0, ts: now }])
+  await save($, 'needs', [...ns.map(n => (n.status === 'discarded' ? n : { ...n, status: 'discarded' as const })), { id: `N-${now}`, text, from: [], status: 'confirmed', misfit: 0, ts: now }])
 }
 
 
@@ -689,10 +699,10 @@ async function writeNeed($: EngineInterface, text: string) {
 async function previewLadder($: EngineInterface) {
   const set = async (p: Partial<Preview>) => {
     const cur = ((await $.store.get('preview')) as Preview | undefined) ?? { at: 0, status: 'running', principles: [], needs: [] }
-    await $.store.set('preview', { ...cur, ...p })
+    await save($, 'preview', { ...cur, ...p })
   }
   const lessons = mineOf(await ownCards($)).filter(c => c.lesson && !c.isMuted).slice(0, 24)
-  await $.store.set('preview', { at: await $.clock.now(), status: 'running', step: `교훈 ${lessons.length}개를 이유별로 묶는 중`, principles: [], needs: [] })
+  await save($, 'preview', { at: await $.clock.now(), status: 'running', step: `교훈 ${lessons.length}개를 이유별로 묶는 중`, principles: [], needs: [] })
   if (lessons.length < 2) return set({ status: 'error', error: '교훈이 2개 이상 있어야 해요' })
   const g = await $.model.complete({
     model: 'haiku',
@@ -756,8 +766,8 @@ async function keepPreviewPrinciple($: EngineInterface, i: number) {
   const p = pv?.principles[i]
   if (!pv || !p) return
   const now = await $.clock.now()
-  await $.store.set('principles', [...(await loadPrinciples($)), { id: `P-${now}`, text: p.text, from: p.from, status: 'active', ts: now }])
-  await $.store.set('preview', { ...pv, principles: pv.principles.filter((_, k) => k !== i) })
+  await save($, 'principles', [...(await loadPrinciples($)), { id: `P-${now}`, text: p.text, from: p.from, status: 'active', ts: now }])
+  await save($, 'preview', { ...pv, principles: pv.principles.filter((_, k) => k !== i) })
 }
 
 /** Confirm one previewed need, in the words shown. */
@@ -766,7 +776,7 @@ async function keepPreviewNeed($: EngineInterface, i: number) {
   const nd = pv?.needs[i]
   if (!pv || !nd) return
   await writeNeed($, nd.text)
-  await $.store.set('preview', { ...pv, needs: [] })
+  await save($, 'preview', { ...pv, needs: [] })
 }
 
 async function attachment($: EngineInterface, r: Result): Promise<{ text: string; lessonIds: string[]; reqIds: string[] } | null> {
@@ -789,9 +799,9 @@ async function attachment($: EngineInterface, r: Result): Promise<{ text: string
   const freshPrinciples = principles.filter(p => isFresh(p.id))
   const freshNeed = need && isFresh(need.id) ? need : undefined
   const freshReqs = reqs.filter(x => isFresh(x.id))
-  await $.store.set('sendSeq', seq)
+  await save($, 'sendSeq', seq)
   const sentIds = [...ruleLines, ...lessonLines].map(c => c.id).concat(freshPrinciples.map(p => p.id), freshReqs.map(x => x.id), freshNeed ? [freshNeed.id] : [])
-  await $.store.set('lastAttached', { ...lastAt, ...Object.fromEntries(sentIds.map(id => [id, seq])) })
+  await save($, 'lastAttached', { ...lastAt, ...Object.fromEntries(sentIds.map(id => [id, seq])) })
   if (!ruleLines.length && !lessonLines.length && !freshPrinciples.length && !freshNeed && !freshReqs.length) {
     // All still in context from earlier requests: nothing new to add, but they still ride.
     return { text: '', lessonIds: lessons.map(c => c.id), reqIds: reqs.map(x => x.id) }
@@ -810,7 +820,7 @@ async function attachment($: EngineInterface, r: Result): Promise<{ text: string
 async function label($: EngineInterface, j: Judgment, isRight: boolean) {
   const labels = ((await $.store.get('labels')) as Label[] | undefined) ?? []
   const one: Label = { cardId: j.id, verdict: j.verdict, isRight, same: j.same, satisfy: j.satisfy, flip: j.flip, ts: await $.clock.now() }
-  await $.store.set('labels', [...labels, one].slice(-2000))
+  await save($, 'labels', [...labels, one].slice(-2000))
   // "Should apply" joins the running request (dropped at turn end); "doesn't" removes it.
   await update($, pinned, ids => (isRight ? [...new Set([...ids, j.id])] : ids.filter(x => x !== j.id)))
   await update($, view, v => ({ ...v, isLabeled: true, answers: { ...v.answers, [j.id]: isRight } }))
@@ -826,7 +836,7 @@ async function unanswer($: EngineInterface, id: string) {
 
 async function toggleDisplay($: EngineInterface, key: keyof Display) {
   const next = await update($, display, d => ({ ...d, [key]: !d[key] }))
-  await $.store.set('display', next)
+  await save($, 'display', next)
 }
 
 async function kindCounts($: EngineInterface): Promise<KindCount[]> {
@@ -960,7 +970,7 @@ async function statusModel($: EngineInterface): Promise<{ lead: Lead; inventory:
 async function setReqs($: EngineInterface, fn: (rs: Requirement[]) => Requirement[]) {
   const base = await loadReqs($)
   const next = await update($, requirements, () => fn(base))
-  await $.store.set('requirements', next)
+  await save($, 'requirements', next)
   return next
 }
 
@@ -1001,7 +1011,7 @@ function pulseOf(b: Beat, now: number): Pulse {
 
 async function toggleSection($: EngineInterface, key: string) {
   const next = await update($, openSections, xs => (xs.includes(key) ? xs.filter(x => x !== key) : [...xs, key]))
-  await $.store.set('openSections', next)
+  await save($, 'openSections', next)
 }
 
 async function forgetRequirement($: EngineInterface, id: string) {
@@ -1075,16 +1085,16 @@ export const register: Register = on => {
         const own = await ownCards($)
         const have = new Set(own.map(c => c.id))
         const cards = [...own.map(c => (c.source === 'jev' && !have.has(c.id) ? c : c.source === 'jev' && !imp.cards.some(x => x.id === c.id) ? { ...c, isArchived: true } : c)), ...imp.cards.filter(c => !have.has(c.id))]
-        await $.store.set('cards', cards)
+        await save($, 'cards', cards)
         const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
         const known = new Set(fb.map(f => f.at))
-        await $.store.set('feedbackLog', [...fb, ...imp.cases.filter(f => !known.has(f.at))].sort((a, b) => b.at - a.at).slice(0, 500))
-        await $.store.set('imports', [...done, imp.id])
+        await save($, 'feedbackLog', [...fb, ...imp.cases.filter(f => !known.has(f.at))].sort((a, b) => b.at - a.at).slice(0, 500))
+        await save($, 'imports', [...done, imp.id])
       }
     }
     // Cases written under the 40자 limit are walked back once more, at full length.
     if (!(await $.store.get('caseV2'))) {
-      await $.store.set('caseV2', true)
+      await save($, 'caseV2', true)
       $.clock.after(0, async () => {
         const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
         for (const f of fb.slice(0, 12)) await enrichFeedback($, f.at, f.text)
@@ -1112,7 +1122,7 @@ export const register: Register = on => {
         : `ani · 교훈 ${record.lessonIds.length}개는 이미 대화에 있어 다시 붙이지 않았어요`, { timeoutMs: 4000 })
     }
     const log = ((await $.store.get('sentLog')) as (typeof record)[] | undefined) ?? []
-    await $.store.set('sentLog', [record, ...log].slice(0, 20))
+    await save($, 'sentLog', [record, ...log].slice(0, 20))
     return next(extra?.text ? { ...e, context: [...(e.context ?? []), extra.text] } : e)
   })
 
@@ -1166,7 +1176,7 @@ export const register: Register = on => {
   // A compaction can drop what was attached earlier: from here, attach again.
   on('session.compact', async ($, e, next) => {
     const r = await next(e)
-    await $.store.set('compactSeq', ((await $.store.get('sendSeq')) as number | undefined) ?? 0)
+    await save($, 'compactSeq', ((await $.store.get('sendSeq')) as number | undefined) ?? 0)
     return r
   })
 
