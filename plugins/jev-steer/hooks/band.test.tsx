@@ -134,3 +134,18 @@ test('desktop panel: every ladder tab always shows; instructions live under feed
   expect(await done.find({ key: 'rm-J-1' })).toBeUndefined()
   await done.unmount()
 })
+
+test('desktop: a pressed lesson card leaves the band on that press, with no remount', async ($, on) => {
+  engine(on, {
+    candidates: [{ id: 'C-1', cases: [1, 2], kind: 'intent', scope: 'personal-project', lesson: '배경만 바꾸라면 배경만 바꾼다', short: '배경만 바꾼다' }],
+    feedbackLog: [
+      { at: 1, text: '아니 배경만 바꾸라고', project: 'unknown' },
+      { at: 2, text: '배경만 바꾸라니까', project: 'unknown' },
+    ],
+  })
+  const band = await $.ui.mount({ plugin: 'jev-steer', surface: 'desktop', component: 'AbovePrompt', props: ABOVE })
+  expect(await band.find({ key: 'c-yes' })).toBeDefined()
+  await band.press({ key: 'c-yes' })
+  expect(await band.find({ key: 'c-yes' })).toBeUndefined()
+  await band.unmount()
+})
