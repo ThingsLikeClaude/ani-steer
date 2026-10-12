@@ -13,7 +13,7 @@ const TONE: Record<Tone, { fill: string; stroke: string; text: string }> = {
   off: { fill: 'rgba(128,128,128,0.0)', stroke: 'rgba(128,128,128,0.25)', text: '#9a9a9a' },
 }
 
-const FONT = "'Pretendard Variable', 'Pretendard', -apple-system, BlinkMacSystemFont, 'Apple SD Gothic Neo', 'Segoe UI', sans-serif"
+const FONT = "'Pretendard Variable', 'Pretendard', -apple-system, BlinkMacSystemFont, 'Apple SD Gothic Neo', 'Malgun Gothic', 'Segoe UI', 'Noto Sans KR', sans-serif"
 const SIZE = 11
 const HEIGHT = 18
 const PAD = 6

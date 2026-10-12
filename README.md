@@ -15,7 +15,7 @@ Claude Code 모드(플러그인). 사용자가 Claude를 교정한 말을 사례
 /plugin install jev-steer@ani-steer
 ```
 
-Jev(TypeSafe) 키가 필요합니다. 키가 없으면 첫 실행 때 프롬프트 위에 안내 카드가 뜨고, `키 설정하기`를 누르면 `/jev-steer:ani-key`가 숨김 입력창으로 키를 받아 `~/.claude/settings.json`의 `env.TYPESAFE_API_KEY`에 저장합니다. 키는 채팅에 남지 않습니다. (`jq` 필요: `brew install jq`)
+Jev(TypeSafe) 키가 필요합니다. 키가 없으면 첫 실행 때 프롬프트 위에 안내 카드가 뜨고, `키 설정하기`를 누르면 `/jev-steer:ani-key`가 숨김 입력창으로 키를 받아 `~/.claude/settings.json`의 `env.TYPESAFE_API_KEY`에 저장합니다. 키는 채팅에 남지 않습니다. macOS · Linux · Windows 모두 지원하며 jq 같은 외부 도구는 필요 없습니다.
 
 ## 저장
 

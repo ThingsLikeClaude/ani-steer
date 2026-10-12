@@ -453,6 +453,8 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
     const state = {
       latest_user_message: prompt.slice(0, MAX_PROMPT_CHARS),
       earlier_user_messages: (mode === 'draft' ? recentPrompts.slice(-3) : recentPrompts.slice(-4, -1)).map(p => p.slice(0, 1000)),
+      // Short replies ("1번으로 해줘", "했어") only make sense against what the assistant last said.
+      assistant_last_reply: lastAnswer.slice(-1500),
       project,
     }
     const body = JSON.stringify({ model: 'jev-latest', state, questions: buildQuestions(candidates, reqs, attachedBefore) })

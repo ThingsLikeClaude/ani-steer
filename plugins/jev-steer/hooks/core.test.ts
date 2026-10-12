@@ -16,9 +16,11 @@ const card = (over: Partial<Card>): Card => ({
   ...over,
 })
 
-test('verdict: apply only when same, satisfying and unlikely to flip', async () => {
+test('verdict: relevance gates; flip vetoes only when it outweighs relevance', async () => {
   expect(verdictOf(0.9, 0.8, 0.1)).toBe('apply')
-  expect(verdictOf(0.9, 0.8, 0.5)).toBe('ask')
+  expect(verdictOf(0.74, 0.4, 0.58)).toBe('apply')
+  expect(verdictOf(0.6, 0.5, 0.65)).toBe('ask')
+  expect(verdictOf(0.9, 0.8, 0.75)).toBe('ask')
   expect(verdictOf(0.3, 0.9, 0.0)).toBe('hold')
 })
 

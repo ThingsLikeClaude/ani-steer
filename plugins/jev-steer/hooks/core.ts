@@ -1,7 +1,7 @@
 import type { Card, Judgment, Kind, Requirement, Scope, Verdict } from '../types'
 
 export const JEV_URL = 'https://api.typesafe.ai/v1/systemone'
-export const MAX_CANDIDATES = 12
+export const MAX_CANDIDATES = 24
 export const MAX_REQUIREMENTS = 7
 export const MAX_PROMPT_CHARS = 4000
 
@@ -163,7 +163,9 @@ export function verdictOf(same: number, satisfy: number, flip: number): Verdict 
   if (same < 0.4) return 'hold'
   // Jev's "opposite complaint" sits around 0.4 for nearly everything, so it only
   // vetoes when it leans yes. Relevance is the real gate.
-  if (same >= 0.55 && flip < 0.5) return 'apply'
+  // Replaying the logged prompts: flip rises with relevance (0.55–0.63 on the
+  // lessons that plainly applied), so it vetoes only when it outweighs relevance.
+  if (same >= 0.55 && flip < 0.7 && flip <= same) return 'apply'
   void satisfy
   return 'ask'
 }
