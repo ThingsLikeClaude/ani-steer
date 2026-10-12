@@ -7,6 +7,7 @@ import {
   KIND_LABEL,
   MAX_PROMPT_CHARS,
   buildQuestions,
+  describe,
   excerpt,
   judge,
   kindOf,
@@ -32,6 +33,8 @@ const KINDS: Kind[] = ['intent', 'effort', 'missed', 'autonomy', 'buried']
  */
 const CAPACITY: Record<'personal-project' | 'global', number> = { 'personal-project': 12, global: 12 }
 const SUBMIT_WAIT_MS = 1200
+const ARCHIVE_MAX = 200
+const REATTACH_EVERY = 6
 const MAX_ATTACHED_LESSONS = 2
 /** A lesson the same correction has hit this often is offered as a rule. */
 const PROMOTE_AT = 3
@@ -83,7 +86,7 @@ async function ownCards($: EngineInterface): Promise<Card[]> {
 }
 
 function mineOf(cards: readonly Card[]): Card[] {
-  return cards.filter(c => c.project === project || c.scope === 'global')
+  return cards.filter(c => !c.isArchived && (c.project === project || c.scope === 'global'))
 }
 
 /** ani's own stores (read-only here) plus the lessons this mod keeps. */
@@ -97,7 +100,7 @@ async function loadCards($: EngineInterface): Promise<Card[]> {
     const text = await $.fs.read(path).catch(() => '')
     if (text) ani.push(...parseIndex(String(text), scope, project))
   }
-  return [...ani, ...(await ownCards($))]
+  return [...ani, ...(await ownCards($)).filter(c => !c.isArchived)]
 }
 
 async function editCard($: EngineInterface, id: string, change: Partial<Card> | null) {
@@ -117,16 +120,19 @@ async function editCard($: EngineInterface, id: string, change: Partial<Card> | 
 function enforceCapacity(cards: Card[]): Card[] {
   let out = cards
   for (const scope of ['personal-project', 'global'] as const) {
-    const inScope = out.filter(c => c.scope === scope && (scope === 'global' || c.project === project))
+    const inScope = out.filter(c => !c.isArchived && !c.isRule && c.scope === scope && (scope === 'global' || c.project === project))
     const over = inScope.length - CAPACITY[scope]
     if (over <= 0) continue
     const weakest = [...inScope]
       .sort((a, b) => Number(!!b.isMuted) - Number(!!a.isMuted) || (a.count ?? 1) - (b.count ?? 1) || a.ts - b.ts)
       .slice(0, over)
       .map(c => c.id)
-    out = out.filter(c => !weakest.includes(c.id))
+    // Archived, not deleted: a repeat of the same mistake brings it back with its count.
+    out = out.map(c => (weakest.includes(c.id) ? { ...c, isArchived: true } : c))
   }
-  return out
+  const archived = out.filter(c => c.isArchived).sort((a, b) => b.ts - a.ts)
+  const drop = new Set(archived.slice(ARCHIVE_MAX).map(c => c.id))
+  return out.filter(c => !drop.has(c.id))
 }
 
 /**
@@ -146,15 +152,28 @@ async function remember($: EngineInterface, prompt: string, answers: Answers, ca
     $.clock.after(0, () => enrichFeedback($, now, prompt))
   }
 
-  if (dup) {
+  // Not a live lesson: maybe an archived one. A repeat revives it.
+  let revived: Card | undefined
+  if (!dup) {
+    const archived = own.filter(c => c.isArchived && c.lesson && (c.scope === 'global' || c.project === project)).sort((a, b) => (b.count ?? 1) - (a.count ?? 1) || b.ts - a.ts).slice(0, 24)
+    const ans = archived.length
+      ? await askJev($, { correction: prompt.slice(0, 1500), earlier_request: intentPrompt.slice(0, 800) }, Object.fromEntries(archived.map((c, i) => [`z${i}`, { type: 'noul', instructions: `Is this correction about the same recurring mistake as this archived lesson, so one lesson covers both: "${describe(c)}"`, criteria: { true: 'same mistake', false: 'a different mistake' } }])))
+      : null
+    const best = ans ? archived.map((c, i) => ({ c, v: noul(ans, `z${i}`) })).sort((a, b) => b.v - a.v)[0] : undefined
+    if (best && best.v >= 0.7) revived = best.c
+  }
+  const hit = dup ?? revived
+  if (hit) {
+    const dup = hit
     const merged: Card = {
       ...dup,
       ts: now,
       count: (dup.count ?? 1) + 1,
       examples: [prompt.slice(0, 300), ...(dup.examples ?? [dup.text])].slice(0, 3),
       isMuted: false,
+      isArchived: false,
     }
-    await $.store.set('cards', own.map(c => (c.id === dup.id ? merged : c)))
+    await $.store.set('cards', enforceCapacity(own.map(c => (c.id === dup.id ? merged : c))))
     $.clock.after(0, () => structure($, merged.id, intentPrompt, answer, prompt, merged))
     await logIt(merged.id)
     return merged
@@ -272,7 +291,7 @@ async function structure($: EngineInterface, cardId: string, intentPrompt: strin
       'Reply with JSON only: {"intent": "...", "why": "...", "lesson": "...", "short": "..."}, all in Korean, each one complete short sentence. ' +
       'intent: what the user actually wanted (≤ 30자). ' +
       'why: why the agent got it wrong — the misreading, not just the action (≤ 40자). ' +
-      'lesson: what to do next time in that situation, as a rule starting with the situation (≤ 40자). ' +
+      'lesson: what to do next time in that situation, as a rule starting with the situation (≤ 40자). Write it one level above this incident so it would apply to the next similar task too: name the kind of work and the habit (e.g. "위치를 지정받으면 그 자리에 정확히 배치"), not this specific button, screen or value (not "꺾쇠를 왼쪽에"). ' +
       'short: the same lesson re-said in ≤ 20자 so it fits one short line whole — keep the key object and action, drop the rest. ' +
       'If an earlier lesson is given, write one lesson that covers both cases.',
     prompt: [
@@ -758,15 +777,32 @@ async function attachment($: EngineInterface, r: Result): Promise<{ text: string
   const need = (await loadNeeds($)).find(n => n.status === 'confirmed')
   const principles = (await loadPrinciples($)).filter(p => p.status === 'active')
   if (!lessons.length && !reqs.length && !need && !principles.length) return null
-  const ruleLines = lessons.filter(c => c.isRule)
-  const lessonLines = lessons.filter(c => !c.isRule)
+  // Whatever went out in the last few requests is still in the conversation the
+  // model reads: saying it again only piles up copies and over-weights it. Repeat
+  // only after REATTACH_EVERY requests, or once a compaction has dropped it.
+  const seq = (((await $.store.get('sendSeq')) as number | undefined) ?? 0) + 1
+  const compactSeq = ((await $.store.get('compactSeq')) as number | undefined) ?? 0
+  const lastAt = ((await $.store.get('lastAttached')) as Record<string, number> | undefined) ?? {}
+  const isFresh = (id: string) => !(lastAt[id] && lastAt[id] > compactSeq && seq - lastAt[id] < REATTACH_EVERY)
+  const ruleLines = lessons.filter(c => c.isRule && isFresh(c.id))
+  const lessonLines = lessons.filter(c => !c.isRule && isFresh(c.id))
+  const freshPrinciples = principles.filter(p => isFresh(p.id))
+  const freshNeed = need && isFresh(need.id) ? need : undefined
+  const freshReqs = reqs.filter(x => isFresh(x.id))
+  await $.store.set('sendSeq', seq)
+  const sentIds = [...ruleLines, ...lessonLines].map(c => c.id).concat(freshPrinciples.map(p => p.id), freshReqs.map(x => x.id), freshNeed ? [freshNeed.id] : [])
+  await $.store.set('lastAttached', { ...lastAt, ...Object.fromEntries(sentIds.map(id => [id, seq])) })
+  if (!ruleLines.length && !lessonLines.length && !freshPrinciples.length && !freshNeed && !freshReqs.length) {
+    // All still in context from earlier requests: nothing new to add, but they still ride.
+    return { text: '', lessonIds: lessons.map(c => c.id), reqIds: reqs.map(x => x.id) }
+  }
   const text = [
     '[ani] From this user\'s own past corrections and standing requirements, judged to bear on this request. Follow them:',
-    ...(need ? [`What this user wants underneath (their own words): ${need.text}`] : []),
-    ...(principles.length ? ['Principles (always):', ...principles.map(p => `- ${p.text}`)] : []),
+    ...(freshNeed ? [`What this user wants underneath (their own words): ${freshNeed.text}`] : []),
+    ...(freshPrinciples.length ? ['Principles (always):', ...freshPrinciples.map(p => `- ${p.text}`)] : []),
     ...(ruleLines.length ? ['Rules (always):', ...ruleLines.map(lessonLine)] : []),
     ...(lessonLines.length ? ['Lessons:', ...lessonLines.map(lessonLine)] : []),
-    ...(reqs.length ? ['Requirements still in force:', ...reqs.map(x => `- ${x.text}`)] : []),
+    ...(freshReqs.length ? ['Requirements still in force:', ...freshReqs.map(x => `- ${x.text}`)] : []),
   ].join('\n')
   return { text, lessonIds: lessons.map(c => c.id), reqIds: reqs.map(x => x.id) }
 }
@@ -1029,6 +1065,23 @@ export const register: Register = on => {
     }
     recentPrompts.push(text)
     if (recentPrompts.length > 6) recentPrompts.shift()
+    // A one-time import (e.g. lessons rebuilt from an earlier conversation):
+    // its lessons go live, the ones they replace are archived, its cases join the log.
+    {
+      const raw = await $.fs.read(`${home}/.ani/jev-steer-import.json`).catch(() => '')
+      const imp = raw ? (JSON.parse(String(raw)) as { id: string; cards: Card[]; cases: Feedback[] }) : null
+      const done = ((await $.store.get('imports')) as string[] | undefined) ?? []
+      if (imp && !done.includes(imp.id)) {
+        const own = await ownCards($)
+        const have = new Set(own.map(c => c.id))
+        const cards = [...own.map(c => (c.source === 'jev' && !have.has(c.id) ? c : c.source === 'jev' && !imp.cards.some(x => x.id === c.id) ? { ...c, isArchived: true } : c)), ...imp.cards.filter(c => !have.has(c.id))]
+        await $.store.set('cards', cards)
+        const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+        const known = new Set(fb.map(f => f.at))
+        await $.store.set('feedbackLog', [...fb, ...imp.cases.filter(f => !known.has(f.at))].sort((a, b) => b.at - a.at).slice(0, 500))
+        await $.store.set('imports', [...done, imp.id])
+      }
+    }
     // Cases written under the 40자 limit are walked back once more, at full length.
     if (!(await $.store.get('caseV2'))) {
       await $.store.set('caseV2', true)
@@ -1050,15 +1103,17 @@ export const register: Register = on => {
     const extra = result ? await attachment($, result) : null
     attachedReqIds = extra?.reqIds ?? []
     const at = await $.clock.now()
-    const record = { at, prompt: text.slice(0, 200), text: extra?.text ?? null, lessonIds: extra?.lessonIds ?? [], reqIds: extra?.reqIds ?? [], isLate: !result, ms: at - t0 }
+    const record = { at, prompt: text.slice(0, 200), text: extra?.text || null, lessonIds: extra?.lessonIds ?? [], reqIds: extra?.reqIds ?? [], isLate: !result, ms: at - t0 }
     await update($, sent, () => record)
     if (record.lessonIds.length && (await read($, display)).toast) {
       const first = (await ownCards($)).find(c => c.id === record.lessonIds[0])
-      $.ui.toast(`ani · 교훈 ${record.lessonIds.length}개를 붙여 보냈어요: ${first?.short ?? first?.lesson ?? ''}`, { timeoutMs: 4000 })
+      $.ui.toast(record.text
+        ? `ani · 교훈 ${record.lessonIds.length}개를 붙여 보냈어요: ${first?.short ?? first?.lesson ?? ''}`
+        : `ani · 교훈 ${record.lessonIds.length}개는 이미 대화에 있어 다시 붙이지 않았어요`, { timeoutMs: 4000 })
     }
     const log = ((await $.store.get('sentLog')) as (typeof record)[] | undefined) ?? []
     await $.store.set('sentLog', [record, ...log].slice(0, 20))
-    return next(extra ? { ...e, context: [...(e.context ?? []), extra.text] } : e)
+    return next(extra?.text ? { ...e, context: [...(e.context ?? []), extra.text] } : e)
   })
 
   on('prompt.edit', async ($, e, next) => {
@@ -1106,6 +1161,13 @@ export const register: Register = on => {
       if ((await read($, paneCols)) !== c) await update($, paneCols, () => c)
     }
     return next(e)
+  })
+
+  // A compaction can drop what was attached earlier: from here, attach again.
+  on('session.compact', async ($, e, next) => {
+    const r = await next(e)
+    await $.store.set('compactSeq', ((await $.store.get('sendSeq')) as number | undefined) ?? 0)
+    return r
   })
 
   on('command.run', { command: 'steer' }, async $ => {
