@@ -58,7 +58,7 @@ export function pickCandidates(prompt: string, cards: readonly Card[], project: 
   const words = new Set(tokenize(prompt))
   const seen = new Set<string>()
   return cards
-    .filter(c => !c.isMuted && (c.scope === 'global' || c.project === project))
+    .filter(c => !c.isMuted && appliesTo(c, project))
     .sort((a, b) => order[a.scope] - order[b.scope])
     .filter(c => (seen.has(c.id) ? false : (seen.add(c.id), true)))
     .map(c => {
@@ -202,4 +202,40 @@ export function excerpt(text: string, max = 120): string {
 export async function slugOf(remote: string, root: string): Promise<string> {
   const m = remote.trim().match(/[:/]([^/:]+\/[^/]+?)(?:\.git)?$/)
   return m?.[1] ?? root.split('/').filter(Boolean).pop() ?? 'unknown'
+}
+
+/** A project slug as a person reads it: the last segment of `owner/repo` or of a folder path. */
+export function projectName(slug: string | undefined): string {
+  return slug ? (slug.split(/[\\/]/).filter(Boolean).pop() ?? slug) : '출처 모름'
+}
+
+/** The same folder written two ways (`C:\Users\me`, `/c/Users/me/`). */
+export function isSamePath(a: string, b: string): boolean {
+  const norm = (p: string) => p.replace(/\\/g, '/').replace(/^\/([a-z])\//i, '$1:/').replace(/\/+$/, '').toLowerCase()
+  return Boolean(a && b) && norm(a) === norm(b)
+}
+
+type Placed = { scope?: Scope; project?: string; alsoIn?: string[]; skipIn?: string[] }
+
+/**
+ * Whether a lesson, rule or requirement rides in this project: its own project,
+ * every project when global, and any project the person attached it to, unless
+ * the person said no here.
+ */
+export function appliesTo(x: Placed, project: string): boolean {
+  if (x.skipIn?.includes(project)) return false
+  return x.scope === 'global' || x.project === project || Boolean(x.alsoIn?.includes(project))
+}
+
+/** Another project's item nobody has decided on here yet. */
+export function isUndecided(x: Placed, project: string): boolean {
+  return !appliesTo(x, project) && !x.skipIn?.includes(project)
+}
+
+/** The person's decision for this project: attach it here, or not. */
+export function placeIn<T extends Placed>(x: T, project: string, isAttached: boolean): T {
+  const without = (xs?: string[]) => (xs ?? []).filter(p => p !== project)
+  return isAttached
+    ? { ...x, alsoIn: [...without(x.alsoIn), project], skipIn: without(x.skipIn) }
+    : { ...x, alsoIn: without(x.alsoIn), skipIn: [...without(x.skipIn), project] }
 }
