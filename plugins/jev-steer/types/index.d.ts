@@ -40,6 +40,10 @@ export type Card = {
   reversals?: number
   /** Over capacity: kept, not attached, still matched against new corrections so a repeat can revive it. */
   isArchived?: boolean
+  /** Other projects the person attached it to. */
+  alsoIn?: string[]
+  /** Projects where the person decided it should not ride. */
+  skipIn?: string[]
 }
 
 export type Judgment = {
@@ -52,7 +56,12 @@ export type Judgment = {
   flip: number
 }
 
-export type Requirement = { id: string; text: string; ts: number; active: number }
+/**
+ * A standing instruction. It rides in the project it was said in; elsewhere it
+ * is listed as another project's, and rides only where the person attaches it.
+ * Requirements saved before `project` existed belong to no project yet.
+ */
+export type Requirement = { id: string; text: string; ts: number; active: number; project?: string; alsoIn?: string[]; skipIn?: string[] }
 
 export type Recorded = { cardId: string; kind: Kind; scope: Scope; until: number }
 
