@@ -12,6 +12,11 @@ function engine(on: On, entries?: Record<string, unknown>) {
   })
 }
 
+/** Whether any drawn Svg's alt text matches: ElementQuery does not match on alt. */
+async function hasSvg(ui: { findAll: (q: { type: string }) => Promise<{ props: Record<string, unknown> }[]> }, alt: RegExp) {
+  return (await ui.findAll({ type: 'Svg' })).some(s => alt.test(String(s.props.alt ?? '')))
+}
+
 const ABOVE = { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 120 } as never
 const PANE = { plugin: 'jev-steer', component: 'Pane', requestId: 'jev-steer', props: {} as never } as const
 const card = (over: Record<string, unknown>) => ({
@@ -104,7 +109,7 @@ test('the panel groups lessons by scope with capacity, and controls each one', a
 })
 
 test('desktop panel: every ladder tab always shows; instructions live under feedback', async ($, on) => {
-  engine(on, { cards: [card({ lesson: '밝기 요청은 바꿀 속성부터 확인' })], requirements: [{ id: 'R-1', text: '이미지는 Codex CLI의 Astra로', ts: 1, active: 1 }] })
+  engine(on, { cards: [card({ lesson: '밝기 요청은 바꿀 속성부터 확인' })], requirements: [{ id: 'R-1', text: '이미지는 Codex CLI의 Astra로', ts: 1, active: 1, project: 'unknown' }] })
   const first = await $.ui.mount({ ...PANE, surface: 'desktop' })
   for (const k of ['tab-feedback', 'tab-lessons', 'tab-rules', 'tab-principles', 'tab-needs', 'tab-sent', 'tab-settings']) expect(await first.find({ key: k })).toBeDefined()
   await first.press({ key: 'tab-feedback' })
@@ -157,7 +162,40 @@ test('promoting a lesson to a rule clears the card at once (store writes redraw)
   expect(await band.find({ key: 'q-yes' })).toBeUndefined()
   const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await pane.press({ key: 'tab-rules' })
-  expect(await pane.find({ type: 'Svg', alt: /위치를 지정받으면/ })).toBeDefined()
+  expect(await hasSvg(pane, /위치를 지정받으면/)).toBe(true)
   await pane.unmount()
   await band.unmount()
+})
+
+test('another project\'s lesson is listed with its project and rides here only once attached', async ($, on) => {
+  engine(on, { cards: [card({ id: 'J-9', project: 'me/other', lesson: '위치를 지정받으면 그 자리에 정확히 둔다' })] })
+  const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await pane.press({ key: 'tab-lessons' })
+  expect(await hasSvg(pane, /위치를 지정받으면/)).toBe(true)
+  expect(await pane.find({ key: 'at-J-9' })).toBeDefined()
+  await pane.press({ key: 'at-J-9' })
+  expect(await pane.find({ key: 'at-J-9' })).toBeUndefined()
+  await pane.unmount()
+  // Attached: it now sits with this project's lessons, tagged with where it came from.
+  const term = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await term.find({ type: 'Text', text: /other에서/ })).toBeDefined()
+  expect(await term.find({ key: 'rm-J-9' })).toBeUndefined()
+  await term.press({ key: 'dt-J-9' })
+  expect(await term.find({ type: 'Text', text: /other에서/ })).toBeUndefined()
+  await term.unmount()
+})
+
+test('requirements from before projects were recorded wait for a decision; not-here folds them away', async ($, on) => {
+  engine(on, { requirements: [{ id: 'R-1', text: '0 raw 원문 본문 수정 금지', ts: 1, active: 1 }] })
+  const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await pane.press({ key: 'tab-feedback' })
+  expect(await pane.find({ key: 'at-R-1' })).toBeDefined()
+  expect((await pane.find({ key: 'tab-feedback' }))?.text).toMatch(/사례 0 \+1$/)
+  expect((await pane.find({ key: 'tab-lessons' }))?.text).toMatch(/교훈 0$/)
+  await pane.press({ key: 'sk-R-1' })
+  expect(await pane.find({ key: 'at-R-1' })).toBeUndefined()
+  expect(await pane.find({ key: 's-rq-skip' })).toBeDefined()
+  await pane.press({ key: 's-rq-skip-fold' })
+  expect(await pane.find({ key: 'at-R-1' })).toBeDefined()
+  await pane.unmount()
 })

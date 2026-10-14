@@ -6,14 +6,19 @@ import {
   JEV_URL,
   KIND_LABEL,
   MAX_PROMPT_CHARS,
+  appliesTo,
   buildQuestions,
   describe,
   excerpt,
+  isSamePath,
+  isUndecided,
   judge,
   kindOf,
   noul,
   parseIndex,
   pickCandidates,
+  placeIn,
+  projectName,
   scopeOf,
   slugOf,
   tokenize,
@@ -96,13 +101,19 @@ async function ownCards($: EngineInterface): Promise<Card[]> {
 }
 
 function mineOf(cards: readonly Card[]): Card[] {
-  return cards.filter(c => !c.isArchived && (c.project === project || c.scope === 'global'))
+  return cards.filter(c => !c.isArchived && appliesTo(c, project))
+}
+
+/** Lessons and rules of other projects, shown with their project so the person can attach them here. */
+function othersOf(cards: readonly Card[]): Card[] {
+  return cards.filter(c => !c.isArchived && !c.isMuted && !appliesTo(c, project))
 }
 
 /** ani's own stores (read-only here) plus the lessons this mod keeps. */
 async function loadCards($: EngineInterface): Promise<Card[]> {
+  // A session opened in the home folder would read the global index twice.
   const stores: [string, Scope][] = [
-    [`${root}/.ani/INDEX.md`, 'team-project'],
+    ...(isSamePath(root, home) ? [] : [[`${root}/.ani/INDEX.md`, 'team-project'] as [string, Scope]]),
     [`${home}/.ani/INDEX.md`, 'global'],
   ]
   const ani: Card[] = []
@@ -110,7 +121,19 @@ async function loadCards($: EngineInterface): Promise<Card[]> {
     const text = await $.fs.read(path).catch(() => '')
     if (text) ani.push(...parseIndex(String(text), scope, project))
   }
-  return [...ani, ...(await ownCards($)).filter(c => !c.isArchived)]
+  const seen = new Set<string>()
+  return [...ani, ...(await ownCards($)).filter(c => !c.isArchived)].filter(c => (seen.has(c.id) ? false : (seen.add(c.id), true)))
+}
+
+/** The person decided whether another project's lesson or rule rides here too. */
+async function placeCard($: EngineInterface, id: string, isAttached: boolean) {
+  const own = await ownCards($)
+  await save($, 'cards', own.map(c => (c.id === id ? placeIn(c, project, isAttached) : c)))
+}
+
+/** The same decision for another project's requirement. */
+async function placeReq($: EngineInterface, id: string, isAttached: boolean) {
+  await setReqs($, rs => rs.map(r => (r.id === id ? placeIn(r, project, isAttached) : r)))
 }
 
 async function editCard($: EngineInterface, id: string, change: Partial<Card> | null) {
@@ -165,7 +188,7 @@ async function remember($: EngineInterface, prompt: string, answers: Answers, ca
   // Not a live lesson: maybe an archived one. A repeat revives it.
   let revived: Card | undefined
   if (!dup) {
-    const archived = own.filter(c => c.isArchived && c.lesson && (c.scope === 'global' || c.project === project)).sort((a, b) => (b.count ?? 1) - (a.count ?? 1) || b.ts - a.ts).slice(0, 24)
+    const archived = own.filter(c => c.isArchived && c.lesson && appliesTo(c, project)).sort((a, b) => (b.count ?? 1) - (a.count ?? 1) || b.ts - a.ts).slice(0, 24)
     const ans = archived.length
       ? await askJev($, { correction: prompt.slice(0, 1500), earlier_request: intentPrompt.slice(0, 800) }, Object.fromEntries(archived.map((c, i) => [`z${i}`, { type: 'noul', instructions: `Is this correction about the same recurring mistake as this archived lesson, so one lesson covers both: "${describe(c)}"`, criteria: { true: 'same mistake', false: 'a different mistake' } }])))
       : null
@@ -424,7 +447,8 @@ export function isConcreteRequirement(text: string): boolean {
 }
 
 async function extractRequirements($: EngineInterface, prompt: string, now: number) {
-  const existing = (await loadReqs($)).map(r => r.text)
+  const all = await loadReqs($)
+  const existing = all.filter(r => appliesTo(r, project)).map(r => r.text)
   const r = await $.model.complete({
     model: 'haiku',
     maxTokens: 300,
@@ -443,10 +467,14 @@ async function extractRequirements($: EngineInterface, prompt: string, now: numb
   if (!r.isAnswered) return
   try {
     const list = (JSON.parse(r.text.match(/\{[\s\S]*\}/)?.[0] ?? '') as { requirements?: string[] }).requirements ?? []
-    const add = list
-      .filter(t => t && isConcreteRequirement(t) && !existing.includes(t))
-      .map((text, i) => ({ id: `R-${now}-${i}`, text, ts: now, active: 1 }))
-    if (add.length) await setReqs($, rs => [...rs, ...add].slice(-20))
+    const said = list.filter(t => t && isConcreteRequirement(t) && !existing.includes(t))
+    // Said here word for word as another project's: attach that one rather than keep a copy.
+    const elsewhere = new Set(all.filter(r => said.includes(r.text)).map(r => r.id))
+    const add: Requirement[] = said
+      .filter(t => !all.some(r => r.text === t))
+      .map((text, i) => ({ id: `R-${now}-${i}`, text, ts: now, active: 1, project }))
+    if (add.length || elsewhere.size)
+      await setReqs($, rs => capReqs([...rs.map(r => (elsewhere.has(r.id) ? placeIn(r, project, true) : r)), ...add]))
   } catch {
     // nothing extracted
   }
@@ -478,7 +506,7 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
     const candidates = pickCandidates(prompt, allCards.filter(c => !c.isRule), project)
     const attachedBefore = mode === 'draft' ? [] : allCards.filter(c => prevAttached.includes(c.id))
     if (mode !== 'commit') await update($, view, v => ({ ...v, weighing: candidates.map(c => c.id) }))
-    const reqs = (await loadReqs($)).filter(r => r.active >= 0.4)
+    const reqs = (await loadReqs($)).filter(r => r.active >= 0.4 && appliesTo(r, project))
     const state = {
       latest_user_message: prompt.slice(0, MAX_PROMPT_CHARS),
       earlier_user_messages: (mode === 'draft' ? recentPrompts.slice(-3) : recentPrompts.slice(-4, -1)).map(p => p.slice(0, 1000)),
@@ -506,9 +534,8 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
     // Requirements: Jev scores whether each still holds and whether it bears on
     // this request. It never deletes one.
     if (mode !== 'draft') {
-      const scored = reqs.map((r, i) => ({ ...r, active: noul(answers, `r${i}_active`) }))
-      const all = await read($, requirements)
-      await setReqs($, () => all.map(r => scored.find(s => s.id === r.id) ?? r))
+      const scored = new Map(reqs.map((r, i) => [r.id, noul(answers, `r${i}_active`)]))
+      await setReqs($, rs => rs.map(r => (scored.has(r.id) ? { ...r, active: scored.get(r.id) as number } : r)))
     }
     const reqIds = reqs
       .map((r, i) => ({ r, rel: noul(answers, `r${i}_relevant`), act: noul(answers, `r${i}_active`) }))
@@ -966,20 +993,30 @@ async function statusModel($: EngineInterface): Promise<{ lead: Lead; inventory:
   return { lead, inventory, line: `ani  ${text}  ·  ${inventory}`, alt: `ani: ${text}. ${inventory}` }
 }
 
-/** Requirements are the part that matters most, so they persist across sessions. */
+/**
+ * Requirements are the part that matters most, so they persist across sessions.
+ * The store holds every project's, and each write starts from the store, so a
+ * session in one project never drops what a session in another just added.
+ */
 async function setReqs($: EngineInterface, fn: (rs: Requirement[]) => Requirement[]) {
-  const base = await loadReqs($)
-  const next = await update($, requirements, () => fn(base))
+  const next = fn(await loadReqs($))
   await save($, 'requirements', next)
+  await update($, requirements, () => next)
   return next
 }
 
-/** Session state first; on a fresh session, what was saved before. */
+/** Every project's requirements; the caller narrows to this project with `appliesTo`. */
 async function loadReqs($: EngineInterface): Promise<Requirement[]> {
-  const rs = await read($, requirements)
-  if (rs.length) return rs
   const saved = ((await $.store.get('requirements')) as Requirement[] | undefined) ?? []
   return saved.filter(r => r.text.length <= 80 && isConcreteRequirement(r.text))
+}
+
+const REQS_PER_PROJECT = 20
+
+/** The newest REQS_PER_PROJECT said in this project; other projects' are left alone. */
+function capReqs(rs: Requirement[]): Requirement[] {
+  const drop = new Set(rs.filter(r => r.project === project).slice(0, -REQS_PER_PROJECT).map(r => r.id))
+  return rs.filter(r => !drop.has(r.id))
 }
 
 /** A tiny Jev call that only proves the line is up. */
@@ -1033,11 +1070,8 @@ export const register: Register = on => {
       const now = await $.clock.now()
       await update($, sessionStartedAt, () => now)
     }
-    // Requirements used to be whole prompts; keep only short ones.
-    const savedReqs = (await $.store.get('requirements')) as Requirement[] | undefined
-    if (savedReqs && (await loadReqs($)).length === 0) await update($, requirements, () => savedReqs)
-    // Drop long raw prompts and generic working rules saved before the filter.
-    await setReqs($, rs => rs.filter(r => r.text.length <= 80 && isConcreteRequirement(r.text)))
+    // Requirements used to be whole prompts; loadReqs keeps only short, concrete ones.
+    await setReqs($, rs => rs)
     const saved = (await $.store.get('display')) as Partial<Display> | undefined
     if (saved) await update($, display, () => ({ ...DEFAULT_DISPLAY, ...saved }))
     $.clock.after(0, () => ping($))
@@ -1205,7 +1239,8 @@ export const register: Register = on => {
       const v = await read($, view)
       const own = await ownCards($)
       void v
-      const promos = mineOf(own).filter(c => !c.isMuted && !c.isRule && !c.isPromotionDeclined && (c.count ?? 1) >= PROMOTE_AT)
+      // Another project's lesson attached here is promoted in its own project, not from here.
+      const promos = mineOf(own).filter(c => (c.scope === 'global' || c.project === project) && !c.isMuted && !c.isRule && !c.isPromotionDeclined && (c.count ?? 1) >= PROMOTE_AT)
       const promo = promos[0]
       const cands = (((await $.store.get('candidates')) as Candidate[] | undefined) ?? []).filter(c => !c.isDeclined)
       const cand = cands[0]
@@ -1365,11 +1400,19 @@ export const register: Register = on => {
     const shown = await read($, display)
     const since = await read($, sessionStartedAt)
     const pinnedIds = await read($, pinned)
-    const reqs = await loadReqs($)
+    const allReqs = await loadReqs($)
+    const reqs = allReqs.filter(r => appliesTo(r, project))
     const labels = ((await $.store.get('labels')) as Label[] | undefined) ?? []
     const right = labels.filter(l => l.isRight).length
     const accuracy = labels.length ? `${Math.round((right / labels.length) * 100)}%` : '—'
     const mine = mineOf(await ownCards($))
+    const others = othersOf(await ownCards($))
+    // Everything kept anywhere is listed; another project's is tagged with its
+    // project and waits for the person to attach it here or not.
+    const newHere = <T extends { project?: string; scope?: Scope; alsoIn?: string[]; skipIn?: string[] }>(xs: T[]) => xs.filter(x => isUndecided(x, project))
+    const skippedHere = <T extends { skipIn?: string[] }>(xs: T[]) => xs.filter(x => x.skipIn?.includes(project))
+    const otherReqs = allReqs.filter(r => !appliesTo(r, project))
+    const isBorrowed = (x: { project?: string; scope?: Scope }) => x.scope !== 'global' && x.project !== project
     const live = mine.filter(c => !c.isMuted)
     const unstructured = mine.filter(c => !c.lesson).length
     const sentIds = (await read($, sent))?.lessonIds ?? []
@@ -1525,7 +1568,7 @@ export const register: Register = on => {
       // File-tree grammar: a small-caps label and a chevron, then one rounded
       // card of one-line rows. Detail shows only for what rides the request,
       // or for every row while managing.
-      const scopeName = (c: Card) => (c.isMuted ? '꺼둠' : c.scope === 'global' ? '모든 프로젝트' : '이 프로젝트')
+      const scopeName = (c: Card) => (c.isMuted ? '꺼둠' : c.scope === 'global' ? '모든 프로젝트' : isBorrowed(c) ? `${projectName(c.project)}에서` : '이 프로젝트')
       const subOf = (c: Card) => [...(c.intent ? [{ label: '원했던 것', value: c.intent }] : []), ...(c.why ?? c.did ? [{ label: '틀린 이유', value: (c.why ?? c.did) as string }] : [])]
       const weighing = new Set(v.isBusy ? v.weighing ?? [] : [])
       const fresh = (c: Card) => Boolean(out && out.lessonIds.includes(c.id) && now - out.at < 8000)
@@ -1540,13 +1583,13 @@ export const register: Register = on => {
         shimmer: weighing.has(c.id) ? 'weigh' : isOn && fresh(c) ? 'fresh' : undefined,
         sub: isOn || isManaging ? subOf(c) : undefined,
       })
-      const labelRow = (key: string, text: string, count: number) => {
+      const labelRow = (key: string, text: string, count: number, startsFolded = false) => {
         // A section title, sized above the rows it holds.
         const lb = sectionSvg(Math.ceil(textWidth(text) * (17 / 11) + 10 + textWidth(`${count}`) * (14 / 11) + 4), text, `${count}`)
         return (
           <Box key={key} flexDirection="row" alignItems="center" gap={2} marginTop={1}>
             <Svg source={lb.source} width={lb.width} height={lb.height} alt={`${text} ${count}`} />
-            <Button key={`${key}-fold`} variant="secondary" dimColor label={isOpen(key) ? '접기' : '열기'} onPress={fold(key)} />
+            <Button key={`${key}-fold`} variant="secondary" dimColor label={(startsFolded ? !isOpen(key) : isOpen(key)) ? '접기' : '열기'} onPress={fold(key)} />
           </Box>
         )
       }
@@ -1558,7 +1601,10 @@ export const register: Register = on => {
         <Box key={`m-${c.id}`} flexDirection="column" marginTop={1}>
           {cardOf(`mc-${c.id}`, [cardRow(c, isOn)])}
           <Box flexDirection="row" gap={1} marginTop={1}>
-            {[
+            {isBorrowed(c) ? [
+              // Scope, mute and forget would change it in the project it came from.
+              <Button key={`dt-${c.id}`} variant="secondary" label="여기서 떼기" onPress={() => placeCard($, c.id, false)} />,
+            ] : [
               <Button key={`to-pp-${c.id}`} variant={!c.isMuted && c.scope === 'personal-project' ? 'primary' : 'secondary'} label="이 프로젝트" onPress={() => editCard($, c.id, { isMuted: false, scope: 'personal-project' })} />,
               <Button key={`to-gl-${c.id}`} variant={!c.isMuted && c.scope === 'global' ? 'primary' : 'secondary'} label="모든 프로젝트" onPress={() => editCard($, c.id, { isMuted: false, scope: 'global' })} />,
               <Button key={`mute-${c.id}`} variant={c.isMuted ? 'primary' : 'secondary'} label={c.isMuted ? '켜기' : '끄기'} onPress={() => editCard($, c.id, { isMuted: !c.isMuted })} />,
@@ -1567,6 +1613,45 @@ export const register: Register = on => {
           </Box>
         </Box>
       )
+      // Another project's lessons, rules or requirements: tagged with the project
+      // they come from; the person attaches each one here, or says not here.
+      type Other = { id: string; title: string; from?: string; badge?: CardRow['badge']; sub?: CardRow['sub'] }
+      const otherSection = (key: string, what: string, undecided: Other[], skipped: Other[], place: (id: string, isAttached: boolean) => unknown) => [
+        ...(undecided.length
+          ? [
+              labelRow(`s-${key}-new`, `다른 프로젝트의 ${what} · 여기에도 붙일까요`, undecided.length),
+              ...(isOpen(`s-${key}-new`)
+                ? undecided.flatMap(o => [
+                    cardOf(`on-${o.id}`, [{ dot: STATE_COLOR.quiet, badge: o.badge, title: o.title, scope: projectName(o.from), pill: { text: '다른 프로젝트', color: STATE_COLOR.ask }, sub: o.sub }], STATE_COLOR.ask),
+                    <Box key={`ob-${o.id}`} flexDirection="row" gap={1} marginTop={1}>
+                      {[
+                        <Button key={`at-${o.id}`} variant="primary" label="여기에도 붙이기" onPress={() => place(o.id, true)} />,
+                        <Button key={`sk-${o.id}`} variant="secondary" label="안 붙임" onPress={() => place(o.id, false)} />,
+                      ]}
+                    </Box>,
+                  ])
+                : []),
+            ]
+          : []),
+        ...(skipped.length
+          ? [
+              labelRow(`s-${key}-skip`, `여기엔 안 붙인 ${what}`, skipped.length, true),
+              ...(!isOpen(`s-${key}-skip`)
+                ? skipped.flatMap(o => [
+                    cardOf(`os-${o.id}`, [{ dot: STATE_COLOR.quiet, title: o.title, scope: projectName(o.from), pill: { text: '안 붙임' }, isMuted: true }]),
+                    <Box key={`osb-${o.id}`} flexDirection="row" marginTop={1}>{[<Button key={`at-${o.id}`} variant="secondary" label="다시 붙이기" onPress={() => place(o.id, true)} />]}</Box>,
+                  ])
+                : []),
+            ]
+          : []),
+      ]
+      const otherOf = (c: Card): Other => ({ id: c.id, title: c.lesson ?? c.text, from: c.project, badge: { text: KIND_BADGE[c.kind], color: KIND_COLOR[c.kind] }, sub: subOf(c) })
+      const otherLessons = others.filter(c => !c.isRule)
+      const otherRules = others.filter(c => c.isRule)
+      const lessonOthers = () => otherSection('ls', '교훈', newHere(otherLessons).map(otherOf), skippedHere(otherLessons).map(otherOf), (id, a) => placeCard($, id, a))
+      const ruleOthers = () => otherSection('ru', '규칙', newHere(otherRules).map(otherOf), skippedHere(otherRules).map(otherOf), (id, a) => placeCard($, id, a))
+      const reqOf = (r: Requirement): Other => ({ id: r.id, title: r.text, from: r.project })
+      const reqOthers = () => otherSection('rq', '지시', newHere(otherReqs).map(reqOf), skippedHere(otherReqs).map(reqOf), (id, a) => placeReq($, id, a))
       const pending: typeof maybe = []
       const own = await ownCards($)
       const sentLog = (((await $.store.get('sentLog')) as Sent[] | undefined) ?? [])
@@ -1575,10 +1660,11 @@ export const register: Register = on => {
       const cands = ((await $.store.get('candidates')) as Candidate[] | undefined) ?? []
       const feedbackLog = (((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []).filter(f => f.project === project || own.find(c => c.id === f.cardId)?.scope === 'global')
       // The ladder reads left to right: what was said, what was learned, what always holds.
-      const ladder: { key: Tab; label: string; n: number }[] = [
-        { key: 'feedback', label: '사례', n: feedbackLog.length },
-        { key: 'lessons', label: '교훈', n: mine.filter(c => !c.isRule && !c.isMuted).length },
-        { key: 'rules', label: '규칙', n: mine.filter(c => c.isRule).length },
+      // "+N": another project's items waiting for a decision here.
+      const ladder: { key: Tab; label: string; n: number; more?: number }[] = [
+        { key: 'feedback', label: '사례', n: feedbackLog.length, more: newHere(otherReqs).length },
+        { key: 'lessons', label: '교훈', n: mine.filter(c => !c.isRule && !c.isMuted).length, more: newHere(otherLessons).length },
+        { key: 'rules', label: '규칙', n: mine.filter(c => c.isRule).length, more: newHere(otherRules).length },
         { key: 'principles', label: '원칙', n: principles.filter(p => p.status === 'active').length },
         { key: 'needs', label: '근원 욕구', n: needs.filter(n => n.status === 'confirmed').length },
       ]
@@ -1605,7 +1691,7 @@ export const register: Register = on => {
                       pill: { text: ago(x.at) },
                       sub: [
                         ...x.lessonIds.map(id => ({ label: '교훈', value: own.find(c => c.id === id)?.lesson ?? id })),
-                        ...x.reqIds.map(id => ({ label: '규칙', value: reqs.find(q => q.id === id)?.text ?? id })),
+                        ...x.reqIds.map(id => ({ label: '규칙', value: allReqs.find(q => q.id === id)?.text ?? id })),
                       ],
                     }))),
                   ]
@@ -1621,10 +1707,10 @@ export const register: Register = on => {
                   ]
                 : []),
             ]
-      const ruleView = () =>
-        ruleCards.length
-          ? []
-          : [emptyNote('rules-empty', `아직 없어요. 같은 교정이 ${PROMOTE_AT}번 쌓인 교훈은 규칙으로 올릴지 물어봐요. 규칙은 그 범위의 모든 요청에 항상 붙어요.`)]
+      const ruleView = () => [
+        ...(ruleCards.length ? [] : [emptyNote('rules-empty', `아직 없어요. 같은 교정이 ${PROMOTE_AT}번 쌓인 교훈은 규칙으로 올릴지 물어봐요. 규칙은 그 범위의 모든 요청에 항상 붙어요.`)]),
+        ...ruleOthers(),
+      ]
       const preview = (await $.store.get('preview')) as Preview | undefined
       const previewBlock = (which: 'principles' | 'needs') => {
         const isRunning = preview?.status === 'running'
@@ -1749,6 +1835,12 @@ export const register: Register = on => {
         </Box>,
       ]
       const emptyNote = (key: string, text: string) => <Box key={key} paddingY={2}><Text dimColor wrap="wrap">{text}</Text></Box>
+      const reqRow = (rq: Requirement): CardRow => ({
+        dot: STATE_COLOR.quiet,
+        title: rq.text,
+        scope: isBorrowed(rq) ? `${projectName(rq.project)}에서` : undefined,
+        pill: attachedReqIds.includes(rq.id) ? { text: '반영 중', color: STATE_COLOR.hit } : { text: dateOf(rq.ts) },
+      })
       const feedbackView = () => [
         ...(feedbackLog.length
           ? [
@@ -1772,14 +1864,21 @@ export const register: Register = on => {
                 ? isManaging
                   ? reqs.map(rq => (
                       <Box key={`mrq-${rq.id}`} flexDirection="column" marginTop={1}>
-                        {cardOf(`mrqc-${rq.id}`, [{ dot: '#8a8a8a', title: rq.text, pill: attachedReqIds.includes(rq.id) ? { text: '반영 중', color: STATE_COLOR.hit } : { text: dateOf(rq.ts) } }])}
-                        <Box flexDirection="row" marginTop={1}>{[<Button key={`rq-rm-${rq.id}`} variant="secondary" label="잊기" onPress={() => forgetRequirement($, rq.id)} />]}</Box>
+                        {cardOf(`mrqc-${rq.id}`, [reqRow(rq)])}
+                        <Box flexDirection="row" marginTop={1}>
+                          {[
+                            isBorrowed(rq)
+                              ? <Button key={`dt-${rq.id}`} variant="secondary" label="여기서 떼기" onPress={() => placeReq($, rq.id, false)} />
+                              : <Button key={`rq-rm-${rq.id}`} variant="secondary" label="잊기" onPress={() => forgetRequirement($, rq.id)} />,
+                          ]}
+                        </Box>
                       </Box>
                     ))
-                  : [cardOf('card-reqs', reqs.map(rq => ({ dot: '#8a8a8a', title: rq.text, pill: attachedReqIds.includes(rq.id) ? { text: '반영 중', color: STATE_COLOR.hit } : { text: dateOf(rq.ts) } })))]
+                  : [cardOf('card-reqs', reqs.map(reqRow))]
                 : []),
             ]
           : []),
+        ...reqOthers(),
       ]
       const lessonCards = [
         ...(pending.length
@@ -1808,6 +1907,7 @@ export const register: Register = on => {
         ...(restList.length
           ? [labelRow('s-rest', onList.length ? '그 밖의 교훈' : '기억 중인 교훈', restList.length), ...(isOpen('s-rest') ? (isManaging ? restList.map(c => manageRow(c, false)) : [cardOf('card-rest', restList.map(c => cardRow(c, false)))]) : [])]
           : []),
+        ...lessonOthers(),
       ]
 
       return (
@@ -1821,7 +1921,7 @@ export const register: Register = on => {
             {[
               ...ladder.flatMap((t, i) => [
                 ...(i > 0 ? [<Text key={`arr-${t.key}`} dimColor>→</Text>] : []),
-                <Button key={`tab-${t.key}`} variant={tab === t.key ? 'primary' : 'secondary'} dimColor={tab !== t.key && t.n === 0} label={`${t.label} ${t.n}`} onPress={setTab(t.key)} />,
+                <Button key={`tab-${t.key}`} variant={tab === t.key ? 'primary' : 'secondary'} dimColor={tab !== t.key && t.n === 0 && !t.more} label={`${t.label} ${t.n}${t.more ? ` +${t.more}` : ''}`} onPress={setTab(t.key)} />,
               ]),
               <Text key="tab-sep" dimColor>│</Text>,
               <Button key="tab-sent" variant={tab === 'sent' ? 'primary' : 'secondary'} dimColor={tab !== 'sent'} label="보낸 내용" onPress={setTab('sent')} />,
@@ -1866,6 +1966,10 @@ export const register: Register = on => {
 
     // Terminal: same order, text only.
     const { Box, Text, Button } = $.ui.resolve(e)
+    const waiting = [
+      ...newHere(others).map(c => ({ id: c.id, text: c.lesson ?? c.text, from: c.project, place: (a: boolean) => placeCard($, c.id, a) })),
+      ...newHere(otherReqs).map(r => ({ id: r.id, text: r.text, from: r.project, place: (a: boolean) => placeReq($, r.id, a) })),
+    ]
     const heading = (title: string, right?: string) => (
       <Box flexDirection="row" marginTop={1}>
         <Text bold>{title}</Text>
@@ -1881,11 +1985,18 @@ export const register: Register = on => {
               {c.lesson ? `다음엔 ${c.lesson}` : c.text}
             </Text>
           </Box>
-          <Box flexShrink={0} flexDirection="row" gap={1}>
-            <Button key={`mv-${c.id}`} label={c.scope === 'global' ? '이 프로젝트로' : '전체로'} onPress={() => editCard($, c.id, { scope: c.scope === 'global' ? 'personal-project' : 'global' })} />
-            <Button key={`mu-${c.id}`} label={c.isMuted ? '켜기' : '끄기'} onPress={() => editCard($, c.id, { isMuted: !c.isMuted })} />
-            <Button key={`rm-${c.id}`} label="잊기" onPress={() => editCard($, c.id, null)} />
-          </Box>
+          {isBorrowed(c) ? (
+            <Box flexShrink={0} flexDirection="row" gap={1}>
+              <Text dimColor>{`${projectName(c.project)}에서`}</Text>
+              <Button key={`dt-${c.id}`} label="여기서 떼기" onPress={() => placeCard($, c.id, false)} />
+            </Box>
+          ) : (
+            <Box flexShrink={0} flexDirection="row" gap={1}>
+              <Button key={`mv-${c.id}`} label={c.scope === 'global' ? '이 프로젝트로' : '전체로'} onPress={() => editCard($, c.id, { scope: c.scope === 'global' ? 'personal-project' : 'global' })} />
+              <Button key={`mu-${c.id}`} label={c.isMuted ? '켜기' : '끄기'} onPress={() => editCard($, c.id, { isMuted: !c.isMuted })} />
+              <Button key={`rm-${c.id}`} label="잊기" onPress={() => editCard($, c.id, null)} />
+            </Box>
+          )}
         </Box>
         {rows(c).map(r => (
           <Text dimColor wrap="wrap">{`   ${r.label}  ${r.value}`}</Text>
@@ -1918,7 +2029,17 @@ export const register: Register = on => {
         ))}
         {heading(`내 규칙 · ${reqs.length}`)}
         {reqs.map(r => (
-          <Text dimColor wrap="wrap">{`·  ${r.text}`}</Text>
+          <Text dimColor wrap="wrap">{`·  ${r.text}${isBorrowed(r) ? `  (${projectName(r.project)}에서)` : ''}`}</Text>
+        ))}
+        {waiting.length > 0 && heading(`다른 프로젝트 · 여기에도 붙일까요 · ${waiting.length}`)}
+        {waiting.map(w => (
+          <Box key={`tw-${w.id}`} flexDirection="row" gap={1}>
+            <Box flexGrow={1} flexShrink={1} minWidth={0}>
+              <Text wrap="wrap">{`[${projectName(w.from)}] ${w.text}`}</Text>
+            </Box>
+            <Button key={`at-${w.id}`} variant="primary" label="여기에도" onPress={() => w.place(true)} />
+            <Button key={`sk-${w.id}`} label="안 붙임" onPress={() => w.place(false)} />
+          </Box>
         ))}
         <Box flexDirection="row" marginTop={1} gap={1}>
           <Text dimColor>표시</Text>
