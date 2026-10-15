@@ -61,7 +61,8 @@ export type Judgment = {
  * is listed as another project's, and rides only where the person attaches it.
  * Requirements saved before `project` existed belong to no project yet.
  */
-export type Requirement = { id: string; text: string; ts: number; active: number; project?: string; alsoIn?: string[]; skipIn?: string[] }
+/** scope: Jev's judgment, at saving, of whether it holds in every project; absent until judged. */
+export type Requirement = { id: string; text: string; ts: number; active: number; project?: string; scope?: Scope; alsoIn?: string[]; skipIn?: string[] }
 
 export type Recorded = { cardId: string; kind: Kind; scope: Scope; until: number }
 
