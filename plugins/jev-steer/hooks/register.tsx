@@ -89,6 +89,19 @@ const SVG_MAX = { chars: 131_072, height: 4096 }
 const SVG_BUDGET = { chars: 100_000, height: 3200 }
 
 type Drawn = { source: string; height: number }
+
+/** Drawings already made, by what they draw: a redraw that changes no case draws none again. */
+const drawings = new Map<string, Drawn & { width: number }>()
+const DRAWINGS_MAX = 300
+function drawnOnce(key: string, draw: () => Drawn & { width: number }) {
+  let sv = drawings.get(key)
+  if (!sv) {
+    sv = draw()
+    if (drawings.size >= DRAWINGS_MAX) drawings.delete(drawings.keys().next().value as string)
+    drawings.set(key, sv)
+  }
+  return sv
+}
 const fitsEngine = (sv: Drawn) => sv.source.length <= SVG_MAX.chars && sv.height <= SVG_MAX.height
 
 /**
@@ -119,8 +132,10 @@ export function bySize<T>(items: readonly T[], measure: (x: T) => Drawn, budget 
 
 /** Rows between one card-with-buttons and the next: twice the gap between a card and its own buttons. */
 const ITEM_GAP = 2
-/** How many rows a long list in the panel shows before "더 보기". */
-const listLimit = atom({ plugin: 'jev-steer', key: 'listLimit' } as const, 30)
+/** How many rows a long list in the panel shows before "더 보기": every drawn case is carried to the screen on each redraw. */
+const listLimit = atom({ plugin: 'jev-steer', key: 'listLimit' } as const, 10)
+/** Rows one "더 보기" adds. */
+const LIST_STEP = 20
 
 let project = 'unknown'
 let root = ''
@@ -2183,7 +2198,7 @@ export const register: Register = on => {
         pill: attachedReqIds.includes(rq.id) ? { text: '반영 중', color: STATE_COLOR.hit } : { text: dateOf(rq.ts) },
       })
       const moreButton = (key: string, total: number) =>
-        total > limit ? [<Box key={`${key}-more`} flexDirection="row" marginTop={1}>{[<Button key={`${key}-more-b`} variant="secondary" label={`${Math.min(30, total - limit)}개 더 보기 · ${total - limit}개 남음`} onPress={() => update($, listLimit, n => n + 30)} />]}</Box>] : []
+        total > limit ? [<Box key={`${key}-more`} flexDirection="row" marginTop={1}>{[<Button key={`${key}-more-b`} variant="secondary" label={`${Math.min(LIST_STEP, total - limit)}개 더 보기 · ${total - limit}개 남음`} onPress={() => update($, listLimit, n => n + LIST_STEP)} />]}</Box>] : []
       const caseCard = (key: string, list: Feedback[], isOther: boolean) => {
         const views = list.slice(0, limit).map(f => {
           const c = own.find(x => x.id === f.cardId)
@@ -2191,10 +2206,10 @@ export const register: Register = on => {
           return { f, v: { dot: c ? KIND_COLOR[c.kind] : '#8a8a8a', said: f.said ?? f.text, raw: f.text, when: isOther ? `${projectName(f.project)} · ${ago(f.at)}` : ago(f.at), before: f.before, did: f.did, after: f.after, understood: f.understood, meant: f.meant, judgment: f.judgment, lesson: c?.lesson ?? (cd ? `후보 · ${cd.lesson ?? '정리하는 중'}` : f.judgment ? '판단 1개 · 같은 판단이 한 번 더 나오면 교훈 후보' : undefined) } }
         })
         // A case is several thousand characters drawn: thirty in one drawing passed the engine's limit.
-        const parts = bySize(views, x => caseCardSvg(paneW, [x.v]))
+        const parts = bySize(views, x => drawnOnce(`case|${paneW}|${JSON.stringify(x.v)}`, () => caseCardSvg(paneW, [x.v])))
         return (
           <Box key={key} flexDirection="column" gap={1}>
-            {parts.map((part, i) => svgOr(`${key}-${i}`, caseCardSvg(paneW, part.map(x => x.v)), part.map(x => x.f.said ?? x.f.text).join('. ')))}
+            {parts.map((part, i) => svgOr(`${key}-${i}`, drawnOnce(`case|${paneW}|${JSON.stringify(part.map(x => x.v))}`, () => caseCardSvg(paneW, part.map(x => x.v))), part.map(x => x.f.said ?? x.f.text).join('. ')))}
           </Box>
         )
       }

@@ -14,6 +14,19 @@ const TONE: Record<Tone, { fill: string; stroke: string; text: string }> = {
 }
 
 const FONT = "'Pretendard Variable', 'Pretendard', -apple-system, BlinkMacSystemFont, 'Apple SD Gothic Neo', 'Malgun Gothic', 'Segoe UI', 'Noto Sans KR', sans-serif"
+const FONT_ATTR = ` font-family="${FONT}"`
+
+/**
+ * The font said once for the whole drawing instead of on every text: every
+ * text of a case card names the same font, and those names were about half
+ * of its characters, all of it carried to the screen on every redraw.
+ */
+function lean<T extends { source: string }>(sv: T): T {
+  if (!sv.source.includes(FONT_ATTR)) return sv
+  const body = sv.source.split(FONT_ATTR).join('')
+  const at = body.indexOf('>') + 1
+  return { ...sv, source: `${body.slice(0, at)}<style>text{font-family:${FONT}}</style>${body.slice(at)}` }
+}
 const SIZE = 11
 const HEIGHT = 18
 const PAD = 6
@@ -819,7 +832,7 @@ export function listCardSvg(width: number, rows: readonly CardRow[], tone?: stri
   const h = Math.ceil(y + padY)
   const frame = `<rect x="0.5" y="0.5" width="${width - 1}" height="${h - 1}" rx="12" ${tone ? `fill="${tone}" fill-opacity="0.06" stroke="${tone}" stroke-opacity="0.55"` : 'class="tile"'}/>`
   const style = '<style>.sb{stop-color:#1d1d1f}@media (prefers-color-scheme: dark){.sb{stop-color:#f2f2f2}}</style>'
-  return { source: `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${h}" viewBox="0 0 ${width} ${h}">${style}<defs>${defs.join('')}</defs>${frame}${parts.join('')}</svg>`, width, height: h }
+  return lean({ source: `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${h}" viewBox="0 0 ${width} ${h}">${style}<defs>${defs.join('')}</defs>${frame}${parts.join('')}</svg>`, width, height: h })
 }
 
 /** A file-tree section label: small caps and a count. */
@@ -924,5 +937,5 @@ export function caseCardSvg(width: number, cs: readonly CaseView[]): { source: s
     y += 14
   })
   const h = Math.ceil(y)
-  return { source: `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${h}" viewBox="0 0 ${width} ${h}"><rect x="0.5" y="0.5" width="${width - 1}" height="${h - 1}" rx="12" class="tile"/>${parts.join('')}</svg>`, width, height: h }
+  return lean({ source: `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${h}" viewBox="0 0 ${width} ${h}"><rect x="0.5" y="0.5" width="${width - 1}" height="${h - 1}" rx="12" class="tile"/>${parts.join('')}</svg>`, width, height: h })
 }
