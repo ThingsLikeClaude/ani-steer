@@ -12,14 +12,17 @@ export function jevBody(value: unknown): string {
 }
 
 /**
- * Where Jev is reached. OpenRouter carries the same Jev on the same System One
- * API, billed to the OpenRouter account; with its key set it is used first.
+ * Where Jev is reached, in the order to try. TypeSafe and OpenRouter carry the
+ * same Jev on the same System One API. A request's own judging goes to TypeSafe
+ * first: measured on this machine, a quarter second faster than through
+ * OpenRouter. Background work goes to OpenRouter first, billed to the
+ * OpenRouter account. Either stands in when the other refuses.
  */
 export type JevRoute = { name: 'OpenRouter' | 'TypeSafe'; url: string; model: string; key: string }
-export function jevRouteOf(keys: { openRouter?: string; typeSafe?: string }): JevRoute | null {
-  if (keys.openRouter) return { name: 'OpenRouter', url: 'https://openrouter.ai/api/v1/systemone', model: '~typesafe/jev-latest', key: keys.openRouter }
-  if (keys.typeSafe) return { name: 'TypeSafe', url: JEV_URL, model: 'jev-latest', key: keys.typeSafe }
-  return null
+export function jevRoutesOf(keys: { openRouter?: string; typeSafe?: string }, isRequest: boolean): JevRoute[] {
+  const viaOpenRouter: JevRoute | null = keys.openRouter ? { name: 'OpenRouter', url: 'https://openrouter.ai/api/v1/systemone', model: '~typesafe/jev-latest', key: keys.openRouter } : null
+  const viaTypeSafe: JevRoute | null = keys.typeSafe ? { name: 'TypeSafe', url: JEV_URL, model: 'jev-latest', key: keys.typeSafe } : null
+  return (isRequest ? [viaTypeSafe, viaOpenRouter] : [viaOpenRouter, viaTypeSafe]).filter((r): r is JevRoute => r !== null)
 }
 export const MAX_CANDIDATES = 24
 /** Rules weighed per request: every rule in scope, the ones sharing the request's words first. */

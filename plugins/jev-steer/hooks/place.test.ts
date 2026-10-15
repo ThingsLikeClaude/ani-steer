@@ -30,11 +30,12 @@ function storeOf(on: Parameters<TestBody>[1], entries: Record<string, unknown>) 
  * how to answer, and as portable unless it names a screen part; every lesson it
  * was asked about is counted.
  */
-function world(on: Parameters<TestBody>[1], entries: Record<string, unknown>) {
+function world(on: Parameters<TestBody>[1], entries: Record<string, unknown>, keys: Record<string, string> = { TYPESAFE_API_KEY: 'test-key' }) {
   const store = storeOf(on, entries)
   const clock = mock.clock(on, { now: Date.parse('2026-10-14T00:00:00Z') })
-  mock.env(on, { CLAUDE_CONFIG_DIR: '/cfg', HOME: '/home/me', TYPESAFE_API_KEY: 'test-key' })
+  mock.env(on, { CLAUDE_CONFIG_DIR: '/cfg', HOME: '/home/me', ...keys })
   const asked: string[] = []
+  const urls: string[] = []
   on('fs.list', () => {
     throw new Error('ENOENT')
   })
@@ -50,6 +51,8 @@ function world(on: Parameters<TestBody>[1], entries: Record<string, unknown>) {
   on('model.complete', () => ({ value: { isAnswered: false, reason: 'api-error', status: 529, error: 'overloaded' } }) as never)
   on('http.fetch', ($, e) => {
     const body = JSON.parse(String((e as { init?: { body?: string } }).init?.body)) as { state: { lessons?: string[] }; questions: Record<string, unknown> }
+    // Where lessons were judged; the session start's ping goes the request's way.
+    if (body.state.lessons) urls.push((e as { url: string }).url)
     const lessons = body.state.lessons ?? []
     asked.push(...lessons)
     const noulOf = (k: string) => {
@@ -61,7 +64,7 @@ function world(on: Parameters<TestBody>[1], entries: Record<string, unknown>) {
     const answers = Object.fromEntries(Object.keys(body.questions).map(k => [k, { noul: noulOf(k) }]))
     return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ answers }) } } as never
   })
-  return { clock, store, asked }
+  return { clock, store, asked, urls }
 }
 
 const scopeOf = (store: Map<string, unknown>, id: string) => (store.get('cards') as Card[]).find(c => c.id === id)
@@ -86,4 +89,13 @@ test('a lesson once archived for a full scope comes back, once', async ($, on) =
   await w.clock.settle()
   expect(scopeOf(w.store, 'J-archived')?.isArchived).toBe(false)
   expect(w.store.get('uncappedV1')).toBe(true)
+})
+
+test('background judging goes to OpenRouter first, billed there, with both keys set', async ($, on) => {
+  const w = world(on, { cards: [HABIT] }, { OPENROUTER_API_KEY: 'sk-or-test', TYPESAFE_API_KEY: 'ts-test' })
+  await $.session.start({ cwd: '/home/me/site', surface: null, isInteractive: false })
+  await w.clock.settle()
+  expect(scopeOf(w.store, 'J-habit')?.scope).toBe('global')
+  expect(w.urls.length).toBeGreaterThan(0)
+  expect(w.urls.every(u => u === 'https://openrouter.ai/api/v1/systemone')).toBe(true)
 })

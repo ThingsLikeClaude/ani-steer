@@ -4,7 +4,7 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { Candidate, Card, Display, Need, Preview, Principle, Feedback, Judgment, Kind, Label, Requirement, Scope, Sent, View } from '../types'
 import {
   jevBody,
-  jevRouteOf,
+  jevRoutesOf,
   type JevRoute,
   KIND_LABEL,
   MAX_PROMPT_CHARS,
@@ -1184,9 +1184,9 @@ type Result = { judgments: Judgment[]; candidates: Card[]; reqIds: string[] }
  * commit: the request went out on a draft's judgment; record only, leave the view.
  */
 async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'submit' | 'commit' = 'submit', prevAttached: readonly string[] = [], isPerson = true): Promise<Result | null> {
-  const route = await jevRoute($)
-  await update($, hasKey, () => Boolean(route))
-  if (!route) {
+  const routes = await jevRoutes($, true)
+  await update($, hasKey, () => routes.length > 0)
+  if (!routes.length) {
     await update($, view, v => ({ ...v, error: 'Jev 키가 없어요 · OPENROUTER_API_KEY 또는 /jev-steer:ani-key로 설정' }))
     return null
   }
@@ -1214,14 +1214,25 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
       assistant_last_reply: lastAnswer.slice(-1500),
       project,
     }
-    const body = jevBody({ model: route.model, state, questions: buildQuestions(candidates, reqs, attachedBefore) })
-    const headers = { authorization: `Bearer ${route.key}`, 'content-type': 'application/json' }
-    // 5xx and 429 are transient on Jev's side: two retries with backoff.
-    let res = await $.http.fetch(route.url, { method: 'POST', headers, body })
-    for (const wait of [400, 1500]) {
-      if (res.ok || !(res.status >= 500 || res.status === 429) || seq !== latestSeq) break
-      await $.clock.sleep(wait)
-      res = await $.http.fetch(route.url, { method: 'POST', headers, body })
+    const questions = buildQuestions(candidates, reqs, attachedBefore)
+    const send = async (route: JevRoute) => {
+      const body = jevBody({ model: route.model, state, questions })
+      const headers = { authorization: `Bearer ${route.key}`, 'content-type': 'application/json' }
+      // 5xx and 429 are transient on Jev's side: two retries with backoff.
+      let res = await $.http.fetch(route.url, { method: 'POST', headers, body })
+      for (const wait of [400, 1500]) {
+        if (res.ok || !(res.status >= 500 || res.status === 429) || seq !== latestSeq) break
+        await $.clock.sleep(wait)
+        res = await $.http.fetch(route.url, { method: 'POST', headers, body })
+      }
+      return res
+    }
+    // A route that refuses (an empty balance, a bad key) hands over to the next;
+    // a 400 is about the request itself, and the next would refuse it too.
+    let res = await send(routes[0] as JevRoute)
+    for (const route of routes.slice(1)) {
+      if (res.ok || res.status === 400 || seq !== latestSeq) break
+      res = await send(route)
     }
     const beatMs = (await $.clock.now()) - started
     await update($, beat, () => ({ ok: res.ok, ms: beatMs, at: started, detail: res.ok ? undefined : `HTTP ${res.status}` }))
@@ -1309,12 +1320,13 @@ async function loadNeeds($: EngineInterface): Promise<Need[]> {
   return ((await $.store.get('needs')) as Need[] | undefined) ?? []
 }
 
-/** One yes/no batch to Jev; null when Jev is unreachable. */
-/** The person's keys, OpenRouter first; the service it picks is shown under 설정. */
-async function jevRoute($: EngineInterface): Promise<JevRoute | null> {
-  const route = jevRouteOf({ openRouter: await $.env.get('OPENROUTER_API_KEY'), typeSafe: await $.env.get('TYPESAFE_API_KEY') })
-  await update($, jevVia, () => route?.name ?? '')
-  return route
+/** The person's keys in the order to try; which service carries what is shown under 설정. */
+async function jevRoutes($: EngineInterface, isRequest: boolean): Promise<JevRoute[]> {
+  const keys = { openRouter: await $.env.get('OPENROUTER_API_KEY'), typeSafe: await $.env.get('TYPESAFE_API_KEY') }
+  const forRequest = jevRoutesOf(keys, true)[0]?.name
+  const forBackground = jevRoutesOf(keys, false)[0]?.name
+  await update($, jevVia, () => (!forRequest ? '' : forRequest === forBackground ? forRequest : `요청 ${forRequest} · 백그라운드 ${forBackground}`))
+  return jevRoutesOf(keys, isRequest)
 }
 
 /** Why the last background Jev call failed, said with the stop it caused. */
@@ -1327,9 +1339,10 @@ let jevFailure = ''
  * asked once: the request does not wait on Jev's moment.
  */
 async function askJev($: EngineInterface, state: Record<string, unknown>, questions: Record<string, unknown>, opts: { isQuick?: boolean } = {}): Promise<Answers | null> {
-  const route = await jevRoute($)
-  if (!route || !Object.keys(questions).length) return null
-  const call = () =>
+  // On a request's path it goes where the request's own judging goes.
+  const routes = await jevRoutes($, Boolean(opts.isQuick))
+  if (!routes.length || !Object.keys(questions).length) return null
+  const call = (route: JevRoute) =>
     $.http
       .fetch(route.url, {
         method: 'POST',
@@ -1337,11 +1350,16 @@ async function askJev($: EngineInterface, state: Record<string, unknown>, questi
         body: jevBody({ model: route.model, state, questions }),
       })
       .catch(() => null)
-  let res = await call()
-  for (const wait of opts.isQuick ? [] : JEV_RETRY_MS) {
-    if (res && (res.ok || !(res.status >= 500 || res.status === 429))) break
-    await $.clock.sleep(wait)
-    res = await call()
+  let res: Awaited<ReturnType<typeof call>> = null
+  for (const route of routes) {
+    res = await call(route)
+    for (const wait of opts.isQuick ? [] : JEV_RETRY_MS) {
+      if (res && (res.ok || !(res.status >= 500 || res.status === 429))) break
+      await $.clock.sleep(wait)
+      res = await call(route)
+    }
+    // Refused for itself (400): the next route would refuse it too.
+    if (res?.ok || res?.status === 400) break
   }
   jevFailure = !res ? '연결 끊김' : res.ok ? '' : `HTTP ${res.status}`
   return res?.ok ? (JSON.parse(res.text) as { answers: Answers }).answers : null
@@ -1943,7 +1961,8 @@ function capReqs(rs: Requirement[]): Requirement[] {
 
 /** A tiny Jev call that only proves the line is up. */
 async function ping($: EngineInterface) {
-  const route = await jevRoute($)
+  // The route a request's own judging takes: the one whose speed the person feels.
+  const route = (await jevRoutes($, true))[0]
   const at = await $.clock.now()
   await update($, hasKey, () => Boolean(route))
   if (!route) return update($, beat, () => ({ ok: false, ms: 0, at, detail: '키 없음' }))
@@ -2004,7 +2023,7 @@ export const register: Register = on => {
     if ((await $.store.get('isBandOpen')) === true) await update($, isBandOpen, () => true)
     await $.command.register({ name: 'steer', description: 'ani: 기억한 교훈 보기·정리' })
     await $.command.register({ name: 'ani', description: 'ani 패널 열기' })
-    { const route = await jevRoute($); await update($, hasKey, () => Boolean(route)) }
+    { const routes = await jevRoutes($, true); await update($, hasKey, () => routes.length > 0) }
     // The pane is where ani lives: open it beside the transcript from the start.
     if ((await read($, display)).pane) $.clock.after(0, () => $.ui.open({ id: PANE, title: TITLE }))
     $.clock.after(0, () => backfill($))
