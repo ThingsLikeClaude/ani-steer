@@ -1,5 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
+import type { TestBody } from 'claude-code/testing'
 
 // Stand-ins for the engine: a store, and the engine's own drawing.
 function engine(on: On, entries?: Record<string, unknown>) {
@@ -198,4 +199,59 @@ test('requirements from before projects were recorded wait for a decision; not-h
   await pane.press({ key: 's-rq-skip-fold' })
   expect(await pane.find({ key: 'at-R-1' })).toBeDefined()
   await pane.unmount()
+})
+
+const ANI_FILES: Record<string, string> = {
+  '.ani/INDEX.md': [
+    '| id | status | scope | keywords | summary | updated |',
+    '| --- | --- | --- | --- | --- | --- |',
+    '| F-1 | captured | global | hmi | 메뉴바 문제를 제거 허가로 읽음 — 왼쪽 메뉴바는 고정 | 2026-09-07 |',
+    '| F-2 | compiled | global | deploy | 로컬만 보고 배포 URL을 넘김 | 2026-09-05 |',
+  ].join('\n'),
+  '.ani/patterns/F-1.md': '---\nid: F-1\nstatus: captured\ndate: 2026-09-07\nproject: hmi2html\ntrigger_quote: "왼쪽에 메뉴바있어야됨"\nkeywords: [hmi]\nrecurrence: 0\n---\n\n## Intent\n\n왼쪽 메뉴바는 고정이다.\n',
+  '.ani/patterns/F-2.md': '---\nid: F-2\nstatus: compiled\ndate: 2026-09-05\nproject: sta_ai_seminar_v2\ntrigger_quote: "배포 링크 404야"\nkeywords: [deploy]\nrecurrence: 0\n---\n',
+  '.ani/patterns/S-deploy.md': '---\nid: S-deploy\nstatus: active\ncompiled_from: [F-2]\ndate_compiled: 2026-09-05\nkeywords: [deploy]\nscope: global\nsummary: Use when about to hand the user a deployed URL\n---\n',
+}
+
+/** ani's files on disk, answered beneath the plugin whatever the home folder is. */
+function aniDisk(on: Parameters<TestBody>[1]) {
+  const find = (path: string) => Object.keys(ANI_FILES).find(k => path.replace(/\\/g, '/').endsWith(k))
+  on('fs.read', ($, e) => {
+    const k = find((e as { path: string }).path)
+    if (!k) throw new Error('ENOENT')
+    return { value: ANI_FILES[k] } as never
+  })
+  on('fs.list', ($, e) => {
+    if (!(e as { path: string }).path.replace(/\\/g, '/').endsWith('.ani/patterns')) throw new Error('ENOENT')
+    return { value: ['F-1.md', 'F-2.md', 'S-deploy.md'].map(name => ({ name, kind: 'file', size: 1, mtimeMs: 0, isLink: false })) } as never
+  })
+  on('prompt.submit', ($, e) => ({ text: (e as { text: string }).text }) as never)
+}
+
+test("ani's records from every project are listed here, each tagged with its project", async ($, on) => {
+  mock.store(on)
+  const clock = mock.clock(on)
+  aniDisk(on)
+  on('ui.toast', () => ({ value: undefined }) as never)
+  await $.prompt.submit({ text: '아무 요청이나 하나' } as never)
+  await clock.settle()
+  const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await pane.press({ key: 'tab-lessons' })
+  // hmi2html's lesson waits for a decision here; the S is a lesson for every project.
+  expect(await pane.find({ key: 'at-F-1' })).toBeDefined()
+  expect(await hasSvg(pane, /Use when about to hand the user a deployed URL/)).toBe(true)
+  await pane.press({ key: 'tab-feedback' })
+  expect(await pane.find({ key: 's-fb-other' })).toBeDefined()
+  expect(await hasSvg(pane, /배포 링크 404야/)).toBe(true)
+  await pane.unmount()
+  // Forgotten here, it is not brought back by the next request.
+  const term = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await term.find({ type: 'Text', text: /\[hmi2html\]/ })).toBeDefined()
+  await term.press({ key: 'rm-S-deploy' })
+  await term.unmount()
+  await $.prompt.submit({ text: '두 번째 요청' } as never)
+  await clock.settle()
+  const again = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await again.find({ type: 'Text', text: /deployed URL/ })).toBeUndefined()
+  await again.unmount()
 })

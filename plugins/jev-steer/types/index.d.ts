@@ -113,6 +113,8 @@ export type Feedback = {
   meant?: string
   /** The judgment this one case supports; judgments add up to a lesson. */
   judgment?: string
+  /** The ani pattern (F-…) it was brought in from. */
+  aniId?: string
 }
 
 export type Display = { chip: boolean; band: boolean; toast: boolean; pane: boolean }
