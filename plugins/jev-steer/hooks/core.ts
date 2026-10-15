@@ -74,6 +74,8 @@ export type AniPattern = {
   compiledFrom: string[]
   recurrence: number
   sections: Record<string, string>
+  /** What the person said, from the pattern's excerpt (`> user: ...`): their words, not ani's summary. */
+  said: string[]
 }
 
 export function parseAniPattern(markdown: string): AniPattern | null {
@@ -105,7 +107,14 @@ export function parseAniPattern(markdown: string): AniPattern | null {
     compiledFrom: list(fm.compiled_from),
     recurrence: Number(fm.recurrence) || 0,
     sections,
+    said: (sections.Excerpt ?? '').split('\n').map(l => l.match(/^>\s*user:\s*(.+)$/i)?.[1]?.replace(/\*\*/g, '').trim() ?? '').filter(Boolean),
   }
+}
+
+/** Mostly Latin letters: ani wrote its summaries in English, never the person's words here. */
+export function isLatin(text?: string): boolean {
+  const latin = (text?.match(/[A-Za-z]/g) ?? []).length
+  return latin > 20 && latin > 2 * (text?.match(/[가-힣]/g) ?? []).length
 }
 
 const plain = (s?: string, max = 160) => (s ? excerpt(s.replace(/\*\*|`/g, ''), max) : undefined)
@@ -119,7 +128,7 @@ export function aniCard(p: AniPattern, summary?: string): Card {
   return {
     id: p.id,
     ts: Date.parse(p.date ?? '') || 0,
-    text: p.quote ?? summary ?? p.summary ?? p.id,
+    text: p.quote ?? p.said[0] ?? summary ?? p.summary ?? p.id,
     kind: 'intent',
     scope: isSkill || !p.project ? 'global' : 'personal-project',
     project: p.project ?? '',
@@ -129,7 +138,7 @@ export function aniCard(p: AniPattern, summary?: string): Card {
     intent: plain(p.sections.Intent ?? p.sections.Situation),
     why: plain(p.sections.Misreading),
     count: isSkill ? Math.max(1, p.compiledFrom.length) : 1 + p.recurrence,
-    ...(p.quote ? { examples: [p.quote] } : {}),
+    ...(p.quote ? { examples: [p.quote] } : p.said.length ? { examples: p.said.slice(0, 3) } : {}),
   }
 }
 
@@ -137,11 +146,11 @@ export function aniCard(p: AniPattern, summary?: string): Card {
 export function aniCase(p: AniPattern, at: number, cardId: string, summary?: string): Feedback {
   return {
     at,
-    text: p.quote ?? summary ?? p.id,
+    text: p.quote ?? p.said[0] ?? summary ?? p.id,
     cardId,
     project: p.project ?? '',
     aniId: p.id,
-    said: p.quote,
+    said: p.quote ?? p.said[0],
     understood: plain(p.sections.Misreading),
     meant: plain(p.sections.Intent),
     judgment: summary?.replace(/\*\*|`/g, ''),

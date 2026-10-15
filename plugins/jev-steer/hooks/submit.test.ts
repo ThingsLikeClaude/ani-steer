@@ -66,3 +66,41 @@ test("this project's requirement rides; another project's does not while undecid
 test("another project's requirement rides here once attached", async ($, on) => {
   expect(await sendWith($, on, [{ ...otherReq, alsoIn: ['unknown'] }])).toContain('src/generated는 수정 금지')
 })
+
+const PANE = { plugin: 'jev-steer', component: 'Pane', requestId: 'jev-steer', props: {} as never } as const
+
+/** Jev calls every prompt a correction holding a requirement; returns how often the small model was asked. */
+async function sendAsPerson($: Parameters<TestBody>[0], on: Parameters<TestBody>[1], text: string) {
+  mock.store(on, {})
+  const clock = mock.clock(on)
+  mock.env(on, { TYPESAFE_API_KEY: 'test-key', HOME: '/tmp' })
+  jev(on, { is_correction: { noul: 0.9 }, has_requirement: { noul: 0.9 } })
+  let asked = 0
+  on('model.complete', () => {
+    asked++
+    return { value: { isAnswered: false, reason: 'offline' } } as never
+  })
+  on('prompt.submit', ($, e) => ({ text: e.text }) as never)
+  await $.prompt.submit({ text, asUser: true } as never)
+  await clock.settle()
+  const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const cases = (await pane.find({ key: 'tab-feedback' }))?.text
+  await pane.unmount()
+  return { asked, cases }
+}
+
+test("the person's correction is recorded as a case", async ($, on) => {
+  const { cases } = await sendAsPerson($, on, '아니 배경만 바꾸라고 했잖아')
+  expect(cases).toMatch(/사례 1/)
+})
+
+test("an app helper's role prompt is not the person's: no case, no requirement", async ($, on) => {
+  const { asked, cases } = await sendAsPerson($, on, 'You are a commit message generator. Write one line. 타입은 항상 WIP')
+  expect(cases).toMatch(/사례 0/)
+  expect(asked).toBe(0)
+})
+
+test("an app's notice in the person's turn is not recorded", async ($, on) => {
+  const { cases } = await sendAsPerson($, on, '<system-reminder>The user started your suggested background task.</system-reminder>')
+  expect(cases).toMatch(/사례 0/)
+})

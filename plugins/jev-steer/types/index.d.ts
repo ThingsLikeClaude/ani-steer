@@ -118,6 +118,10 @@ export type Feedback = {
   aniId?: string
   /** Found in a past conversation, before ani was recording: `before` and `did` hold that conversation's context. */
   fromHistory?: boolean
+  /** The conversation around a case found in a past conversation: requests before and after, what the agent said and did. */
+  context?: string
+  /** The working habit the case shows, one level above this incident: what cases are paired by. */
+  pattern?: string
 }
 
 export type Display = { chip: boolean; band: boolean; toast: boolean; pane: boolean }

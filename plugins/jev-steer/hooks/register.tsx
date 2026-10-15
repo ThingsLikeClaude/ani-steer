@@ -17,6 +17,7 @@ import {
   judge,
   kindOf,
   noul,
+  isLatin,
   parseAniPattern,
   parseIndex,
   pickCandidates,
@@ -29,7 +30,8 @@ import {
   type AniPattern,
   type Answers,
 } from './core'
-import { lineSplitter, pastPromptReader } from './history'
+import { contextOf, isPersonOrigin, isScriptedEntry, lineSplitter, pastPromptReader, personText } from './history'
+import type { PastPrompt } from './history'
 import { KIND_COLOR, STATE_COLOR, bandSvg, bannerSvg, cardSvg, headingSvg, leadStripSvg, paneHeaderSvg, ruleSvg, rowSvg, sectionSvg, tableHeadSvg, titleRowSvg, detailSvg, textWidth, caseCardSvg, askCardSvg, nowCardSvg, listCardSvg, capLabelSvg, type CardRow, type Glow, type Pulse, type KindCount } from './ui'
 
 // ── constants and state ─────────────────────────────────────────────────
@@ -140,6 +142,8 @@ let project = 'unknown'
 let root = ''
 let home = ''
 const recentPrompts: string[] = []
+/** Started by another program (`claude -p`, the SDKs): its prompts are an agent's or a script's, never recorded as the person's. */
+let isScriptedSession = false
 let latestSeq = 0
 /** The draft Jev judged while the person typed, and what it said: reused at submit when the text matches. */
 let drafted: { text: string; result: Result } | null = null
@@ -254,6 +258,83 @@ async function bringInAni($: EngineInterface) {
   await save($, 'aniImported', [...done, ...patterns.map(p => p.id)])
 }
 
+/**
+ * Cases recorded from a turn the person did not type keep only the person's
+ * words: an attached terminal snippet is taken off, and a case that was all
+ * an app's notice is removed. Once.
+ */
+async function keepPersonWords($: EngineInterface) {
+  if (await $.store.get('personWordsV1')) return
+  const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+  const kept = fb.flatMap(f => {
+    if (f.fromHistory || f.aniId) return [f]
+    const t = personText(f.text)
+    return t ? [t === f.text ? f : { ...f, text: t }] : []
+  })
+  await save($, 'feedbackLog', kept)
+  const own = await ownCards($)
+  const words = (x: string) => personText(x) || x
+  await save($, 'cards', own.map(c => (c.source === 'jev' ? { ...c, text: words(c.text), examples: c.examples?.map(words) } : c)))
+  await save($, 'personWordsV1', true)
+}
+
+let isKoreanizing = false
+
+/**
+ * ani wrote its records' summaries in English, and they stood where the
+ * person's words go. Each such lesson and case is said again in Korean, and
+ * shows what the person actually said (the pattern's excerpt). A few a session.
+ */
+async function koreanizeAni($: EngineInterface) {
+  if (isKoreanizing) return
+  isKoreanizing = true
+  try {
+    const patternOf = async (id: string) => parseAniPattern(String(await $.fs.read(`${home}/.ani/patterns/${id}.md`).catch(() => '')))
+    const ask = async (system: string, prompt: string) => {
+      const r = await $.model.complete({ model: 'haiku', maxTokens: 400, timeoutMs: 20000, system, prompt })
+      if (!r.isAnswered) return null
+      try {
+        return JSON.parse(r.text.match(/\{[\s\S]*\}/)?.[0] ?? '') as Record<string, string | undefined>
+      } catch {
+        return null
+      }
+    }
+    const wordsOf = (p: AniPattern | null) => (p?.quote ? [p.quote] : p?.said ?? [])
+    for (const c of mineOf(await ownCards($)).filter(c => c.source === 'ani' && [c.lesson, c.intent, c.why, c.text].some(isLatin)).slice(0, 8)) {
+      const p = await patternOf(c.id)
+      // A compiled lesson keeps no words of its own: they are in the records it was compiled from.
+      let said = wordsOf(p)
+      for (const id of p?.compiledFrom ?? []) if (said.length < 3) said = [...said, ...wordsOf(await patternOf(id))]
+      if (!said.length) {
+        const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+        said = fb.filter(f => f.cardId === c.id && f.said && !isLatin(f.said)).map(f => f.said as string)
+      }
+      const t = await ask(
+        '영어로 쓰인 교훈 기록을 한국어로 다시 씁니다. JSON만 답하세요: {"intent": "...", "why": "...", "lesson": "...", "short": "..."}. 모두 한국어 한 문장, 말줄임표 금지. ' +
+          'intent: 사용자가 실제로 원한 것(30자 이내). why: 에이전트가 왜 잘못 읽었는지(40자 이내). lesson: 그 상황에서 다음엔 할 일, 상황으로 시작(40자 이내). short: lesson을 20자 이내로.',
+        [`요약: ${c.lesson ?? ''}`, `의도: ${c.intent ?? ''}`, `오해: ${c.why ?? ''}`, said.length ? `사용자가 한 말: ${said.slice(0, 3).join(' / ')}` : '', p ? Object.entries(p.sections).map(([k, v]) => `${k}: ${v.slice(0, 600)}`).join('\n') : ''].filter(Boolean).join('\n'),
+      )
+      if (!t?.lesson || isLatin(t.lesson)) continue
+      const short = t.short && [...t.short].length <= SHORT_MAX ? t.short : undefined
+      await editCard($, c.id, { intent: t.intent, why: t.why, lesson: t.lesson, short, ...(said[0] ? { text: said[0], examples: said.slice(0, 3) } : {}) })
+    }
+    const cases = (((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []).filter(f => f.aniId && [f.judgment, f.understood, f.meant, f.text].some(isLatin)).slice(0, 8)
+    for (const f of cases) {
+      const p = await patternOf(f.aniId as string)
+      const said = p?.quote ?? p?.said[0]
+      const t = await ask(
+        '영어로 쓰인 사례 기록을 한국어로 다시 씁니다. JSON만 답하세요: {"understood": "...", "meant": "...", "judgment": "..."}. 모두 한국어 한 문장, 각 80자 이내, 말줄임표 금지. ' +
+          'understood: 에이전트가 요청을 무엇으로 이해했는지. meant: 사용자가 실제로 의도한 것. judgment: 이 사례 하나에서 내릴 수 있는 판단("이 상황에서는 ~였다").',
+        [`판단: ${f.judgment ?? ''}`, `오해: ${f.understood ?? ''}`, `의도: ${f.meant ?? ''}`, said ? `사용자가 한 말: ${said}` : '', p ? Object.entries(p.sections).map(([k, v]) => `${k}: ${v.slice(0, 600)}`).join('\n') : ''].filter(Boolean).join('\n'),
+      )
+      if (!t?.judgment || isLatin(t.judgment)) continue
+      await setFeedback($, f.at, { understood: t.understood, meant: t.meant, judgment: t.judgment, ...(said ? { text: said, said } : {}) })
+    }
+  } finally {
+    isKoreanizing = false
+  }
+}
+
 async function editCard($: EngineInterface, id: string, change: Partial<Card> | null) {
   const own = await ownCards($)
   const next = change === null ? own.filter(c => c.id !== id) : own.map(c => (c.id === id ? { ...c, ...change } : c))
@@ -337,6 +418,12 @@ async function remember($: EngineInterface, prompt: string, answers: Answers, ca
   return null
 }
 
+/** How a case's habit is written: what pairs two cases said in different words or projects. */
+const PATTERN_RULE = '에이전트가 고쳐야 할 작업 습관을 이 사례보다 한 단계 일반화해서 30자 이내 한 문장으로 쓰세요. 특정 화면·파일·값·도구 이름은 빼고 일의 종류와 습관만 남길 것. 예: "지정된 범위를 넓혀서 해석함", "확인하지 않고 완료라고 보고함", "보여 줄 것을 사용자에게 실행시킴".'
+
+/** Where a lesson came from when it was not made here from a correction. */
+const SOURCE_LABEL: Partial<Record<Card['source'], string>> = { ani: '옛 ani 기록에서' }
+
 const CANDIDATE_AT = 0.7
 /** How many lessons, lesson candidates and waiting cases one new case is weighed against. */
 const PLACE_MAX = 24
@@ -364,21 +451,24 @@ async function placeCase($: EngineInterface, at: number) {
   const me = fb.find(f => f.at === at)
   if (!me?.judgment || me.cardId || me.candidateId) return
   const judgment = me.judgment
-  const firstJudgment = (c: Candidate) => fb.find(f => c.cases.includes(f.at) && f.judgment)?.judgment ?? ''
-  const lessons = nearest(judgment, (await ownCards($)).filter(c => c.lesson && !c.isArchived && !c.isMuted), c => `${c.lesson} ${c.why ?? ''}`, 8)
-  const cands = nearest(judgment, (((await $.store.get('candidates')) as Candidate[] | undefined) ?? []).filter(c => !c.isDeclined), c => c.lesson ?? firstJudgment(c), 8)
-  const waiting = nearest(judgment, fb.filter(f => f.at !== at && !f.cardId && !f.candidateId && f.judgment), f => f.judgment as string, PLACE_MAX - lessons.length - cands.length)
+  // Cases are weighed by the habit they show: the same habit in another task or project is the same lesson.
+  const habit = (f: Feedback) => (f.pattern ? `${f.pattern} — ${f.judgment ?? ''}` : (f.judgment as string))
+  const firstJudgment = (c: Candidate) => { const f = fb.find(x => c.cases.includes(x.at) && x.judgment); return f ? habit(f) : '' }
+  const key = me.pattern ? `${me.pattern} ${judgment}` : judgment
+  const lessons = nearest(key, (await ownCards($)).filter(c => c.lesson && !c.isArchived && !c.isMuted), c => `${c.lesson} ${c.why ?? ''}`, 8)
+  const cands = nearest(key, (((await $.store.get('candidates')) as Candidate[] | undefined) ?? []).filter(c => !c.isDeclined), c => c.lesson ?? firstJudgment(c), 8)
+  const waiting = nearest(key, fb.filter(f => f.at !== at && !f.cardId && !f.candidateId && f.judgment), habit, PLACE_MAX - lessons.length - cands.length)
   if (!lessons.length && !cands.length && !waiting.length) return
   const same = (text: string) => ({
     type: 'noul',
-    instructions: `Does the new judgment describe the same recurring mistake, in the same kind of situation, as this: "${text}"`,
-    criteria: { true: 'same mistake and situation; one lesson would cover both', false: 'a different mistake or a different situation' },
+    instructions: `Does the new case show the same working habit for the assistant to fix as this one, so one lesson would prevent both, even if the task, project or wording differ: "${text}"`,
+    criteria: { true: 'the same habit to fix; one lesson covers both', false: 'a different mistake' },
   })
   const q: Record<string, unknown> = {}
-  lessons.forEach((c, i) => (q[`l${i}`] = same(c.lesson as string)))
+  lessons.forEach((c, i) => (q[`l${i}`] = same(`${c.lesson as string}${c.why ? ` (${c.why})` : ''}`)))
   cands.forEach((c, i) => (q[`k${i}`] = same(c.lesson ?? firstJudgment(c))))
-  waiting.forEach((f, i) => (q[`p${i}`] = same(f.judgment as string)))
-  const answers = await askJev($, { new_judgment: judgment, new_case: `${me.understood ?? ''} / ${me.meant ?? ''}` }, q)
+  waiting.forEach((f, i) => (q[`p${i}`] = same(habit(f))))
+  const answers = await askJev($, { new_case_habit: me.pattern ?? '', new_judgment: judgment, new_case: `${me.understood ?? ''} / ${me.meant ?? ''}` }, q)
   if (!answers) return
   // The strongest match; a lesson before a candidate before a lone case when equal.
   const best = [
@@ -426,7 +516,7 @@ async function placeCase($: EngineInterface, at: number) {
     system:
       '같은 판단을 낳은 사례 두 개가 주어집니다. 둘을 함께 덮는 교훈 하나를 만드세요. JSON만 답하세요: {"intent": "...", "why": "...", "lesson": "...", "short": "..."}. 모두 한국어 한 문장, 말줄임표 금지. ' +
       'intent: 사용자가 실제로 원한 것(30자 이내). why: 에이전트가 왜 잘못 읽었는지(40자 이내). lesson: 그 상황에서 다음엔 할 일, 상황으로 시작(40자 이내). short: lesson을 20자 이내로 다시 요약.',
-    prompt: [other, me].map((f, i) => `사례 ${i + 1}\n요청: ${f.before ?? ''}\n에이전트가 이해한 것: ${f.understood ?? ''}\n실제 의도: ${f.meant ?? ''}\n피드백: ${f.said ?? f.text}\n판단: ${f.judgment}`).join('\n\n'),
+    prompt: [other, me].map((f, i) => `사례 ${i + 1}\n요청: ${f.before ?? ''}\n에이전트가 이해한 것: ${f.understood ?? ''}\n실제 의도: ${f.meant ?? ''}\n피드백: ${f.said ?? f.text}\n판단: ${f.judgment}${f.pattern ? `\n습관: ${f.pattern}` : ''}`).join('\n\n'),
   })
   if (!r.isAnswered) return
   try {
@@ -550,17 +640,18 @@ async function judgeCase($: EngineInterface, at: number, prompt: string, transcr
     maxTokens: 300,
     timeoutMs: 20000,
     system:
-      '대화 기록과 그 뒤에 나온 사용자 피드백이 주어집니다. JSON만 답하세요: {"before": "...", "did": "...", "said": "...", "understood": "...", "meant": "...", "judgment": "..."}. 모두 한국어 한 문장, 각 80자 이내, 말줄임표 금지. 원래 요청의 구체적인 대상과 표현은 살려서 쓸 것. ' +
+      '대화 기록과 사용자 피드백이 주어집니다. 기록에 피드백 뒤의 대화가 있으면 사용자가 결국 무엇을 원했는지 확인하는 데 쓰세요. JSON만 답하세요: {"before": "...", "did": "...", "said": "...", "understood": "...", "meant": "...", "judgment": "...", "pattern": "..."}. 모두 한국어 한 문장, 각 80자 이내, 말줄임표 금지. 원래 요청의 구체적인 대상과 표현은 살려서 쓸 것. ' +
       'before: 이 피드백이 가리키는 사용자의 원래 요청(바로 앞이 아니라 몇 턴 위일 수 있음, 필요한 만큼 거슬러 올라갈 것). ' +
       'did: 그 요청 이후 에이전트가 실제로 한 것. said: 피드백 자체의 요지. ' +
       'understood: 에이전트가 요청을 무엇으로 이해했는지. meant: 사용자가 실제로 의도한 것. 둘의 차이가 드러나게 쓸 것. ' +
-      'judgment: 이 사례 하나에서 내릴 수 있는 판단(일반 규칙이 아니라 "이 상황에서는 ~였다").',
+      'judgment: 이 사례 하나에서 내릴 수 있는 판단(일반 규칙이 아니라 "이 상황에서는 ~였다"). ' +
+      `pattern: ${PATTERN_RULE}`,
     prompt: `대화 기록:\n${transcript}\n\n피드백:\n${prompt.slice(0, 1500)}`,
   })
   if (!res.isAnswered) return false
   try {
-    const t = JSON.parse(res.text.match(/\{[\s\S]*\}/)?.[0] ?? '') as { before?: string; did?: string; said?: string; understood?: string; meant?: string; judgment?: string }
-    await setFeedback($, at, { before: t.before, did: t.did, said: t.said, understood: t.understood, meant: t.meant, judgment: t.judgment })
+    const t = JSON.parse(res.text.match(/\{[\s\S]*\}/)?.[0] ?? '') as { before?: string; did?: string; said?: string; understood?: string; meant?: string; judgment?: string; pattern?: string }
+    await setFeedback($, at, { before: t.before, did: t.did, said: t.said, understood: t.understood, meant: t.meant, judgment: t.judgment, pattern: t.pattern?.slice(0, 60) })
     if (t.judgment) await placeCase($, at)
     return Boolean(t.judgment)
   } catch {
@@ -571,14 +662,17 @@ async function judgeCase($: EngineInterface, at: number, prompt: string, transcr
 
 // ── past conversations ──────────────────────────────────────────────────
 
-/** How far back "지난 대화에서 사례 찾기" reads. */
+/** How far back "지난 대화에서 사례 찾기" reads; "전체 기간" reads everything before that. */
 const HISTORY_DAYS = 45
-/** Requests per Jev call when asking which past requests were corrections. */
-const HISTORY_BATCH = 15
+/** Requests per Jev call when asking which past requests were corrections; each carries its conversation. */
+const HISTORY_BATCH = 10
+/** How past requests are read and judged. A run made the older way can be run again. */
+const HISTORY_V = 2
 /** `$.fs.read` takes files up to 4 MiB; longer transcripts are streamed. */
 const READ_MAX = 4_000_000
 
-type History = { status: 'running' | 'done' | 'error'; at: number; since: number; until: number; files: number; filesDone: number; prompts: number; found: number; enriched: number; error?: string }
+type HistoryRange = 'recent' | 'all'
+type History = { status: 'running' | 'done' | 'error'; at: number; since: number; until: number; files: number; filesDone: number; prompts: number; found: number; enriched: number; error?: string; v?: number; range?: HistoryRange }
 
 async function setHistory($: EngineInterface, change: Partial<History>) {
   const cur = ((await $.store.get('history')) as History | undefined) ?? { status: 'running', at: 0, since: 0, until: 0, files: 0, filesDone: 0, prompts: 0, found: 0, enriched: 0 }
@@ -634,14 +728,16 @@ const isHistoryLive = (h: History | undefined, now: number) => h?.status === 'ru
 /**
  * "지난 대화에서 사례 찾기": the corrections made before ani was recording,
  * walked through the same ladder as live ones. One run at a time; progress is
- * kept per transcript, so pressing again after a stop carries on.
+ * kept per transcript, so pressing again after a stop carries on. A range
+ * starts a new run: the last 45 days, or everything before them.
  */
-async function mineHistory($: EngineInterface) {
+async function mineHistory($: EngineInterface, range?: HistoryRange) {
   if (isMining || isHistoryLive((await $.store.get('history')) as History | undefined, await $.clock.now())) return
   isMining = true
   try {
-    await readHistory($)
+    await readHistory($, range)
     await judgeHistory($)
+    await regroupCases($)
     await setHistory($, { status: 'done' })
   } catch (err) {
     await setHistory($, { status: 'error', error: excerpt(String(err).replace(/^Error: /, ''), 80) })
@@ -650,22 +746,46 @@ async function mineHistory($: EngineInterface) {
   }
 }
 
+/** What a past request's case keeps of its conversation. */
+const caseContext = (p: PastPrompt): Partial<Feedback> => ({
+  before: p.before,
+  did: p.reply?.slice(-400),
+  after: p.after?.map(a => excerpt(a, 80)),
+  context: contextOf(p).slice(0, 3000),
+})
+
+/** One past request as Jev reads it: what came before and after it, in order. */
+const itemOf = (p: PastPrompt) => ({
+  earlier_user_messages: (p.earlier ?? []).map(e => e.slice(0, 200)),
+  assistant_actions: p.tools ?? [],
+  assistant_reply: (p.reply ?? '').slice(-500),
+  user_message: p.text.slice(0, 800),
+  assistant_next_reply: (p.next ?? '').slice(-200),
+  next_user_messages: (p.after ?? []).map(a => a.slice(0, 200)),
+})
+
 /**
- * Every transcript written in the last HISTORY_DAYS, up to when ani started
- * recording (what came after was judged as it was sent): Jev says which of the
- * person's requests corrected the agent, and those become cases.
+ * The transcripts of a range, up to when ani started recording (what came
+ * after was judged as it was sent): Jev says which of the person's requests
+ * corrected the agent, and those become cases. Only what the person typed in
+ * their own sessions is asked about: not the engine's or the app's turns, and
+ * not sessions another program started, whose prompts an agent wrote.
  */
-async function readHistory($: EngineInterface) {
+async function readHistory($: EngineInterface, range?: HistoryRange) {
   const now = await $.clock.now()
   const prev = (await $.store.get('history')) as History | undefined
-  const isResuming = Boolean(prev && prev.status !== 'done')
+  // No range: carry on with the run that stopped.
+  const isResuming = !range && Boolean(prev && prev.status !== 'done')
   const live = (((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []).filter(f => !f.aniId && !f.fromHistory).map(f => f.at)
-  const since = isResuming && prev ? prev.since : now - HISTORY_DAYS * 86_400_000
-  const until = isResuming && prev ? prev.until : live.length ? Math.min(...live) : now
+  const liveStart = live.length ? Math.min(...live) : now
+  const recentDone = prev && prev.status === 'done' && (prev.v ?? 1) >= HISTORY_V && prev.range !== 'all'
+  const since = isResuming && prev ? prev.since : range === 'all' ? 0 : now - HISTORY_DAYS * 86_400_000
+  const until = isResuming && prev ? prev.until : range === 'all' && recentDone && prev ? prev.since : liveStart
   // A transcript is known by its file name, the session's id: the list of those read stays small.
   const files = await transcriptFiles($, since)
   if (!files.length) throw new Error('대화 기록 폴더를 찾지 못했어요')
-  const done = new Set(((await $.store.get('historyFiles')) as string[] | undefined) ?? [])
+  if (!isResuming) await save($, 'historyFiles', [])
+  const done = new Set(isResuming ? (((await $.store.get('historyFiles')) as string[] | undefined) ?? []) : [])
   await setHistory($, {
     status: 'running',
     since,
@@ -673,6 +793,8 @@ async function readHistory($: EngineInterface) {
     files: files.length,
     filesDone: files.filter(f => done.has(f.name)).length,
     error: undefined,
+    v: HISTORY_V,
+    range: isResuming ? prev?.range ?? 'recent' : range ?? 'recent',
     ...(isResuming ? {} : { prompts: 0, found: 0, enriched: 0 }),
   })
   const slugs = new Map<string, string>()
@@ -687,26 +809,32 @@ async function readHistory($: EngineInterface) {
       // A long transcript is read in the session's own process: let it breathe.
       if (++n % 2000 === 0) await $.clock.sleep(0)
     }
-    const known = new Set((((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []).map(x => x.at))
-    const fresh = reader.prompts().filter(p => !known.has(p.at) && !asked.has(p.uuid))
-    for (const p of fresh) asked.add(p.uuid)
+    const prompts = reader.prompts().filter(p => !asked.has(p.uuid))
+    for (const p of prompts) asked.add(p.uuid)
+    const byAt = new Map((((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []).map(x => [x.at, x]))
+    // A case an earlier run found gets the conversation around it, and is judged again with it.
+    for (const p of prompts.filter(x => byAt.get(x.at)?.fromHistory && !byAt.get(x.at)?.context)) await setFeedback($, p.at, caseContext(p))
+    const fresh = prompts.filter(p => !byAt.has(p.at))
     let found = 0
     for (let i = 0; i < fresh.length; i += HISTORY_BATCH) {
       const batch = fresh.slice(i, i + HISTORY_BATCH)
       const answers = await askJev(
         $,
-        { items: batch.map(p => ({ earlier_user_message: (p.before ?? '').slice(0, 300), assistant_reply: (p.reply ?? '').slice(-500), user_message: p.text.slice(0, 800) })) },
+        { items: batch.map(itemOf) },
         Object.fromEntries(batch.map((_, k) => [`h${k}`, {
           type: 'noul',
-          instructions: `In items[${k}], is user_message correcting the assistant: saying it misunderstood, did something other than what was asked, went further than asked, or missed something? Not a new request, a question, an approval or a remark.`,
-          criteria: { true: 'a correction of what the assistant did or said', false: 'not a correction' },
+          instructions:
+            `In items[${k}], is user_message the person correcting the assistant: saying it misunderstood, did something other than asked, went further than asked, missed something, or that what it made is wrong or still broken? ` +
+            'It counts when asked as a question ("X 아니지???", "왜 Y로 했어?") or followed by the next request ("X가 아니라 Y야, 그리고 Z도 해줘"). Read the messages before and after it to tell. ' +
+            'Not a correction: a new request that finds no fault with what was done, a plain question, an approval, or a remark.',
+          criteria: { true: 'corrects what the assistant did or said', false: 'not a correction' },
         }])),
       )
       if (!answers) throw new Error('Jev에 연결하지 못했어요')
       const hits = batch.filter((_, k) => noul(answers, `h${k}`) >= 0.6)
       if (!hits.length) continue
       const cases: Feedback[] = []
-      for (const p of hits) cases.push({ at: p.at, text: p.text, cardId: '', project: await projectOf($, p.cwd, slugs), fromHistory: true, before: p.before, did: p.reply?.slice(-400) })
+      for (const p of hits) cases.push({ at: p.at, text: p.text, cardId: '', project: await projectOf($, p.cwd, slugs), fromHistory: true, ...caseContext(p) })
       const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
       const have = new Set(fb.map(x => x.at))
       const add = cases.filter(c => !have.has(c.at))
@@ -720,18 +848,57 @@ async function readHistory($: EngineInterface) {
   }
 }
 
-/** Each case found in past conversations is worded and placed like a live one, oldest first. */
+/**
+ * Each case found in past conversations is worded and placed like a live one,
+ * oldest first: new ones, and earlier ones that now have their conversation
+ * and no habit yet, so they are paired by it.
+ */
 async function judgeHistory($: EngineInterface) {
   const tried = new Set<number>()
   for (;;) {
     const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
-    const next = fb.filter(f => f.fromHistory && !f.judgment && !tried.has(f.at)).sort((a, b) => a.at - b.at)[0]
+    const isWaiting = (f: Feedback) => !f.cardId && !f.candidateId
+    const next = fb.filter(f => f.fromHistory && !tried.has(f.at) && (!f.judgment || (!f.pattern && f.context && isWaiting(f)))).sort((a, b) => a.at - b.at)[0]
     if (!next) return
     tried.add(next.at)
-    const transcript = [next.before && `[0] 사용자: ${next.before}`, next.did && `[1] 에이전트: ${next.did}`].filter(Boolean).join('\n') || '(앞 대화 기록 없음)'
+    const transcript = next.context ?? ([next.before && `사용자: ${next.before}`, next.did && `에이전트: ${next.did}`].filter(Boolean).join('\n') || '(앞 대화 기록 없음)')
     await judgeCase($, next.at, next.text, transcript)
     const h = (await $.store.get('history')) as History
     await setHistory($, { enriched: h.enriched + 1 })
+  }
+}
+
+let isRegrouping = false
+
+/**
+ * Waiting cases judged before habits were written get one, and are weighed
+ * again: two that show the same habit become a lesson candidate, whatever
+ * their wording or project.
+ */
+async function regroupCases($: EngineInterface) {
+  if (isRegrouping) return
+  isRegrouping = true
+  try {
+    const tried = new Set<number>()
+    for (;;) {
+      const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+      const next = fb.filter(f => f.judgment && !f.pattern && !f.cardId && !f.candidateId && !f.aniId && !tried.has(f.at)).sort((a, b) => a.at - b.at)[0]
+      if (!next) return
+      tried.add(next.at)
+      const r = await $.model.complete({
+        model: 'haiku',
+        maxTokens: 80,
+        timeoutMs: 15000,
+        system: `사례 하나의 판단이 주어집니다. ${PATTERN_RULE} 그 한 문장만 답하세요.`,
+        prompt: `판단: ${next.judgment}\n에이전트가 이해한 것: ${next.understood ?? ''}\n실제 의도: ${next.meant ?? ''}\n피드백: ${next.said ?? next.text.slice(0, 300)}`,
+      })
+      const pattern = r.isAnswered ? r.text.trim().split('\n')[0]?.replace(/^["'“”]+|["'“”.]+$/g, '').trim().slice(0, 60) : ''
+      if (!pattern) continue
+      await setFeedback($, next.at, { pattern })
+      await placeCase($, next.at)
+    }
+  } finally {
+    isRegrouping = false
   }
 }
 
@@ -830,7 +997,7 @@ type Result = { judgments: Judgment[]; candidates: Card[]; reqIds: string[] }
  * submit: the request going out; everything.
  * commit: the request went out on a draft's judgment; record only, leave the view.
  */
-async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'submit' | 'commit' = 'submit', prevAttached: readonly string[] = []): Promise<Result | null> {
+async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'submit' | 'commit' = 'submit', prevAttached: readonly string[] = [], isPerson = true): Promise<Result | null> {
   const key = await $.env.get('TYPESAFE_API_KEY')
   await update($, hasKey, () => Boolean(key))
   if (!key) {
@@ -841,6 +1008,8 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
   if (mode !== 'commit') await update($, view, v => ({ ...v, isBusy: true, error: null }))
   const started = await $.clock.now()
   const shown = await read($, display)
+  // Recorded only when the person typed it in their own session: not the engine's or the app's turn, not a script's.
+  const said = mode === 'draft' || isScriptedSession || !isPerson ? '' : personText(prompt)
   try {
     const allCards = await loadCards($)
     // Rules ride every request; Jev weighs only lessons.
@@ -884,11 +1053,11 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
       .sort((a, b) => b.rel - a.rel)
       .slice(0, MAX_ATTACHED_REQS)
       .map(x => x.r.id)
-    if (mode !== 'draft' && noul(answers, 'has_requirement') >= 0.6) $.clock.after(0, () => extractRequirements($, prompt, started))
+    if (said && noul(answers, 'has_requirement') >= 0.6) $.clock.after(0, () => extractRequirements($, said, started))
 
     // A correction pushing against a lesson attached last turn means Jev attached it wrongly.
     for (const [i, c] of attachedBefore.entries()) {
-      if (noul(answers, `p${i}_reverses`) < 0.6) continue
+      if (!said || noul(answers, `p${i}_reverses`) < 0.6) continue
       const labels = ((await $.store.get('labels')) as Label[] | undefined) ?? []
       await save($, 'labels', [...labels, { cardId: c.id, verdict: 'apply', isRight: false, same: 0, satisfy: 0, flip: 1, ts: started } as Label].slice(-2000))
       const reversals = (c.reversals ?? 0) + 1
@@ -897,17 +1066,17 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
     }
 
     let recorded: View['recorded'] = null
-    if (mode !== 'draft' && noul(answers, 'is_correction') >= 0.6) {
-      const card = await remember($, prompt, answers, candidates, started)
+    if (said && noul(answers, 'is_correction') >= 0.6) {
+      const card = await remember($, said, answers, candidates, started)
       if (card) recorded = { cardId: card.id, kind: card.kind, scope: card.scope, until: started }
       if (shown.toast) $.ui.toast(card ? `ani · 같은 판단 ${card.count}번째 — 교훈을 다듬을게요` : `ani · 사례로 기록했어요 · 같은 판단이 한 번 더 나오면 교훈 후보가 돼요`, { timeoutMs: 4000 })
     }
 
-    if (mode !== 'draft' && noul(answers, 'is_correction') >= 0.6) {
+    if (said && noul(answers, 'is_correction') >= 0.6) {
       const ns = await loadNeeds($)
       const need = ns.find(n => n.status === 'confirmed')
       if (need) {
-        const fitAns = await askJev($, { correction: prompt.slice(0, 1500) }, { fit: { type: 'noul', instructions: `Is this correction consistent with what the user says they want underneath: "${need.text}"`, criteria: { true: 'consistent', false: 'points somewhere else' } } })
+        const fitAns = await askJev($, { correction: said.slice(0, 1500) }, { fit: { type: 'noul', instructions: `Is this correction consistent with what the user says they want underneath: "${need.text}"`, criteria: { true: 'consistent', false: 'points somewhere else' } } })
         if (fitAns && noul(fitAns, 'fit') < 0.3) await save($, 'needs', ns.map(n => (n.id === need.id ? { ...n, misfit: (n.misfit ?? 0) + 1 } : n)))
       }
     }
@@ -1406,6 +1575,40 @@ async function originsOf($: EngineInterface, reqs: readonly Requirement[]): Prom
   return out
 }
 
+/** How near a requirement's saving the turn it came from was sent: Jev answers within seconds. */
+const SOURCE_WINDOW = 6_000
+
+/**
+ * Requirements whose turn was not the person's: an app's message (a CI
+ * event), a scheduled task's prompt, an app helper's role prompt. Read back
+ * from the transcripts, nearest turn of the same project first; one whose
+ * turn is not found is kept.
+ */
+async function notThePersons($: EngineInterface, reqs: readonly Requirement[]): Promise<Set<string>> {
+  const out = new Set<string>()
+  if (!reqs.length) return out
+  const from = Math.min(...reqs.map(r => r.ts)) - SOURCE_WINDOW
+  const to = Math.max(...reqs.map(r => r.ts)) + SOURCE_WINDOW
+  const turns: PastPrompt[] = []
+  for (const f of await transcriptFiles($, from)) {
+    const reader = pastPromptReader(from, to, false)
+    let n = 0
+    for await (const line of transcriptLines($, f.path, f.size)) {
+      reader.line(line)
+      if (++n % 2000 === 0) await $.clock.sleep(0)
+    }
+    turns.push(...reader.prompts())
+  }
+  const slugs = new Map<string, string>()
+  for (const r of reqs) {
+    const near = turns.filter(t => Math.abs(t.at - r.ts) <= SOURCE_WINDOW).sort((a, b) => Math.abs(a.at - r.ts) - Math.abs(b.at - r.ts))
+    let source = near[0]
+    if (r.project) for (const t of near) if (sameProject(await projectOf($, t.cwd, slugs), r.project)) { source = t; break }
+    if (source && !source.isTyped) out.add(r.id)
+  }
+  return out
+}
+
 let isSettling = false
 let hasSettled = false
 
@@ -1419,6 +1622,18 @@ async function settleReqs($: EngineInterface) {
   if (isSettling || hasSettled) return
   isSettling = true
   try {
+    // Each requirement's turn is looked up once: one an app, a schedule or a script sent goes.
+    const checked = new Set(((await $.store.get('reqSourceChecked')) as string[] | undefined) ?? [])
+    const unchecked = (await loadReqs($)).filter(r => !checked.has(r.id))
+    if (unchecked.length) {
+      const drop = await notThePersons($, unchecked)
+      if (drop.size) {
+        const aside = ((await $.store.get('reqsNotThePersons')) as Requirement[] | undefined) ?? []
+        await save($, 'reqsNotThePersons', [...aside, ...unchecked.filter(r => drop.has(r.id))].slice(-200))
+        await setReqs($, rs => rs.filter(r => !drop.has(r.id)))
+      }
+      await save($, 'reqSourceChecked', [...checked, ...unchecked.map(r => r.id)])
+    }
     const all = await loadReqs($)
     // The transcripts are read once for each: one never found is not looked for again.
     const tried = new Set(((await $.store.get('reqOriginsTried')) as string[] | undefined) ?? [])
@@ -1488,6 +1703,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     root = await $.session.root()
     home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE')) ?? ''
+    isScriptedSession = isScriptedEntry((await $.env.get('CLAUDE_CODE_ENTRYPOINT')) ?? '')
     const remote = await $.process
       .run(['git', '-C', root, 'remote', 'get-url', 'origin'])
       .then(r => (r.exitCode === 0 ? r.stdout : ''))
@@ -1512,7 +1728,12 @@ export const register: Register = on => {
     // The pane is where ani lives: open it beside the transcript from the start.
     if ((await read($, display)).pane) $.clock.after(0, () => $.ui.open({ id: PANE, title: TITLE }))
     $.clock.after(0, () => backfill($))
-    $.clock.after(0, () => importAni($))
+    $.clock.after(0, async () => {
+      await importAni($)
+      await keepPersonWords($)
+      await koreanizeAni($)
+      await regroupCases($)
+    })
     $.clock.after(0, () => settleReqs($))
     // Feedback logged before the walk-back existed gets its context now.
     $.clock.after(0, async () => {
@@ -1527,15 +1748,18 @@ export const register: Register = on => {
   on('prompt.submit', async ($, e, next) => {
     const text = e.text.trim()
     if (!text || text.startsWith('/')) return next(e)
+    // A scheduled task, a background notice or another session is not the person speaking.
+    const isPerson = isPersonOrigin(e.origin as { kind: string; asUser?: boolean } | undefined)
     {
       const m = text.match(/^근원\s*욕구\s*[:：]\s*(.+)$/s)
       if (m) await writeNeed($, m[1].trim().slice(0, 200))
     }
     if (/(ani|애니|패널|사이드\s*패널).{0,12}(열어|띄워|보여|켜)/i.test(text)) await $.ui.open({ id: PANE, title: TITLE })
     {
+      const own = isScriptedSession || !isPerson ? '' : personText(text)
       const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
       const last = fb[0]
-      if (last && last.text !== text && (last.after?.length ?? 0) < 2) await setFeedback($, last.at, { after: [...(last.after ?? []), excerpt(text, 80)] })
+      if (own && last && !last.fromHistory && !last.aniId && last.text !== own && (last.after?.length ?? 0) < 2) await setFeedback($, last.at, { after: [...(last.after ?? []), excerpt(own, 80)] })
     }
     recentPrompts.push(text)
     if (recentPrompts.length > 6) recentPrompts.shift()
@@ -1574,8 +1798,8 @@ export const register: Register = on => {
     const pre = drafted && drafted.text === text ? drafted.result : null
     await update($, view, v => ({ ...v, isDraft: false }))
     drafted = null
-    if (pre) $.clock.after(0, () => analyze($, text, 'commit', prevIds))
-    const result = pre ?? (await Promise.race([analyze($, text, 'submit', prevIds), $.clock.sleep(SUBMIT_WAIT_MS).then(() => null)]))
+    if (pre) $.clock.after(0, () => analyze($, text, 'commit', prevIds, isPerson))
+    const result = pre ?? (await Promise.race([analyze($, text, 'submit', prevIds, isPerson), $.clock.sleep(SUBMIT_WAIT_MS).then(() => null)]))
     const extra = result ? await attachment($, result) : null
     attachedReqIds = extra?.reqIds ?? []
     const at = await $.clock.now()
@@ -1854,7 +2078,7 @@ export const register: Register = on => {
       { key: 'gl', title: '모든 프로젝트에', cap: CAPACITY.global, cards: order(mine.filter(c => c.scope === 'global')) },
     ]
     const meta = (c: Card) =>
-      [KIND_LABEL[c.kind], (c.count ?? 1) > 1 ? `교정 ${c.count}번 반복` : null, c.ts >= since ? '이번 세션' : null, c.isMuted ? '꺼짐' : null]
+      [KIND_LABEL[c.kind], (c.count ?? 1) > 1 ? `교정 ${c.count}번 반복` : null, SOURCE_LABEL[c.source] ?? null, c.ts >= since ? '이번 세션' : null, c.isMuted ? '꺼짐' : null]
         .filter(Boolean)
         .join('  ·  ')
     const rows = (c: Card) =>
@@ -2299,19 +2523,34 @@ export const register: Register = on => {
       }
       const histView = () => {
         const isLive = isHistLive
+        const isOld = hist?.status === 'done' && (hist.v ?? 1) < HISTORY_V
+        const isRecentDone = hist?.status === 'done' && !isOld && hist.range !== 'all'
+        const from = hist && hist.since > 0 ? `${dateOf(hist.since)}부터` : '처음부터'
         const text = !hist
-          ? `ani가 기록하기 전의 대화는 아직 보지 않았어요. 지난 ${HISTORY_DAYS}일 대화에서 교정을 찾아 사례로 정리하고, 같은 판단끼리 교훈 후보로 묶어요. 교정 하나에 Jev와 Haiku를 두세 번 써요.`
+          ? `ani가 기록하기 전의 대화는 아직 보지 않았어요. 지난 ${HISTORY_DAYS}일 대화에서 교정을 찾아 사례로 정리하고, 같은 습관끼리 교훈 후보로 묶어요. 교정 하나에 Jev와 Haiku를 두세 번 써요.`
           : isLive
-            ? `지난 대화를 읽는 중 · 기록 ${hist.filesDone}/${hist.files} · 요청 ${hist.prompts}개에서 교정 ${hist.found}개 · 정리 ${hist.enriched}/${hist.found}`
-            : hist.status === 'done'
-              ? `${dateOf(hist.since)}부터 ani 기록 전까지의 대화에서 요청 ${hist.prompts}개를 보고 교정 ${hist.found}개를 사례로 정리했어요`
-              : `멈췄어요${hist.error ? ` · ${hist.error}` : ''} · 기록 ${hist.filesDone}/${hist.files} · 다시 누르면 이어서 해요`
-        // Once done there is nothing left to read: what came after was recorded as it was said.
-        const label = !hist ? `지난 ${HISTORY_DAYS}일 대화에서 사례 찾기` : '이어서 찾기'
+            ? `지난 대화를 읽는 중 · 기록 ${hist.filesDone}/${hist.files} · 요청 ${hist.prompts}개에서 교정 ${hist.found}개 · 정리 ${hist.enriched}개`
+            : isOld
+              ? `예전 기준으로 요청 ${hist.prompts}개에서 교정 ${hist.found}개를 찾았어요. 새 기준은 질문으로 한 교정도 찾고, 앞뒤 대화와 에이전트가 한 작업까지 봐요. 내가 친 말이 아닌 것(앱 알림, 예약 작업, 다른 프로그램이 보낸 지시)은 빼요.`
+              : hist.status === 'done'
+                ? `${from} ani 기록 전까지의 대화에서 요청 ${hist.prompts}개를 보고 교정 ${hist.found}개를 사례로 정리했어요${isRecentDone ? `. 그 전 대화(${dateOf(hist.since)} 이전)는 아직 안 봤어요. 오래 걸리고 Jev를 많이 써요.` : ''}`
+                : `멈췄어요${hist.error ? ` · ${hist.error}` : ''} · 기록 ${hist.filesDone}/${hist.files} · 다시 누르면 이어서 해요`
+        const run = (range?: HistoryRange) => () => { $.clock.after(0, () => mineHistory($, range)) }
+        const button = isLive
+          ? null
+          : !hist
+            ? <Button key="hist-run" variant="primary" label={`지난 ${HISTORY_DAYS}일 대화에서 사례 찾기`} onPress={run('recent')} />
+            : isOld
+              ? <Button key="hist-run" variant="primary" label={`새 기준으로 지난 ${HISTORY_DAYS}일 다시 찾기`} onPress={run('recent')} />
+              : isRecentDone
+                ? <Button key="hist-run" variant="secondary" label={`${dateOf(hist.since)} 이전 대화도 찾기`} onPress={run('all')} />
+                : hist.status === 'done'
+                  ? null
+                  : <Button key="hist-run" variant="secondary" label="이어서 찾기" onPress={run()} />
         return [
           <Box key="hist" flexDirection="column" marginBottom={1}>
             <Text dimColor={!isLive} wrap="wrap">{text}</Text>
-            {isLive || hist?.status === 'done' ? null : <Box flexDirection="row" marginTop={1}>{[<Button key="hist-run" variant={hist ? 'secondary' : 'primary'} label={label} onPress={() => { $.clock.after(0, () => mineHistory($)) }} />]}</Box>}
+            {button ? <Box flexDirection="row" marginTop={1}>{[button]}</Box> : null}
           </Box>,
         ]
       }
