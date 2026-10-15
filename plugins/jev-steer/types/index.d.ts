@@ -115,6 +115,8 @@ export type Feedback = {
   judgment?: string
   /** The ani pattern (F-…) it was brought in from. */
   aniId?: string
+  /** Found in a past conversation, before ani was recording: `before` and `did` hold that conversation's context. */
+  fromHistory?: boolean
 }
 
 export type Display = { chip: boolean; band: boolean; toast: boolean; pane: boolean }
@@ -140,6 +142,7 @@ declare module 'claude-code' {
       pinned: string[]
       keyLater: boolean
       hasKey: boolean
+      listLimit: number
     }
   }
 }
@@ -155,6 +158,8 @@ export type Candidate = {
   lesson?: string
   short?: string
   isDeclined?: boolean
+  /** The project of the case that made it; a lesson made from it belongs there. */
+  project?: string
 }
 
 /** Rules that share one reason, said once. Rides every request in every project once accepted. */
