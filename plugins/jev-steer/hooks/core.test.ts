@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 import { isConcreteRequirement } from './register'
 
 import type { Card, Requirement } from '../types'
-import { aniCard, appliesTo, buildQuestions, indexSummaries, isSamePath, isUndecided, judge, parseAniPattern, parseIndex, parseMemoryNote, pickCandidates, placeIn, projectName, sameProject, scopeOf, slugOf, verdictOf } from './core'
+import { aniCard, appliesTo, buildQuestions, indexSummaries, isSamePath, isUndecided, jevBody, judge, parseAniPattern, parseIndex, parseMemoryNote, pickCandidates, placeIn, projectName, sameProject, scopeOf, slugOf, verdictOf } from './core'
 
 const card = (over: Partial<Card>): Card => ({
   id: 'J-1',
@@ -255,4 +255,14 @@ test('memory notes: values that run over several lines', async () => {
   expect(parseMemoryNote('---\ndescription:\n  starts on\n  the next line\n---\n')?.description).toBe('starts on the next line')
   expect(parseMemoryNote('no frontmatter')).toBeNull()
   expect(parseMemoryNote('---\n---\nonly a body')?.body).toBe('only a body')
+})
+
+test('a Jev body never carries half an emoji: cut text is mended, whole emoji kept', async () => {
+  // '🙂' cut after its first half, as .slice(0, n) leaves it.
+  const cut = '좋아요 🙂 그리고 \uD83D'
+  const body = jevBody({ state: { items: [{ user_message: cut }], lone: '\uDE42끝' } })
+  expect(body).not.toMatch(/\\ud[89a-f][0-9a-f]{2}/i)
+  const back = JSON.parse(body) as { state: { items: { user_message: string }[]; lone: string } }
+  expect(back.state.items[0]?.user_message).toBe('좋아요 🙂 그리고 �')
+  expect(back.state.lone).toBe('�끝')
 })
