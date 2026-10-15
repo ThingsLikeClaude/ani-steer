@@ -42,12 +42,6 @@ import { KIND_COLOR, STATE_COLOR, bandSvg, bannerSvg, cardSvg, headingSvg, leadS
 const PANE = 'jev-steer'
 const TITLE = 'ani · 피드백'
 const KINDS: Kind[] = ['intent', 'effort', 'missed', 'autonomy', 'buried']
-/**
- * The memory is small on purpose: a closed loop. A repeated correction merges
- * into the lesson it repeats, and when a scope is full the weakest lesson
- * (fewest corrections, oldest) gives way. The pressure is what refines lessons.
- */
-const CAPACITY: Record<'personal-project' | 'global', number> = { 'personal-project': 12, global: 12 }
 const SUBMIT_WAIT_MS = 1200
 const ARCHIVE_MAX = 200
 /** Cases kept: enough for every correction of the past weeks, well under the store's 4 MiB. */
@@ -58,6 +52,8 @@ const MAX_ATTACHED_LESSONS = 2
 const MAX_ATTACHED_RULES = 3
 /** A lesson the same correction has hit this often is offered as a rule. */
 const PROMOTE_AT = 3
+/** Waits before trying a background Jev call again: about twenty seconds in all. */
+const JEV_RETRY_MS = [1_000, 4_000, 15_000]
 /** Two-letter type tags for lesson kinds, as the file tree tags JS / PDF. */
 const KIND_BADGE: Record<Kind, string> = { intent: '의도', effort: '정도', missed: '누락', autonomy: '월권', buried: '묻힘' }
 const MAX_ATTACHED_REQS = 5
@@ -486,23 +482,19 @@ async function editCard($: EngineInterface, id: string, change: Partial<Card> | 
   } else if (change.scope) {
     const scope = change.scope
     await update($, view, v => (v.recorded?.cardId === id ? { ...v, recorded: { ...v.recorded, scope } } : v))
+    // The person placed it: Jev does not judge its scope again.
+    const placed = ((await $.store.get('lessonsPlaced')) as string[] | undefined) ?? []
+    if (!placed.includes(id)) await save($, 'lessonsPlaced', [...placed, id])
   }
 }
 
-/** Keeps each scope within its capacity: muted first, then fewest corrections, then oldest. */
-function enforceCapacity(cards: Card[]): Card[] {
-  let out = cards
-  for (const scope of ['personal-project', 'global'] as const) {
-    const inScope = out.filter(c => !c.isArchived && !c.isRule && c.scope === scope && (scope === 'global' || sameProject(c.project, project)))
-    const over = inScope.length - CAPACITY[scope]
-    if (over <= 0) continue
-    const weakest = [...inScope]
-      .sort((a, b) => Number(!!b.isMuted) - Number(!!a.isMuted) || (a.count ?? 1) - (b.count ?? 1) || a.ts - b.ts)
-      .slice(0, over)
-      .map(c => c.id)
-    // Archived, not deleted: a repeat of the same mistake brings it back with its count.
-    out = out.map(c => (weakest.includes(c.id) ? { ...c, isArchived: true } : c))
-  }
+/**
+ * No lesson gives way to a count: Jev picks the few that bear on each request,
+ * so a long list costs a request nothing. Only lessons an import replaced are
+ * archived, and the oldest of those past ARCHIVE_MAX go.
+ */
+function capArchive(cards: Card[]): Card[] {
+  const out = cards
   const archived = out.filter(c => c.isArchived).sort((a, b) => b.ts - a.ts)
   const drop = new Set(archived.slice(ARCHIVE_MAX).map(c => c.id))
   return out.filter(c => !drop.has(c.id))
@@ -530,7 +522,7 @@ async function remember($: EngineInterface, prompt: string, answers: Answers, ca
   if (!dup) {
     const archived = own.filter(c => c.isArchived && c.lesson && appliesTo(c, project)).sort((a, b) => (b.count ?? 1) - (a.count ?? 1) || b.ts - a.ts).slice(0, 24)
     const ans = archived.length
-      ? await askJev($, { correction: prompt.slice(0, 1500), earlier_request: intentPrompt.slice(0, 800) }, Object.fromEntries(archived.map((c, i) => [`z${i}`, { type: 'noul', instructions: `Is this correction about the same recurring mistake as this archived lesson, so one lesson covers both: "${describe(c)}"`, criteria: { true: 'same mistake', false: 'a different mistake' } }])))
+      ? await askJev($, { correction: prompt.slice(0, 1500), earlier_request: intentPrompt.slice(0, 800) }, Object.fromEntries(archived.map((c, i) => [`z${i}`, { type: 'noul', instructions: `Is this correction about the same recurring mistake as this archived lesson, so one lesson covers both: "${describe(c)}"`, criteria: { true: 'same mistake', false: 'a different mistake' } }])), { isQuick: true })
       : null
     const best = ans ? archived.map((c, i) => ({ c, v: noul(ans, `z${i}`) })).sort((a, b) => b.v - a.v)[0] : undefined
     if (best && best.v >= 0.7) revived = best.c
@@ -546,7 +538,7 @@ async function remember($: EngineInterface, prompt: string, answers: Answers, ca
       isMuted: false,
       isArchived: false,
     }
-    await save($, 'cards', enforceCapacity(own.map(c => (c.id === dup.id ? merged : c))))
+    await save($, 'cards', capArchive(own.map(c => (c.id === dup.id ? merged : c))))
     $.clock.after(0, () => structure($, merged.id, intentPrompt, answer, prompt, merged))
     await logIt(merged.id)
     return merged
@@ -743,7 +735,7 @@ async function acceptCandidate($: EngineInterface, id: string) {
     lesson: c.lesson ?? worded?.lesson ?? cases.find(f => f.judgment)?.judgment,
     short: c.short ?? worded?.short,
   }
-  await save($, 'cards', enforceCapacity([...(await ownCards($)), card]))
+  await save($, 'cards', capArchive([...(await ownCards($)), card]))
   await save($, 'feedbackLog', fb.map(f => (c.cases.includes(f.at) ? { ...f, cardId: card.id, candidateId: undefined } : f)))
   await save($, 'candidates', cands.filter(x => x.id !== id))
   if (!card.short) $.clock.after(0, () => shorten($))
@@ -1020,7 +1012,7 @@ async function readHistory($: EngineInterface, range?: HistoryRange) {
           criteria: { true: 'corrects what the assistant did or said', false: 'not a correction' },
         }])),
       )
-      if (!answers) throw new Error('Jev에 연결하지 못했어요')
+      if (!answers) throw new Error(`Jev에 연결하지 못했어요${jevFailure ? ` (${jevFailure})` : ''}`)
       const hits = batch.filter((_, k) => noul(answers, `h${k}`) >= 0.6)
       if (!hits.length) continue
       const cases: Feedback[] = []
@@ -1270,7 +1262,7 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
       const ns = await loadNeeds($)
       const need = ns.find(n => n.status === 'confirmed')
       if (need) {
-        const fitAns = await askJev($, { correction: said.slice(0, 1500) }, { fit: { type: 'noul', instructions: `Is this correction consistent with what the user says they want underneath: "${need.text}"`, criteria: { true: 'consistent', false: 'points somewhere else' } } })
+        const fitAns = await askJev($, { correction: said.slice(0, 1500) }, { fit: { type: 'noul', instructions: `Is this correction consistent with what the user says they want underneath: "${need.text}"`, criteria: { true: 'consistent', false: 'points somewhere else' } } }, { isQuick: true })
         if (fitAns && noul(fitAns, 'fit') < 0.3) await save($, 'needs', ns.map(n => (n.id === need.id ? { ...n, misfit: (n.misfit ?? 0) + 1 } : n)))
       }
     }
@@ -1314,15 +1306,34 @@ async function loadNeeds($: EngineInterface): Promise<Need[]> {
 }
 
 /** One yes/no batch to Jev; null when Jev is unreachable. */
-async function askJev($: EngineInterface, state: Record<string, unknown>, questions: Record<string, unknown>): Promise<Answers | null> {
+/** Why the last background Jev call failed, said with the stop it caused. */
+let jevFailure = ''
+
+/**
+ * One Jev call off the request path. A dropped connection, a 5xx or a 429 is
+ * Jev's moment, not an answer: tried again with backoff before giving up, so
+ * one blip does not stop a long run. On a request's own path (isQuick) it is
+ * asked once: the request does not wait on Jev's moment.
+ */
+async function askJev($: EngineInterface, state: Record<string, unknown>, questions: Record<string, unknown>, opts: { isQuick?: boolean } = {}): Promise<Answers | null> {
   const key = await $.env.get('TYPESAFE_API_KEY')
   if (!key || !Object.keys(questions).length) return null
-  const res = await $.http.fetch(JEV_URL, {
-    method: 'POST',
-    headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ model: 'jev-latest', state, questions }),
-  })
-  return res.ok ? (JSON.parse(res.text) as { answers: Answers }).answers : null
+  const call = () =>
+    $.http
+      .fetch(JEV_URL, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'jev-latest', state, questions }),
+      })
+      .catch(() => null)
+  let res = await call()
+  for (const wait of opts.isQuick ? [] : JEV_RETRY_MS) {
+    if (res && (res.ok || !(res.status >= 500 || res.status === 429))) break
+    await $.clock.sleep(wait)
+    res = await call()
+  }
+  jevFailure = !res ? '연결 끊김' : res.ok ? '' : `HTTP ${res.status}`
+  return res?.ok ? (JSON.parse(res.text) as { answers: Answers }).answers : null
 }
 
 const ruleText = (c: Card) => c.lesson ?? c.text
@@ -1851,6 +1862,63 @@ async function settleReqs($: EngineInterface) {
   }
 }
 
+/** Lessons judged in one Jev call: two questions each. */
+const PLACE_BATCH = 10
+
+let isPlacing = false
+let hasPlaced = false
+
+/**
+ * Once a session, each lesson or rule kept for one project is judged once:
+ * a working habit that holds anywhere (how to read a request, how far to
+ * change things, how to check and report) moves to every project, where Jev
+ * weighs it per request; one tied to its project's own code, tools, files,
+ * design, subject or people stays. Two questions, both must agree: replayed on
+ * this machine's 59 lessons, either alone moved project-only ones. One the
+ * person placed is never judged. Jev unreachable, the next session goes on.
+ */
+async function placeLessons($: EngineInterface) {
+  if (isPlacing || hasPlaced) return
+  isPlacing = true
+  try {
+    const placed = new Set(((await $.store.get('lessonsPlaced')) as string[] | undefined) ?? [])
+    const open = (await ownCards($)).filter(c => c.scope === 'personal-project' && !placed.has(c.id))
+    let moved = 0
+    for (let i = 0; i < open.length; i += PLACE_BATCH) {
+      const part = open.slice(i, i + PLACE_BATCH)
+      const answers = await askJev(
+        $,
+        { lessons: part.map(describe) },
+        Object.fromEntries(
+          part.flatMap((_, k) => [
+            [`g${k}`, {
+              type: 'noul',
+              instructions: `Is lessons[${k}] a working habit that would hold in any project (how to read a request, how far to change things, how to check work, how to report or ask), rather than tied to one project: its own code, stack, commands, remotes, files, design, data, people or names?`,
+              criteria: { true: 'holds in any project', false: 'tied to one project' },
+            }],
+            [`w${k}`, {
+              type: 'noul',
+              instructions: `Would lessons[${k}] make sense word for word in an unrelated project? It would not if it names one project's own tool, skill, command, remote, file, screen, component, style value, subject matter (songs, slides, video, characters, hardware) or person (a presenter, a client).`,
+              criteria: { true: 'makes sense anywhere', false: 'names one project' },
+            }],
+          ]),
+        ),
+      )
+      if (!answers) return
+      const everywhere = new Set(part.filter((_, k) => noul(answers, `g${k}`) >= 0.8 && noul(answers, `w${k}`) >= 0.5).map(c => c.id))
+      // The person may have placed one meanwhile: theirs stands.
+      const now = new Set(((await $.store.get('lessonsPlaced')) as string[] | undefined) ?? [])
+      if (everywhere.size) await save($, 'cards', (await ownCards($)).map(c => (everywhere.has(c.id) && !now.has(c.id) && c.scope === 'personal-project' ? { ...c, scope: 'global' as const } : c)))
+      await save($, 'lessonsPlaced', [...now, ...part.map(c => c.id).filter(id => !now.has(id))])
+      moved += everywhere.size
+    }
+    hasPlaced = true
+    if (moved && (await read($, display)).toast) $.ui.toast(`ani · 다른 프로젝트에서 배운 교훈 ${moved}개가 이제 모든 프로젝트에 붙어요`, { timeoutMs: 5000 })
+  } finally {
+    isPlacing = false
+  }
+}
+
 /** The person's own say: this requirement holds in every project, or in its own. */
 async function setReqScope($: EngineInterface, id: string, scope: Scope) {
   await setReqs($, rs => rs.map(r => (r.id === id ? { ...r, scope, project: r.project ?? project } : r)))
@@ -1935,7 +2003,13 @@ export const register: Register = on => {
       await koreanizeAni($)
       await regroupCases($)
       await rewordLessons($)
+      await placeLessons($)
     })
+    // Lessons once archived for a full scope come back: nothing gives way to a count any more.
+    if (!(await $.store.get('uncappedV1'))) {
+      await save($, 'cards', (await ownCards($)).map(c => (c.isArchived ? { ...c, isArchived: false } : c)))
+      await save($, 'uncappedV1', true)
+    }
     $.clock.after(0, () => importMemory($))
     $.clock.after(0, () => settleReqs($))
     // Feedback logged before the walk-back existed gets its context now.
@@ -2277,8 +2351,8 @@ export const register: Register = on => {
     const maybe = v.judgments.filter(j => j.verdict === 'ask' && !v.applied.includes(j.id) && !pinnedIds.includes(j.id))
     const order = (list: Card[]) => [...list].sort((a, b) => (b.count ?? 1) - (a.count ?? 1) || b.ts - a.ts)
     const groups = [
-      { key: 'pp', title: '이 프로젝트에만', cap: CAPACITY['personal-project'], cards: order(mine.filter(c => c.scope === 'personal-project')) },
-      { key: 'gl', title: '모든 프로젝트에', cap: CAPACITY.global, cards: order(mine.filter(c => c.scope === 'global')) },
+      { key: 'pp', title: '이 프로젝트에만', cards: order(mine.filter(c => c.scope === 'personal-project')) },
+      { key: 'gl', title: '모든 프로젝트에', cards: order(mine.filter(c => c.scope === 'global')) },
     ]
     const meta = (c: Card) =>
       [KIND_LABEL[c.kind], (c.count ?? 1) > 1 ? `교정 ${c.count}번 반복` : null, SOURCE_LABEL[c.source] ?? null, c.ts >= since ? '이번 세션' : null, c.isMuted ? '꺼짐' : null]
@@ -2969,7 +3043,7 @@ export const register: Register = on => {
         ))}
         {groups.map(g => (
           <Box key={`tg-${g.key}`} flexDirection="column">
-            {heading(`${g.title} · ${g.cards.length}/${g.cap}`)}
+            {heading(`${g.title} · ${g.cards.length}`)}
             {g.cards.length === 0 && <Text dimColor>아직 없어요</Text>}
             {g.cards.map(row)}
           </Box>

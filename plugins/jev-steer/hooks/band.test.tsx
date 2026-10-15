@@ -85,15 +85,15 @@ test('a lesson reads large with intent and cause beneath it', async ($, on) => {
   await desk.unmount()
 })
 
-test('the panel groups lessons by scope with capacity, and controls each one', async ($, on) => {
+test('the panel groups lessons by scope with their counts, no capacity, and controls each one', async ($, on) => {
   engine(on, { cards: [card({ id: 'J-1' }), card({ id: 'J-2', scope: 'global' })] })
   const term = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await term.find({ type: 'Text', text: /이 프로젝트에만 · 1\/12/ })).toBeDefined()
-  expect(await term.find({ type: 'Text', text: /모든 프로젝트에 · 1\/12/ })).toBeDefined()
+  expect(await term.find({ type: 'Text', text: /이 프로젝트에만 · 1$/ })).toBeDefined()
+  expect(await term.find({ type: 'Text', text: /모든 프로젝트에 · 1$/ })).toBeDefined()
   await term.press({ key: 'mv-J-1' })
-  expect(await term.find({ type: 'Text', text: /모든 프로젝트에 · 2\/12/ })).toBeDefined()
+  expect(await term.find({ type: 'Text', text: /모든 프로젝트에 · 2$/ })).toBeDefined()
   await term.press({ key: 'rm-J-2' })
-  expect(await term.find({ type: 'Text', text: /모든 프로젝트에 · 1\/12/ })).toBeDefined()
+  expect(await term.find({ type: 'Text', text: /모든 프로젝트에 · 1$/ })).toBeDefined()
   await term.unmount()
 
   const desk = await $.ui.mount({ ...PANE, surface: 'desktop' })
