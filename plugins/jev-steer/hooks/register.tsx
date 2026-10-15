@@ -14,7 +14,6 @@ import {
   excerpt,
   indexSummaries,
   isSamePath,
-  isUndecided,
   judge,
   kindOf,
   noul,
@@ -599,6 +598,19 @@ async function* transcriptLines($: EngineInterface, path: string, size: number):
   yield* split.end()
 }
 
+/** The session transcripts written to since a time, oldest first. */
+async function transcriptFiles($: EngineInterface, since: number) {
+  const homeDir = home || ((await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE')) ?? '')
+  const base = `${(await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${homeDir}/.claude`}/projects`
+  const files: { path: string; name: string; size: number; mtime: number }[] = []
+  for (const d of await $.fs.list(base).catch(() => [])) {
+    if (d.kind !== 'dir') continue
+    for (const f of await $.fs.list(`${base}/${d.name}`).catch(() => []))
+      if (f.kind === 'file' && f.name.endsWith('.jsonl') && f.mtimeMs >= since) files.push({ path: `${base}/${d.name}/${f.name}`, name: f.name, size: f.size, mtime: f.mtimeMs })
+  }
+  return files.sort((a, b) => a.mtime - b.mtime)
+}
+
 /** A session's project as live recording names it: the origin remote, else the folder. */
 async function projectOf($: EngineInterface, cwd: string, cache: Map<string, string>): Promise<string> {
   if (!cwd) return 'unknown'
@@ -650,17 +662,9 @@ async function readHistory($: EngineInterface) {
   const live = (((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []).filter(f => !f.aniId && !f.fromHistory).map(f => f.at)
   const since = isResuming && prev ? prev.since : now - HISTORY_DAYS * 86_400_000
   const until = isResuming && prev ? prev.until : live.length ? Math.min(...live) : now
-  const homeDir = home || ((await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE')) ?? '')
-  const base = `${(await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${homeDir}/.claude`}/projects`
   // A transcript is known by its file name, the session's id: the list of those read stays small.
-  const files: { path: string; name: string; size: number; mtime: number }[] = []
-  for (const d of await $.fs.list(base).catch(() => [])) {
-    if (d.kind !== 'dir') continue
-    for (const f of await $.fs.list(`${base}/${d.name}`).catch(() => []))
-      if (f.kind === 'file' && f.name.endsWith('.jsonl') && f.mtimeMs >= since) files.push({ path: `${base}/${d.name}/${f.name}`, name: f.name, size: f.size, mtime: f.mtimeMs })
-  }
+  const files = await transcriptFiles($, since)
   if (!files.length) throw new Error('대화 기록 폴더를 찾지 못했어요')
-  files.sort((a, b) => a.mtime - b.mtime)
   const done = new Set(((await $.store.get('historyFiles')) as string[] | undefined) ?? [])
   await setHistory($, {
     status: 'running',
@@ -803,13 +807,15 @@ async function extractRequirements($: EngineInterface, prompt: string, now: numb
   try {
     const list = (JSON.parse(r.text.match(/\{[\s\S]*\}/)?.[0] ?? '') as { requirements?: string[] }).requirements ?? []
     const said = list.filter(t => t && isConcreteRequirement(t) && !existing.includes(t))
-    // Said here word for word as another project's: attach that one rather than keep a copy.
+    // Said here word for word as another project's: it holds in more than one, so in every one.
     const elsewhere = new Set(all.filter(r => said.includes(r.text)).map(r => r.id))
-    const add: Requirement[] = said
+    const fresh: Requirement[] = said
       .filter(t => !all.some(r => r.text === t))
       .map((text, i) => ({ id: `R-${now}-${i}`, text, ts: now, active: 1, project }))
-    if (add.length || elsewhere.size)
-      await setReqs($, rs => capReqs([...rs.map(r => (elsewhere.has(r.id) ? placeIn(r, project, true) : r)), ...add]))
+    if (!fresh.length && !elsewhere.size) return
+    const scopes = (await scopeReqs($, fresh)) ?? new Map<string, Scope>()
+    const add = fresh.map(r => ({ ...r, scope: scopes.get(r.id) }))
+    await setReqs($, rs => capReqs([...rs.map(r => (elsewhere.has(r.id) ? { ...r, scope: 'global' as const } : r)), ...add]))
   } catch {
     // nothing extracted
   }
@@ -1348,6 +1354,92 @@ async function loadReqs($: EngineInterface): Promise<Requirement[]> {
 
 const REQS_PER_PROJECT = 20
 
+/**
+ * Jev says which requirements hold in every project: how the assistant should
+ * work anywhere, not one project's own files, data or names. Null when Jev
+ * could not be reached.
+ */
+async function scopeReqs($: EngineInterface, reqs: readonly Requirement[]): Promise<Map<string, Scope> | null> {
+  if (!reqs.length) return new Map()
+  const answers = await askJev(
+    $,
+    { requirements: reqs.map(r => r.text) },
+    Object.fromEntries(reqs.map((_, i) => [`g${i}`, {
+      type: 'noul',
+      instructions: `Is requirements[${i}] a standing preference about how the assistant should work in any project (reply language, tools and commands, commit, review or reporting habits), rather than about one project's own files, folders, data, screens or names?`,
+      criteria: { true: 'holds in any project', false: 'about one project' },
+    }])),
+  )
+  if (!answers) return null
+  return new Map(reqs.map((r, i) => [r.id, noul(answers, `g${i}`) >= 0.6 ? 'global' : 'personal-project']))
+}
+
+/** How far from a requirement's saving the request it came from may be. */
+const ORIGIN_WINDOW = 120_000
+
+/**
+ * Where requirements saved before projects were recorded were said: the
+ * session of the person's turn nearest the moment each was saved, read back
+ * from the transcripts. A scheduled task's prompt counts: its folder is where
+ * the requirement belongs.
+ */
+async function originsOf($: EngineInterface, reqs: readonly Requirement[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>()
+  if (!reqs.length) return out
+  const from = Math.min(...reqs.map(r => r.ts)) - ORIGIN_WINDOW
+  const to = Math.max(...reqs.map(r => r.ts)) + ORIGIN_WINDOW
+  const near: { at: number; cwd: string }[] = []
+  for (const f of await transcriptFiles($, from)) {
+    const reader = pastPromptReader(from, to, false)
+    let n = 0
+    for await (const line of transcriptLines($, f.path, f.size)) {
+      reader.line(line)
+      if (++n % 2000 === 0) await $.clock.sleep(0)
+    }
+    near.push(...reader.prompts().filter(p => p.cwd))
+  }
+  const slugs = new Map<string, string>()
+  for (const r of reqs) {
+    const p = near.filter(x => Math.abs(x.at - r.ts) <= ORIGIN_WINDOW).sort((a, b) => Math.abs(a.at - r.ts) - Math.abs(b.at - r.ts))[0]
+    if (p) out.set(r.id, await projectOf($, p.cwd, slugs))
+  }
+  return out
+}
+
+let isSettling = false
+let hasSettled = false
+
+/**
+ * Once a session: requirements with no project get the one they were said in,
+ * and those not yet judged get Jev's judgment of whether they hold in every
+ * project. Nothing to do once all are placed; Jev unreachable, the next
+ * session tries again.
+ */
+async function settleReqs($: EngineInterface) {
+  if (isSettling || hasSettled) return
+  isSettling = true
+  try {
+    const all = await loadReqs($)
+    // The transcripts are read once for each: one never found is not looked for again.
+    const tried = new Set(((await $.store.get('reqOriginsTried')) as string[] | undefined) ?? [])
+    const lost = all.filter(r => !r.project && !tried.has(r.id))
+    const origins = await originsOf($, lost)
+    if (origins.size) await setReqs($, rs => rs.map(r => (!r.project && origins.has(r.id) ? { ...r, project: origins.get(r.id) } : r)))
+    if (lost.length) await save($, 'reqOriginsTried', [...tried, ...lost.map(r => r.id)])
+    const scopes = await scopeReqs($, (await loadReqs($)).filter(r => !r.scope))
+    if (!scopes) return
+    if (scopes.size) await setReqs($, rs => rs.map(r => (!r.scope && scopes.has(r.id) ? { ...r, scope: scopes.get(r.id) } : r)))
+    hasSettled = true
+  } finally {
+    isSettling = false
+  }
+}
+
+/** The person's own say: this requirement holds in every project, or in its own. */
+async function setReqScope($: EngineInterface, id: string, scope: Scope) {
+  await setReqs($, rs => rs.map(r => (r.id === id ? { ...r, scope, project: r.project ?? project } : r)))
+}
+
 /** The newest REQS_PER_PROJECT said in this project; other projects' are left alone. */
 function capReqs(rs: Requirement[]): Requirement[] {
   const drop = new Set(rs.filter(r => sameProject(r.project, project)).slice(0, -REQS_PER_PROJECT).map(r => r.id))
@@ -1421,6 +1513,7 @@ export const register: Register = on => {
     if ((await read($, display)).pane) $.clock.after(0, () => $.ui.open({ id: PANE, title: TITLE }))
     $.clock.after(0, () => backfill($))
     $.clock.after(0, () => importAni($))
+    $.clock.after(0, () => settleReqs($))
     // Feedback logged before the walk-back existed gets its context now.
     $.clock.after(0, async () => {
       const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
@@ -1447,6 +1540,7 @@ export const register: Register = on => {
     recentPrompts.push(text)
     if (recentPrompts.length > 6) recentPrompts.shift()
     $.clock.after(0, () => importAni($))
+    $.clock.after(0, () => settleReqs($))
     // A one-time import (e.g. lessons rebuilt from an earlier conversation):
     // its lessons go live, the ones they replace are archived, its cases join the log.
     {
@@ -1747,8 +1841,6 @@ export const register: Register = on => {
     const others = othersOf(await ownCards($))
     // Everything kept anywhere is listed; another project's is tagged with its
     // project and waits for the person to attach it here or not.
-    const newHere = <T extends { project?: string; scope?: Scope; alsoIn?: string[]; skipIn?: string[] }>(xs: T[]) => xs.filter(x => isUndecided(x, project))
-    const skippedHere = <T extends { skipIn?: string[] }>(xs: T[]) => xs.filter(x => x.skipIn?.includes(project))
     const otherReqs = allReqs.filter(r => !appliesTo(r, project))
     const isBorrowed = (x: { project?: string; scope?: Scope }) => x.scope !== 'global' && !sameProject(x.project, project)
     const live = mine.filter(c => !c.isMuted)
@@ -1962,43 +2054,37 @@ export const register: Register = on => {
               <Button key={`mute-${c.id}`} variant={c.isMuted ? 'primary' : 'secondary'} label={c.isMuted ? '켜기' : '끄기'} onPress={() => editCard($, c.id, { isMuted: !c.isMuted })} />,
               <Button key={`rm-${c.id}`} variant="secondary" label="잊기" onPress={() => editCard($, c.id, null)} />,
             ])
-      // Another project's lessons, rules or requirements: tagged with the project
-      // they come from; the person attaches each one here, or says not here.
+      // Another project's lessons, rules or requirements, for reference: each says
+      // where it was said, and none rides here. Whether one holds in every project
+      // is Jev's judgment at saving; 모든 프로젝트로, under 관리, is the person's.
       type Other = { id: string; title: string; from?: string; badge?: CardRow['badge']; sub?: CardRow['sub'] }
-      const otherSection = (key: string, what: string, undecided: Other[], skipped: Other[], place: (id: string, isAttached: boolean) => unknown) => [
-        ...(undecided.length
-          ? [
-              labelRow(`s-${key}-new`, `다른 프로젝트의 ${what} · 여기에도 붙일까요`, undecided.length),
-              ...(isOpen(`s-${key}-new`)
-                ? undecided.map(o =>
-                    itemOf(`ob-${o.id}`, cardOf(`on-${o.id}`, [{ dot: STATE_COLOR.quiet, badge: o.badge, title: o.title, scope: projectName(o.from), pill: { text: '다른 프로젝트', color: STATE_COLOR.ask }, sub: o.sub }], STATE_COLOR.ask), [
-                      <Button key={`at-${o.id}`} variant="primary" label="여기에도 붙이기" onPress={() => place(o.id, true)} />,
-                      <Button key={`sk-${o.id}`} variant="secondary" label="안 붙임" onPress={() => place(o.id, false)} />,
-                    ]),
-                  )
-                : []),
-            ]
-          : []),
-        ...(skipped.length
-          ? [
-              labelRow(`s-${key}-skip`, `여기엔 안 붙인 ${what}`, skipped.length, true),
-              ...(!isOpen(`s-${key}-skip`)
-                ? skipped.map(o =>
-                    itemOf(`osb-${o.id}`, cardOf(`os-${o.id}`, [{ dot: STATE_COLOR.quiet, title: o.title, scope: projectName(o.from), pill: { text: '안 붙임' }, isMuted: true }]), [
-                      <Button key={`at-${o.id}`} variant="secondary" label="다시 붙이기" onPress={() => place(o.id, true)} />,
-                    ]),
-                  )
-                : []),
-            ]
-          : []),
-      ]
-      const otherOf = (c: Card): Other => ({ id: c.id, title: c.lesson ?? c.text, from: c.project, badge: { text: KIND_BADGE[c.kind], color: KIND_COLOR[c.kind] }, sub: subOf(c) })
+      const moreButton = (key: string, total: number) =>
+        total > limit ? [<Box key={`${key}-more`} flexDirection="row" marginTop={1}>{[<Button key={`${key}-more-b`} variant="secondary" label={`${Math.min(LIST_STEP, total - limit)}개 더 보기 · ${total - limit}개 남음`} onPress={() => update($, listLimit, n => n + LIST_STEP)} />]}</Box>] : []
+      const otherSection = (key: string, what: string, items: Other[], toGlobal: (id: string) => unknown) => {
+        if (!items.length) return []
+        const k = `s-${key}-other`
+        const row = (o: Other): CardRow => ({ dot: STATE_COLOR.quiet, badge: o.badge, title: o.title, scope: o.from ? projectName(o.from) : '출처 모름' })
+        const shown = items.slice(0, limit)
+        return [
+          labelRow(k, `다른 프로젝트의 ${what} · 참고`, items.length, true),
+          ...(!isOpen(k)
+            ? [
+                // One drawing for the list; under 관리, one per item with its button.
+                ...(isManaging
+                  ? shown.map(o => itemOf(`ob-${o.id}`, cardOf(`on-${o.id}`, [row(o)]), [<Button key={`gl-${o.id}`} variant="secondary" label="모든 프로젝트로" onPress={() => toGlobal(o.id)} />]))
+                  : [<Box key={`${k}-list`} marginTop={1}>{cardOf(`${k}-card`, shown.map(row))}</Box>]),
+                ...moreButton(k, items.length),
+              ]
+            : []),
+        ]
+      }
+      const otherOf = (c: Card): Other => ({ id: c.id, title: c.lesson ?? c.text, from: c.project, badge: { text: KIND_BADGE[c.kind], color: KIND_COLOR[c.kind] } })
       const otherLessons = others.filter(c => !c.isRule)
       const otherRules = others.filter(c => c.isRule)
-      const lessonOthers = () => otherSection('ls', '교훈', newHere(otherLessons).map(otherOf), skippedHere(otherLessons).map(otherOf), (id, a) => placeCard($, id, a))
-      const ruleOthers = () => otherSection('ru', '규칙', newHere(otherRules).map(otherOf), skippedHere(otherRules).map(otherOf), (id, a) => placeCard($, id, a))
+      const lessonOthers = () => otherSection('ls', '교훈', otherLessons.map(otherOf), id => editCard($, id, { scope: 'global' }))
+      const ruleOthers = () => otherSection('ru', '규칙', otherRules.map(otherOf), id => editCard($, id, { scope: 'global' }))
       const reqOf = (r: Requirement): Other => ({ id: r.id, title: r.text, from: r.project })
-      const reqOthers = () => otherSection('rq', '지시', newHere(otherReqs).map(reqOf), skippedHere(otherReqs).map(reqOf), (id, a) => placeReq($, id, a))
+      const reqOthers = () => otherSection('rq', '지시', otherReqs.map(reqOf), id => setReqScope($, id, 'global'))
       const pending: typeof maybe = []
       const own = await ownCards($)
       const sentLog = (((await $.store.get('sentLog')) as Sent[] | undefined) ?? [])
@@ -2016,11 +2102,11 @@ export const register: Register = on => {
       const feedbackLog = allCases.filter(f => sameProject(f.project, project))
       const otherCases = allCases.filter(f => !sameProject(f.project, project))
       // The ladder reads left to right: what was said, what was learned, what always holds.
-      // "+N": what waits for the person's decision: another project's items, lesson and rule candidates.
+      // "+N": what waits for the person's decision: lesson and rule candidates.
       const ladder: { key: Tab; label: string; n: number; more?: number }[] = [
-        { key: 'feedback', label: '사례', n: allCases.length, more: newHere(otherReqs).length },
-        { key: 'lessons', label: '교훈', n: mine.filter(c => !c.isRule && !c.isMuted).length, more: newHere(otherLessons).length + openCands.length },
-        { key: 'rules', label: '규칙', n: mine.filter(c => c.isRule).length, more: newHere(otherRules).length + promoCards.length },
+        { key: 'feedback', label: '사례', n: allCases.length, more: 0 },
+        { key: 'lessons', label: '교훈', n: mine.filter(c => !c.isRule && !c.isMuted).length, more: openCands.length },
+        { key: 'rules', label: '규칙', n: mine.filter(c => c.isRule).length, more: promoCards.length },
         { key: 'principles', label: '원칙', n: principles.filter(p => p.status === 'active').length },
         { key: 'needs', label: '근원 욕구', n: needs.filter(n => n.status === 'confirmed').length },
       ]
@@ -2194,11 +2280,9 @@ export const register: Register = on => {
       const reqRow = (rq: Requirement): CardRow => ({
         dot: STATE_COLOR.quiet,
         title: rq.text,
-        scope: isBorrowed(rq) ? `${projectName(rq.project)}에서` : undefined,
+        scope: isBorrowed(rq) ? `${projectName(rq.project)}에서` : rq.scope === 'global' ? '모든 프로젝트' : undefined,
         pill: attachedReqIds.includes(rq.id) ? { text: '반영 중', color: STATE_COLOR.hit } : { text: dateOf(rq.ts) },
       })
-      const moreButton = (key: string, total: number) =>
-        total > limit ? [<Box key={`${key}-more`} flexDirection="row" marginTop={1}>{[<Button key={`${key}-more-b`} variant="secondary" label={`${Math.min(LIST_STEP, total - limit)}개 더 보기 · ${total - limit}개 남음`} onPress={() => update($, listLimit, n => n + LIST_STEP)} />]}</Box>] : []
       const caseCard = (key: string, list: Feedback[], isOther: boolean) => {
         const views = list.slice(0, limit).map(f => {
           const c = own.find(x => x.id === f.cardId)
@@ -2245,18 +2329,15 @@ export const register: Register = on => {
               labelRow('s-reqs', '직접 말한 지시', reqs.length),
               ...(isOpen('s-reqs')
                 ? isManaging
-                  ? reqs.map(rq => (
-                      <Box key={`mrq-${rq.id}`} flexDirection="column" marginTop={ITEM_GAP}>
-                        {cardOf(`mrqc-${rq.id}`, [reqRow(rq)])}
-                        <Box flexDirection="row" marginTop={1}>
-                          {[
-                            isBorrowed(rq)
-                              ? <Button key={`dt-${rq.id}`} variant="secondary" label="여기서 떼기" onPress={() => placeReq($, rq.id, false)} />
-                              : <Button key={`rq-rm-${rq.id}`} variant="secondary" label="잊기" onPress={() => forgetRequirement($, rq.id)} />,
-                          ]}
-                        </Box>
-                      </Box>
-                    ))
+                  ? reqs.map(rq =>
+                      itemOf(`mrq-${rq.id}`, cardOf(`mrqc-${rq.id}`, [reqRow(rq)]), isBorrowed(rq)
+                        ? [<Button key={`dt-${rq.id}`} variant="secondary" label="여기서 떼기" onPress={() => placeReq($, rq.id, false)} />]
+                        : [
+                            <Button key={`rq-pp-${rq.id}`} variant={rq.scope !== 'global' ? 'primary' : 'secondary'} label={rq.project && !sameProject(rq.project, project) ? `${projectName(rq.project)}만` : '이 프로젝트'} onPress={() => setReqScope($, rq.id, 'personal-project')} />,
+                            <Button key={`rq-gl-${rq.id}`} variant={rq.scope === 'global' ? 'primary' : 'secondary'} label="모든 프로젝트" onPress={() => setReqScope($, rq.id, 'global')} />,
+                            <Button key={`rq-rm-${rq.id}`} variant="secondary" label="잊기" onPress={() => forgetRequirement($, rq.id)} />,
+                          ]),
+                    )
                   : [cardOf('card-reqs', reqs.map(reqRow))]
                 : []),
             ]
@@ -2366,7 +2447,7 @@ export const register: Register = on => {
                 : [cardOf('card-rules', ruleCards.map(c => ({ ...cardRow(c, false), pill: c.isMuted ? { text: '꺼둠' } : { text: '항상', color: STATE_COLOR.hit }, sub: subOf(c) })))]
               : []),
           ]}
-          {(tab === 'lessons' || tab === 'rules' || tab === 'feedback') && (mine.length > 0 || reqs.length > 0) && (
+          {(tab === 'lessons' || tab === 'rules' || tab === 'feedback') && (mine.length > 0 || reqs.length > 0 || others.length > 0 || otherReqs.length > 0) && (
             <Box key="lesson-tools" flexDirection="row" justifyContent="flex-start" marginTop={1}>
               <Button key="manage" variant={isManaging ? 'primary' : 'secondary'} dimColor={!isManaging} label="한 번에 관리" onPress={toggleManage} />
             </Box>
@@ -2389,10 +2470,6 @@ export const register: Register = on => {
 
     // Terminal: same order, text only.
     const { Box, Text, Button } = $.ui.resolve(e)
-    const waiting = [
-      ...newHere(others).map(c => ({ id: c.id, text: c.lesson ?? c.text, from: c.project, place: (a: boolean) => placeCard($, c.id, a) })),
-      ...newHere(otherReqs).map(r => ({ id: r.id, text: r.text, from: r.project, place: (a: boolean) => placeReq($, r.id, a) })),
-    ]
     const heading = (title: string, right?: string) => (
       <Box flexDirection="row" marginTop={1}>
         <Text bold>{title}</Text>
@@ -2453,16 +2530,6 @@ export const register: Register = on => {
         {heading(`내 규칙 · ${reqs.length}`)}
         {reqs.map(r => (
           <Text dimColor wrap="wrap">{`·  ${r.text}${isBorrowed(r) ? `  (${projectName(r.project)}에서)` : ''}`}</Text>
-        ))}
-        {waiting.length > 0 && heading(`다른 프로젝트 · 여기에도 붙일까요 · ${waiting.length}`)}
-        {waiting.map(w => (
-          <Box key={`tw-${w.id}`} flexDirection="row" gap={1}>
-            <Box flexGrow={1} flexShrink={1} minWidth={0}>
-              <Text wrap="wrap">{`[${projectName(w.from)}] ${w.text}`}</Text>
-            </Box>
-            <Button key={`at-${w.id}`} variant="primary" label="여기에도" onPress={() => w.place(true)} />
-            <Button key={`sk-${w.id}`} label="안 붙임" onPress={() => w.place(false)} />
-          </Box>
         ))}
         <Box flexDirection="row" marginTop={1} gap={1}>
           <Text dimColor>표시</Text>

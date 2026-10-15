@@ -48,9 +48,10 @@ function textOf(content: unknown): { text: string; isToolResult: boolean } {
 /**
  * Reads one transcript line by line. Lines are checked as text before any is
  * parsed: tool results and tool calls, most of a transcript's bytes, are never
- * parsed at all.
+ * parsed at all. isTypedOnly false also takes what a scheduled task or the app
+ * sent in the person's turn: where something was said, not only what was typed.
  */
-export function pastPromptReader(since: number, until = Infinity) {
+export function pastPromptReader(since: number, until = Infinity, isTypedOnly = true) {
   let before = ''
   let reply = ''
   const out: PastPrompt[] = []
@@ -73,10 +74,10 @@ export function pastPromptReader(since: number, until = Infinity) {
         reply = text.slice(-600)
         return
       }
-      if (r.type !== 'user' || NOT_TYPED.test(text)) return
+      if (r.type !== 'user' || (isTypedOnly && NOT_TYPED.test(text))) return
       const at = Date.parse(r.timestamp ?? '')
-      if (at >= since && at < until && text.length <= MAX_TEXT && r.uuid)
-        out.push({ uuid: r.uuid, at, session: r.sessionId ?? '', cwd: r.cwd ?? '', text: text.trim(), before: before || undefined, reply: reply || undefined })
+      if (at >= since && at < until && (!isTypedOnly || text.length <= MAX_TEXT) && r.uuid)
+        out.push({ uuid: r.uuid, at, session: r.sessionId ?? '', cwd: r.cwd ?? '', text: isTypedOnly ? text.trim() : text.trim().slice(0, 400), before: before || undefined, reply: reply || undefined })
       before = text.trim().slice(0, 400)
       reply = ''
     },
