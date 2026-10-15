@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { detailSvg, leadStripSvg, listCardSvg, textWidth, titleRowSvg } from './ui'
+import { caseCardSvg, detailSvg, leadStripSvg, listCardSvg, textWidth, titleRowSvg } from './ui'
 
 // Layout lint: nothing is cut with an ellipsis, and no text runs past its
 // image's right edge (estimated with the same width table the layout uses).
@@ -51,5 +51,14 @@ test('list card: a long project name ends in … before the pill, and the title 
     expect(scope?.[2]).toMatch(/…$/)
     expect(xOf(scope?.[1] ?? '') + textWidth(scope?.[2] ?? '') * (12 / 11)).toBeLessThan(pillX)
     for (const m of texts.filter(t => /font-size="13.5"/.test(t[1]))) expect(xOf(m[1]) + textWidth(m[2]) * (13.5 / 11)).toBeLessThan(xOf(scope?.[1] ?? ''))
+  }
+})
+
+test('case and list cards name their font once, not on every text: half of what is carried to the screen', () => {
+  const cs = caseCardSvg(554, [{ dot: '#8a8a8a', said: '배포 링크 달라고', when: 'hmi2html · 9월 7일', before: '배포 링크 줘', did: '로컬 주소를 줌', judgment: '배포 주소를 줘야 했다' }])
+  const ls = listCardSvg(554, [{ dot: '#8a8a8a', title: LONG, scope: 'hmi2html', pill: { text: '다른 프로젝트', color: '#f5873a' } }])
+  for (const sv of [cs, ls]) {
+    expect(sv.source.match(/font-family/g)?.length).toBe(1)
+    expect(sv.source).toContain('<style>text{font-family:')
   }
 })
