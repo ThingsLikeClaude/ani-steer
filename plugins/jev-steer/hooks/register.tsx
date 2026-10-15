@@ -6,24 +6,31 @@ import {
   JEV_URL,
   KIND_LABEL,
   MAX_PROMPT_CHARS,
+  aniCard,
+  aniCase,
   appliesTo,
   buildQuestions,
   describe,
   excerpt,
+  indexSummaries,
   isSamePath,
   isUndecided,
   judge,
   kindOf,
   noul,
+  parseAniPattern,
   parseIndex,
   pickCandidates,
   placeIn,
   projectName,
+  sameProject,
   scopeOf,
   slugOf,
   tokenize,
+  type AniPattern,
   type Answers,
 } from './core'
+import { lineSplitter, pastPromptReader } from './history'
 import { KIND_COLOR, STATE_COLOR, bandSvg, bannerSvg, cardSvg, headingSvg, leadStripSvg, paneHeaderSvg, ruleSvg, rowSvg, sectionSvg, tableHeadSvg, titleRowSvg, detailSvg, textWidth, caseCardSvg, askCardSvg, nowCardSvg, listCardSvg, capLabelSvg, type CardRow, type Glow, type Pulse, type KindCount } from './ui'
 
 // ── constants and state ─────────────────────────────────────────────────
@@ -39,6 +46,8 @@ const KINDS: Kind[] = ['intent', 'effort', 'missed', 'autonomy', 'buried']
 const CAPACITY: Record<'personal-project' | 'global', number> = { 'personal-project': 12, global: 12 }
 const SUBMIT_WAIT_MS = 1200
 const ARCHIVE_MAX = 200
+/** Cases kept: enough for every correction of the past weeks, well under the store's 4 MiB. */
+const FEEDBACK_MAX = 1000
 const REATTACH_EVERY = 6
 const MAX_ATTACHED_LESSONS = 2
 /** A lesson the same correction has hit this often is offered as a rule. */
@@ -71,6 +80,10 @@ const expandedSections = atom({ plugin: 'jev-steer', key: 'expandedSections' } a
 const pinned = atom({ plugin: 'jev-steer', key: 'pinned' } as const, [] as string[])
 const keyLater = atom({ plugin: 'jev-steer', key: 'keyLater' } as const, false)
 const hasKey = atom({ plugin: 'jev-steer', key: 'hasKey' } as const, true)
+/** Rows between one card-with-buttons and the next: twice the gap between a card and its own buttons. */
+const ITEM_GAP = 2
+/** How many rows a long list in the panel shows before "더 보기". */
+const listLimit = atom({ plugin: 'jev-steer', key: 'listLimit' } as const, 30)
 
 let project = 'unknown'
 let root = ''
@@ -121,8 +134,10 @@ async function loadCards($: EngineInterface): Promise<Card[]> {
     const text = await $.fs.read(path).catch(() => '')
     if (text) ani.push(...parseIndex(String(text), scope, project))
   }
+  // The lesson this mod keeps wins over ani's index row of the same id: a muted
+  // or attached copy stays as the person left it.
   const seen = new Set<string>()
-  return [...ani, ...(await ownCards($)).filter(c => !c.isArchived)].filter(c => (seen.has(c.id) ? false : (seen.add(c.id), true)))
+  return [...(await ownCards($)).filter(c => !c.isArchived), ...ani].filter(c => (seen.has(c.id) ? false : (seen.add(c.id), true)))
 }
 
 /** The person decided whether another project's lesson or rule rides here too. */
@@ -134,6 +149,58 @@ async function placeCard($: EngineInterface, id: string, isAttached: boolean) {
 /** The same decision for another project's requirement. */
 async function placeReq($: EngineInterface, id: string, isAttached: boolean) {
   await setReqs($, rs => rs.map(r => (r.id === id ? placeIn(r, project, isAttached) : r)))
+}
+
+/**
+ * ani's own records (~/.ani/patterns) join the panel, so every correction made
+ * on this computer is listed whatever folder a session opens in: an S becomes a
+ * lesson for every project, a captured F the lesson of the project it was said
+ * in, a compiled F a case of the S it went into. Each id comes in once; one the
+ * person forgets here is not brought back. The files are left as they are.
+ */
+let isImporting = false
+
+async function importAni($: EngineInterface) {
+  if (isImporting) return
+  isImporting = true
+  try {
+    await bringInAni($)
+  } finally {
+    isImporting = false
+  }
+}
+
+async function bringInAni($: EngineInterface) {
+  const dir = `${home}/.ani/patterns`
+  const entries = await $.fs.list(dir).catch(() => [])
+  const done = new Set(((await $.store.get('aniImported')) as string[] | undefined) ?? [])
+  const files = entries.filter(f => f.kind === 'file' && /^[SF]-.+\.md$/.test(f.name) && !done.has(f.name.replace(/\.md$/, '')))
+  if (!files.length) return
+  const summaries = indexSummaries(String(await $.fs.read(`${home}/.ani/INDEX.md`).catch(() => '')))
+  const patterns: AniPattern[] = []
+  for (const f of files) {
+    const p = parseAniPattern(String(await $.fs.read(`${dir}/${f.name}`).catch(() => '')))
+    if (p) patterns.push(p)
+  }
+  // A compiled case points at the S it went into (both come in on the same run).
+  const skills = new Map<string, string>()
+  for (const p of patterns) for (const f of p.compiledFrom) skills.set(f, p.id)
+  const own = await ownCards($)
+  const have = new Set(own.map(c => c.id))
+  const cards = patterns.filter(p => !have.has(p.id) && (p.id.startsWith('S-') ? p.status !== 'retired' : p.status !== 'compiled')).map(p => aniCard(p, summaries[p.id]))
+  const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+  const known = new Set(fb.map(f => f.at))
+  const caseIds = new Set(fb.map(f => f.aniId).filter(Boolean))
+  const cases: Feedback[] = []
+  for (const p of patterns.filter(x => x.id.startsWith('F-') && x.status === 'compiled' && !caseIds.has(x.id))) {
+    let at = Date.parse(p.date ?? '') || 1
+    while (known.has(at)) at++
+    known.add(at)
+    cases.push(aniCase(p, at, skills.get(p.id) ?? '', summaries[p.id]))
+  }
+  if (cards.length) await save($, 'cards', [...own, ...cards])
+  if (cases.length) await save($, 'feedbackLog', [...fb, ...cases].sort((a, b) => b.at - a.at).slice(0, FEEDBACK_MAX))
+  await save($, 'aniImported', [...done, ...patterns.map(p => p.id)])
 }
 
 async function editCard($: EngineInterface, id: string, change: Partial<Card> | null) {
@@ -153,7 +220,7 @@ async function editCard($: EngineInterface, id: string, change: Partial<Card> | 
 function enforceCapacity(cards: Card[]): Card[] {
   let out = cards
   for (const scope of ['personal-project', 'global'] as const) {
-    const inScope = out.filter(c => !c.isArchived && !c.isRule && c.scope === scope && (scope === 'global' || c.project === project))
+    const inScope = out.filter(c => !c.isArchived && !c.isRule && c.scope === scope && (scope === 'global' || sameProject(c.project, project)))
     const over = inScope.length - CAPACITY[scope]
     if (over <= 0) continue
     const weakest = [...inScope]
@@ -181,7 +248,7 @@ async function remember($: EngineInterface, prompt: string, answers: Answers, ca
   const answer = lastAnswer
   const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
   const logIt = async (cardId: string) => {
-    await save($, 'feedbackLog', [{ at: now, text: prompt, cardId, project }, ...fb].slice(0, 500))
+    await save($, 'feedbackLog', [{ at: now, text: prompt, cardId, project }, ...fb].slice(0, FEEDBACK_MAX))
     $.clock.after(0, () => enrichFeedback($, now, prompt))
   }
 
@@ -213,45 +280,93 @@ async function remember($: EngineInterface, prompt: string, answers: Answers, ca
   }
 
   // Not the same mistake as a lesson: it stays a case with one judgment. Two
-  // judgments that say the same thing become a lesson candidate (pairUp).
-  await save($, 'feedbackLog', [{ at: now, text: prompt, cardId: '', project, kind: kindOf(answers), scope: scopeOf(answers) }, ...fb].slice(0, 500))
+  // judgments that say the same thing become a lesson candidate (placeCase).
+  await save($, 'feedbackLog', [{ at: now, text: prompt, cardId: '', project, kind: kindOf(answers), scope: scopeOf(answers) }, ...fb].slice(0, FEEDBACK_MAX))
   $.clock.after(0, () => enrichFeedback($, now, prompt))
   return null
 }
 
 const CANDIDATE_AT = 0.7
+/** How many lessons, lesson candidates and waiting cases one new case is weighed against. */
+const PLACE_MAX = 24
+
+/** The items sharing the most words with a judgment: which to weigh it against first. */
+function nearest<T>(judgment: string, xs: readonly T[], text: (x: T) => string, n: number): T[] {
+  const words = new Set(tokenize(judgment))
+  return xs
+    .map(x => ({ x, s: tokenize(text(x)).filter(w => words.has(w)).length }))
+    .sort((a, b) => b.s - a.s)
+    .slice(0, Math.max(0, n))
+    .map(y => y.x)
+}
 
 /**
- * A case's judgment is in: ask Jev whether it says the same thing as another
- * case still waiting. The first match makes a lesson candidate from the two.
+ * A case's judgment is in. Jev weighs it, in one call, against the nearest
+ * lessons, lesson candidates and waiting cases of every project: a repeat of a
+ * lesson counts toward it (PROMOTE_AT of them offer a rule), a match with a
+ * candidate joins it, and two waiting cases that say the same thing become a
+ * candidate the person confirms. The same mistake in two projects is offered
+ * as a lesson for every project.
  */
-async function pairUp($: EngineInterface, at: number) {
+async function placeCase($: EngineInterface, at: number) {
   const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
   const me = fb.find(f => f.at === at)
   if (!me?.judgment || me.cardId || me.candidateId) return
-  const others = fb.filter(f => f.at !== at && !f.cardId && !f.candidateId && f.judgment && f.project === me.project).slice(0, 8)
-  if (!others.length) return
-  const key = await $.env.get('TYPESAFE_API_KEY')
-  if (!key) return
-  const questions = Object.fromEntries(others.map((o, i) => [`p${i}`, {
+  const judgment = me.judgment
+  const firstJudgment = (c: Candidate) => fb.find(f => c.cases.includes(f.at) && f.judgment)?.judgment ?? ''
+  const lessons = nearest(judgment, (await ownCards($)).filter(c => c.lesson && !c.isArchived && !c.isMuted), c => `${c.lesson} ${c.why ?? ''}`, 8)
+  const cands = nearest(judgment, (((await $.store.get('candidates')) as Candidate[] | undefined) ?? []).filter(c => !c.isDeclined), c => c.lesson ?? firstJudgment(c), 8)
+  const waiting = nearest(judgment, fb.filter(f => f.at !== at && !f.cardId && !f.candidateId && f.judgment), f => f.judgment as string, PLACE_MAX - lessons.length - cands.length)
+  if (!lessons.length && !cands.length && !waiting.length) return
+  const same = (text: string) => ({
     type: 'noul',
-    instructions: `Does the new judgment describe the same recurring mistake, in the same kind of situation, as this earlier one: "${o.judgment}"`,
+    instructions: `Does the new judgment describe the same recurring mistake, in the same kind of situation, as this: "${text}"`,
     criteria: { true: 'same mistake and situation; one lesson would cover both', false: 'a different mistake or a different situation' },
-  }]))
-  const res = await $.http.fetch(JEV_URL, {
-    method: 'POST',
-    headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ model: 'jev-latest', state: { new_judgment: me.judgment, new_case: `${me.understood ?? ''} / ${me.meant ?? ''}` }, questions }),
   })
-  if (!res.ok) return
-  const answers = (JSON.parse(res.text) as { answers: Answers }).answers
-  const best = others.map((o, i) => ({ o, p: noul(answers, `p${i}`) })).sort((x, y) => y.p - x.p)[0]
-  if (!best || best.p < CANDIDATE_AT) return
+  const q: Record<string, unknown> = {}
+  lessons.forEach((c, i) => (q[`l${i}`] = same(c.lesson as string)))
+  cands.forEach((c, i) => (q[`k${i}`] = same(c.lesson ?? firstJudgment(c))))
+  waiting.forEach((f, i) => (q[`p${i}`] = same(f.judgment as string)))
+  const answers = await askJev($, { new_judgment: judgment, new_case: `${me.understood ?? ''} / ${me.meant ?? ''}` }, q)
+  if (!answers) return
+  // The strongest match; a lesson before a candidate before a lone case when equal.
+  const best = [
+    ...lessons.map((_, i) => ({ to: 'lesson' as const, i, v: noul(answers, `l${i}`), order: 0 })),
+    ...cands.map((_, i) => ({ to: 'candidate' as const, i, v: noul(answers, `k${i}`), order: 1 })),
+    ...waiting.map((_, i) => ({ to: 'case' as const, i, v: noul(answers, `p${i}`), order: 2 })),
+  ]
+    .filter(x => x.v >= CANDIDATE_AT)
+    .sort((a, b) => b.v - a.v || a.order - b.order)[0]
+  if (!best) return
+  if (best.to === 'lesson') {
+    const hit = lessons[best.i] as Card
+    const own = await ownCards($)
+    await save($, 'cards', own.map(c => (c.id === hit.id ? { ...c, count: (c.count ?? 1) + 1, examples: [me.text.slice(0, 300), ...(c.examples ?? [c.text])].slice(0, 3), ts: Math.max(c.ts, me.at) } : c)))
+    await setFeedback($, at, { cardId: hit.id })
+    return
+  }
+  if (best.to === 'candidate') {
+    const hit = cands[best.i] as Candidate
+    const isElsewhere = fb.some(f => hit.cases.includes(f.at) && !sameProject(f.project, me.project))
+    const now = ((await $.store.get('candidates')) as Candidate[] | undefined) ?? []
+    await save($, 'candidates', now.map(c => (c.id === hit.id ? { ...c, cases: [...c.cases, at], ...(isElsewhere ? { scope: 'global' as const } : {}) } : c)))
+    await setFeedback($, at, { candidateId: hit.id })
+    return
+  }
+  const other = waiting[best.i] as Feedback
   const id = `C-${at}`
-  const cand: Candidate = { id, cases: [best.o.at, at], kind: me.kind ?? best.o.kind ?? 'intent', scope: me.scope ?? best.o.scope ?? 'personal-project' }
-  const cands = ((await $.store.get('candidates')) as Candidate[] | undefined) ?? []
-  await save($, 'candidates', [...cands, cand])
-  await save($, 'feedbackLog', fb.map(f => (f.at === at || f.at === best.o.at ? { ...f, candidateId: id } : f)))
+  const isElsewhere = !sameProject(other.project, me.project)
+  const cand: Candidate = {
+    id,
+    cases: [other.at, at],
+    kind: me.kind ?? other.kind ?? 'intent',
+    scope: isElsewhere ? 'global' : me.scope ?? other.scope ?? 'personal-project',
+    project: me.project,
+  }
+  const cs = ((await $.store.get('candidates')) as Candidate[] | undefined) ?? []
+  await save($, 'candidates', [...cs, cand])
+  const latest = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+  await save($, 'feedbackLog', latest.map(f => (f.at === at || f.at === other.at ? { ...f, candidateId: id } : f)))
   // The lesson text, drafted from both cases by the small model.
   const r = await $.model.complete({
     model: 'haiku',
@@ -260,7 +375,7 @@ async function pairUp($: EngineInterface, at: number) {
     system:
       '같은 판단을 낳은 사례 두 개가 주어집니다. 둘을 함께 덮는 교훈 하나를 만드세요. JSON만 답하세요: {"intent": "...", "why": "...", "lesson": "...", "short": "..."}. 모두 한국어 한 문장, 말줄임표 금지. ' +
       'intent: 사용자가 실제로 원한 것(30자 이내). why: 에이전트가 왜 잘못 읽었는지(40자 이내). lesson: 그 상황에서 다음엔 할 일, 상황으로 시작(40자 이내). short: lesson을 20자 이내로 다시 요약.',
-    prompt: [best.o, me].map((f, i) => `사례 ${i + 1}\n요청: ${f.before ?? ''}\n에이전트가 이해한 것: ${f.understood ?? ''}\n실제 의도: ${f.meant ?? ''}\n피드백: ${f.said ?? f.text}\n판단: ${f.judgment}`).join('\n\n'),
+    prompt: [other, me].map((f, i) => `사례 ${i + 1}\n요청: ${f.before ?? ''}\n에이전트가 이해한 것: ${f.understood ?? ''}\n실제 의도: ${f.meant ?? ''}\n피드백: ${f.said ?? f.text}\n판단: ${f.judgment}`).join('\n\n'),
   })
   if (!r.isAnswered) return
   try {
@@ -273,7 +388,7 @@ async function pairUp($: EngineInterface, at: number) {
   }
 }
 
-/** The person said yes: the two cases become one lesson (count 2). */
+/** The person said yes: the cases become one lesson, counted once per case. */
 async function acceptCandidate($: EngineInterface, id: string) {
   const cands = ((await $.store.get('candidates')) as Candidate[] | undefined) ?? []
   const c = cands.find(x => x.id === id)
@@ -287,7 +402,7 @@ async function acceptCandidate($: EngineInterface, id: string) {
     text: cases[0]?.text.slice(0, 300) ?? c.lesson ?? '',
     kind: c.kind,
     scope: c.scope,
-    project,
+    project: c.project ?? cases[0]?.project ?? project,
     source: 'jev',
     keywords: tokenize(cases.map(f => f.text).join(' ')).slice(0, 6),
     count: cases.length,
@@ -374,6 +489,11 @@ async function enrichFeedback($: EngineInterface, at: number, prompt: string) {
   const window = rows.slice(Math.max(0, end - 12), end)
   if (!window.length) return
   const transcript = window.map((m, i) => `[${i}] ${m.role === 'user' ? '사용자' : '에이전트'}: ${m.text.replace(/\s+/g, ' ').slice(0, 500)}`).join('\n')
+  await judgeCase($, at, prompt, transcript)
+}
+
+/** The small model reads one case against the conversation before it; true when it drew a judgment. */
+async function judgeCase($: EngineInterface, at: number, prompt: string, transcript: string): Promise<boolean> {
   const res = await $.model.complete({
     model: 'haiku',
     maxTokens: 300,
@@ -386,13 +506,176 @@ async function enrichFeedback($: EngineInterface, at: number, prompt: string) {
       'judgment: 이 사례 하나에서 내릴 수 있는 판단(일반 규칙이 아니라 "이 상황에서는 ~였다").',
     prompt: `대화 기록:\n${transcript}\n\n피드백:\n${prompt.slice(0, 1500)}`,
   })
-  if (!res.isAnswered) return
+  if (!res.isAnswered) return false
   try {
     const t = JSON.parse(res.text.match(/\{[\s\S]*\}/)?.[0] ?? '') as { before?: string; did?: string; said?: string; understood?: string; meant?: string; judgment?: string }
     await setFeedback($, at, { before: t.before, did: t.did, said: t.said, understood: t.understood, meant: t.meant, judgment: t.judgment })
-    if (t.judgment) await pairUp($, at)
+    if (t.judgment) await placeCase($, at)
+    return Boolean(t.judgment)
   } catch {
     // leave the verbatim record as it is
+    return false
+  }
+}
+
+// ── past conversations ──────────────────────────────────────────────────
+
+/** How far back "지난 대화에서 사례 찾기" reads. */
+const HISTORY_DAYS = 45
+/** Requests per Jev call when asking which past requests were corrections. */
+const HISTORY_BATCH = 15
+/** `$.fs.read` takes files up to 4 MiB; longer transcripts are streamed. */
+const READ_MAX = 4_000_000
+
+type History = { status: 'running' | 'done' | 'error'; at: number; since: number; until: number; files: number; filesDone: number; prompts: number; found: number; enriched: number; error?: string }
+
+async function setHistory($: EngineInterface, change: Partial<History>) {
+  const cur = ((await $.store.get('history')) as History | undefined) ?? { status: 'running', at: 0, since: 0, until: 0, files: 0, filesDone: 0, prompts: 0, found: 0, enriched: 0 }
+  await save($, 'history', { ...cur, ...change, at: await $.clock.now() })
+}
+
+/** A transcript line by line: read whole when small, streamed through `type` / `cat` when not. */
+async function* transcriptLines($: EngineInterface, path: string, size: number): AsyncGenerator<string> {
+  if (size < READ_MAX) {
+    yield* String(await $.fs.read(path)).split('\n')
+    return
+  }
+  const isWindows = (await $.env.get('OS')) === 'Windows_NT'
+  const split = lineSplitter()
+  const child = $.process.spawn({ argv: isWindows ? ['cmd', '/d', '/c', 'type', path.replace(/\//g, '\\')] : ['cat', path] })
+  for await (const piece of child) if (piece.stream === 'stdout') yield* split.push(piece.text)
+  yield* split.end()
+}
+
+/** A session's project as live recording names it: the origin remote, else the folder. */
+async function projectOf($: EngineInterface, cwd: string, cache: Map<string, string>): Promise<string> {
+  if (!cwd) return 'unknown'
+  if (!cache.has(cwd)) {
+    const remote = await $.process
+      .run(['git', '-C', cwd, 'remote', 'get-url', 'origin'])
+      .then(r => (r.exitCode === 0 ? r.stdout : ''))
+      .catch(() => '')
+    cache.set(cwd, await slugOf(remote, cwd))
+  }
+  return cache.get(cwd) as string
+}
+
+let isMining = false
+/** A run writes its progress at least this often; one quieter than this has stopped. */
+const HISTORY_ALIVE = 120_000
+
+/** Whether a run is reading now, in this session or another one. */
+const isHistoryLive = (h: History | undefined, now: number) => h?.status === 'running' && (isMining || now - h.at < HISTORY_ALIVE)
+
+/**
+ * "지난 대화에서 사례 찾기": the corrections made before ani was recording,
+ * walked through the same ladder as live ones. One run at a time; progress is
+ * kept per transcript, so pressing again after a stop carries on.
+ */
+async function mineHistory($: EngineInterface) {
+  if (isMining || isHistoryLive((await $.store.get('history')) as History | undefined, await $.clock.now())) return
+  isMining = true
+  try {
+    await readHistory($)
+    await judgeHistory($)
+    await setHistory($, { status: 'done' })
+  } catch (err) {
+    await setHistory($, { status: 'error', error: excerpt(String(err).replace(/^Error: /, ''), 80) })
+  } finally {
+    isMining = false
+  }
+}
+
+/**
+ * Every transcript written in the last HISTORY_DAYS, up to when ani started
+ * recording (what came after was judged as it was sent): Jev says which of the
+ * person's requests corrected the agent, and those become cases.
+ */
+async function readHistory($: EngineInterface) {
+  const now = await $.clock.now()
+  const prev = (await $.store.get('history')) as History | undefined
+  const isResuming = Boolean(prev && prev.status !== 'done')
+  const live = (((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []).filter(f => !f.aniId && !f.fromHistory).map(f => f.at)
+  const since = isResuming && prev ? prev.since : now - HISTORY_DAYS * 86_400_000
+  const until = isResuming && prev ? prev.until : live.length ? Math.min(...live) : now
+  const homeDir = home || ((await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE')) ?? '')
+  const base = `${(await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${homeDir}/.claude`}/projects`
+  // A transcript is known by its file name, the session's id: the list of those read stays small.
+  const files: { path: string; name: string; size: number; mtime: number }[] = []
+  for (const d of await $.fs.list(base).catch(() => [])) {
+    if (d.kind !== 'dir') continue
+    for (const f of await $.fs.list(`${base}/${d.name}`).catch(() => []))
+      if (f.kind === 'file' && f.name.endsWith('.jsonl') && f.mtimeMs >= since) files.push({ path: `${base}/${d.name}/${f.name}`, name: f.name, size: f.size, mtime: f.mtimeMs })
+  }
+  if (!files.length) throw new Error('대화 기록 폴더를 찾지 못했어요')
+  files.sort((a, b) => a.mtime - b.mtime)
+  const done = new Set(((await $.store.get('historyFiles')) as string[] | undefined) ?? [])
+  await setHistory($, {
+    status: 'running',
+    since,
+    until,
+    files: files.length,
+    filesDone: files.filter(f => done.has(f.name)).length,
+    error: undefined,
+    ...(isResuming ? {} : { prompts: 0, found: 0, enriched: 0 }),
+  })
+  const slugs = new Map<string, string>()
+  // A forked or resumed session repeats the messages it carried over: each is asked about once.
+  const asked = new Set<string>()
+  for (const f of files) {
+    if (done.has(f.name)) continue
+    const reader = pastPromptReader(since, until)
+    let n = 0
+    for await (const line of transcriptLines($, f.path, f.size)) {
+      reader.line(line)
+      // A long transcript is read in the session's own process: let it breathe.
+      if (++n % 2000 === 0) await $.clock.sleep(0)
+    }
+    const known = new Set((((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []).map(x => x.at))
+    const fresh = reader.prompts().filter(p => !known.has(p.at) && !asked.has(p.uuid))
+    for (const p of fresh) asked.add(p.uuid)
+    let found = 0
+    for (let i = 0; i < fresh.length; i += HISTORY_BATCH) {
+      const batch = fresh.slice(i, i + HISTORY_BATCH)
+      const answers = await askJev(
+        $,
+        { items: batch.map(p => ({ earlier_user_message: (p.before ?? '').slice(0, 300), assistant_reply: (p.reply ?? '').slice(-500), user_message: p.text.slice(0, 800) })) },
+        Object.fromEntries(batch.map((_, k) => [`h${k}`, {
+          type: 'noul',
+          instructions: `In items[${k}], is user_message correcting the assistant: saying it misunderstood, did something other than what was asked, went further than asked, or missed something? Not a new request, a question, an approval or a remark.`,
+          criteria: { true: 'a correction of what the assistant did or said', false: 'not a correction' },
+        }])),
+      )
+      if (!answers) throw new Error('Jev에 연결하지 못했어요')
+      const hits = batch.filter((_, k) => noul(answers, `h${k}`) >= 0.6)
+      if (!hits.length) continue
+      const cases: Feedback[] = []
+      for (const p of hits) cases.push({ at: p.at, text: p.text, cardId: '', project: await projectOf($, p.cwd, slugs), fromHistory: true, before: p.before, did: p.reply?.slice(-400) })
+      const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+      const have = new Set(fb.map(x => x.at))
+      const add = cases.filter(c => !have.has(c.at))
+      await save($, 'feedbackLog', [...fb, ...add].sort((a, b) => b.at - a.at).slice(0, FEEDBACK_MAX))
+      found += add.length
+    }
+    done.add(f.name)
+    await save($, 'historyFiles', [...done])
+    const h = (await $.store.get('history')) as History
+    await setHistory($, { filesDone: h.filesDone + 1, prompts: h.prompts + fresh.length, found: h.found + found })
+  }
+}
+
+/** Each case found in past conversations is worded and placed like a live one, oldest first. */
+async function judgeHistory($: EngineInterface) {
+  const tried = new Set<number>()
+  for (;;) {
+    const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+    const next = fb.filter(f => f.fromHistory && !f.judgment && !tried.has(f.at)).sort((a, b) => a.at - b.at)[0]
+    if (!next) return
+    tried.add(next.at)
+    const transcript = [next.before && `[0] 사용자: ${next.before}`, next.did && `[1] 에이전트: ${next.did}`].filter(Boolean).join('\n') || '(앞 대화 기록 없음)'
+    await judgeCase($, next.at, next.text, transcript)
+    const h = (await $.store.get('history')) as History
+    await setHistory($, { enriched: h.enriched + 1 })
   }
 }
 
@@ -1015,7 +1298,7 @@ const REQS_PER_PROJECT = 20
 
 /** The newest REQS_PER_PROJECT said in this project; other projects' are left alone. */
 function capReqs(rs: Requirement[]): Requirement[] {
-  const drop = new Set(rs.filter(r => r.project === project).slice(0, -REQS_PER_PROJECT).map(r => r.id))
+  const drop = new Set(rs.filter(r => sameProject(r.project, project)).slice(0, -REQS_PER_PROJECT).map(r => r.id))
   return rs.filter(r => !drop.has(r.id))
 }
 
@@ -1060,7 +1343,7 @@ async function forgetRequirement($: EngineInterface, id: string) {
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     root = await $.session.root()
-    home = (await $.env.get('HOME')) ?? ''
+    home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE')) ?? ''
     const remote = await $.process
       .run(['git', '-C', root, 'remote', 'get-url', 'origin'])
       .then(r => (r.exitCode === 0 ? r.stdout : ''))
@@ -1085,10 +1368,12 @@ export const register: Register = on => {
     // The pane is where ani lives: open it beside the transcript from the start.
     if ((await read($, display)).pane) $.clock.after(0, () => $.ui.open({ id: PANE, title: TITLE }))
     $.clock.after(0, () => backfill($))
+    $.clock.after(0, () => importAni($))
     // Feedback logged before the walk-back existed gets its context now.
     $.clock.after(0, async () => {
       const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
-      for (const f of fb.filter(x => !x.judgment).slice(0, 10)) await enrichFeedback($, f.at, f.text)
+      // Cases from past conversations or ani's files carry their own context.
+      for (const f of fb.filter(x => !x.judgment && !x.fromHistory && !x.aniId).slice(0, 10)) await enrichFeedback($, f.at, f.text)
     })
     return next(e)
   })
@@ -1109,6 +1394,7 @@ export const register: Register = on => {
     }
     recentPrompts.push(text)
     if (recentPrompts.length > 6) recentPrompts.shift()
+    $.clock.after(0, () => importAni($))
     // A one-time import (e.g. lessons rebuilt from an earlier conversation):
     // its lessons go live, the ones they replace are archived, its cases join the log.
     {
@@ -1122,7 +1408,7 @@ export const register: Register = on => {
         await save($, 'cards', cards)
         const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
         const known = new Set(fb.map(f => f.at))
-        await save($, 'feedbackLog', [...fb, ...imp.cases.filter(f => !known.has(f.at))].sort((a, b) => b.at - a.at).slice(0, 500))
+        await save($, 'feedbackLog', [...fb, ...imp.cases.filter(f => !known.has(f.at))].sort((a, b) => b.at - a.at).slice(0, FEEDBACK_MAX))
         await save($, 'imports', [...done, imp.id])
       }
     }
@@ -1131,7 +1417,7 @@ export const register: Register = on => {
       await save($, 'caseV2', true)
       $.clock.after(0, async () => {
         const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
-        for (const f of fb.slice(0, 12)) await enrichFeedback($, f.at, f.text)
+        for (const f of fb.filter(x => !x.fromHistory && !x.aniId).slice(0, 12)) await enrichFeedback($, f.at, f.text)
       })
     }
     // Lessons still without a short form get one in the background.
@@ -1240,7 +1526,7 @@ export const register: Register = on => {
       const own = await ownCards($)
       void v
       // Another project's lesson attached here is promoted in its own project, not from here.
-      const promos = mineOf(own).filter(c => (c.scope === 'global' || c.project === project) && !c.isMuted && !c.isRule && !c.isPromotionDeclined && (c.count ?? 1) >= PROMOTE_AT)
+      const promos = mineOf(own).filter(c => (c.scope === 'global' || sameProject(c.project, project)) && !c.isMuted && !c.isRule && !c.isPromotionDeclined && (c.count ?? 1) >= PROMOTE_AT)
       const promo = promos[0]
       const cands = (((await $.store.get('candidates')) as Candidate[] | undefined) ?? []).filter(c => !c.isDeclined)
       const cand = cands[0]
@@ -1412,7 +1698,7 @@ export const register: Register = on => {
     const newHere = <T extends { project?: string; scope?: Scope; alsoIn?: string[]; skipIn?: string[] }>(xs: T[]) => xs.filter(x => isUndecided(x, project))
     const skippedHere = <T extends { skipIn?: string[] }>(xs: T[]) => xs.filter(x => x.skipIn?.includes(project))
     const otherReqs = allReqs.filter(r => !appliesTo(r, project))
-    const isBorrowed = (x: { project?: string; scope?: Scope }) => x.scope !== 'global' && x.project !== project
+    const isBorrowed = (x: { project?: string; scope?: Scope }) => x.scope !== 'global' && !sameProject(x.project, project)
     const live = mine.filter(c => !c.isMuted)
     const unstructured = mine.filter(c => !c.lesson).length
     const sentIds = (await read($, sent))?.lessonIds ?? []
@@ -1553,7 +1839,10 @@ export const register: Register = on => {
         )
       const out = await read($, sent)
       const now = await $.clock.now()
-      const ago = (t: number) => { const s = Math.max(0, Math.round((now - t) / 1000)); return s < 60 ? `${s}초 전` : `${Math.round(s / 60)}분 전` }
+      const ago = (t: number) => {
+        const s = Math.max(0, Math.round((now - t) / 1000))
+        return s < 60 ? `${s}초 전` : s < 3600 ? `${Math.round(s / 60)}분 전` : s < 86400 ? `${Math.round(s / 3600)}시간 전` : dateOf(t)
+      }
       const verdictText = { apply: '붙임', ask: '물어봄', hold: '안 붙임' } as const
       const verdictColor = { apply: STATE_COLOR.hit, ask: STATE_COLOR.ask, hold: undefined } as const
       const plain = (key: string, title: string, sub?: string) => {
@@ -1597,11 +1886,17 @@ export const register: Register = on => {
         const sv = listCardSvg(paneW, rows, tone)
         return <Svg key={key} source={sv.source} width={sv.width} height={sv.height} alt={rows.map(r => r.title).join('. ')} />
       }
-      const manageRow = (c: Card, isOn: boolean) => (
-        <Box key={`m-${c.id}`} flexDirection="column" marginTop={1}>
-          {cardOf(`mc-${c.id}`, [cardRow(c, isOn)])}
-          <Box flexDirection="row" gap={1} marginTop={1}>
-            {isBorrowed(c) ? [
+      // One card with its buttons, kept together: the buttons sit just under their own card and
+      // the next card starts a clear step below, so no button reads as the next card's.
+      const itemOf = (key: string, card: JSX.Element, buttons: JSX.Element[]) => (
+        <Box key={key} flexDirection="column" marginTop={ITEM_GAP}>
+          {card}
+          <Box flexDirection="row" gap={1} marginTop={1}>{buttons}</Box>
+        </Box>
+      )
+      const manageRow = (c: Card, isOn: boolean) =>
+        itemOf(`m-${c.id}`, cardOf(`mc-${c.id}`, [cardRow(c, isOn)]),
+            isBorrowed(c) ? [
               // Scope, mute and forget would change it in the project it came from.
               <Button key={`dt-${c.id}`} variant="secondary" label="여기서 떼기" onPress={() => placeCard($, c.id, false)} />,
             ] : [
@@ -1609,10 +1904,7 @@ export const register: Register = on => {
               <Button key={`to-gl-${c.id}`} variant={!c.isMuted && c.scope === 'global' ? 'primary' : 'secondary'} label="모든 프로젝트" onPress={() => editCard($, c.id, { isMuted: false, scope: 'global' })} />,
               <Button key={`mute-${c.id}`} variant={c.isMuted ? 'primary' : 'secondary'} label={c.isMuted ? '켜기' : '끄기'} onPress={() => editCard($, c.id, { isMuted: !c.isMuted })} />,
               <Button key={`rm-${c.id}`} variant="secondary" label="잊기" onPress={() => editCard($, c.id, null)} />,
-            ]}
-          </Box>
-        </Box>
-      )
+            ])
       // Another project's lessons, rules or requirements: tagged with the project
       // they come from; the person attaches each one here, or says not here.
       type Other = { id: string; title: string; from?: string; badge?: CardRow['badge']; sub?: CardRow['sub'] }
@@ -1621,15 +1913,12 @@ export const register: Register = on => {
           ? [
               labelRow(`s-${key}-new`, `다른 프로젝트의 ${what} · 여기에도 붙일까요`, undecided.length),
               ...(isOpen(`s-${key}-new`)
-                ? undecided.flatMap(o => [
-                    cardOf(`on-${o.id}`, [{ dot: STATE_COLOR.quiet, badge: o.badge, title: o.title, scope: projectName(o.from), pill: { text: '다른 프로젝트', color: STATE_COLOR.ask }, sub: o.sub }], STATE_COLOR.ask),
-                    <Box key={`ob-${o.id}`} flexDirection="row" gap={1} marginTop={1}>
-                      {[
-                        <Button key={`at-${o.id}`} variant="primary" label="여기에도 붙이기" onPress={() => place(o.id, true)} />,
-                        <Button key={`sk-${o.id}`} variant="secondary" label="안 붙임" onPress={() => place(o.id, false)} />,
-                      ]}
-                    </Box>,
-                  ])
+                ? undecided.map(o =>
+                    itemOf(`ob-${o.id}`, cardOf(`on-${o.id}`, [{ dot: STATE_COLOR.quiet, badge: o.badge, title: o.title, scope: projectName(o.from), pill: { text: '다른 프로젝트', color: STATE_COLOR.ask }, sub: o.sub }], STATE_COLOR.ask), [
+                      <Button key={`at-${o.id}`} variant="primary" label="여기에도 붙이기" onPress={() => place(o.id, true)} />,
+                      <Button key={`sk-${o.id}`} variant="secondary" label="안 붙임" onPress={() => place(o.id, false)} />,
+                    ]),
+                  )
                 : []),
             ]
           : []),
@@ -1637,10 +1926,11 @@ export const register: Register = on => {
           ? [
               labelRow(`s-${key}-skip`, `여기엔 안 붙인 ${what}`, skipped.length, true),
               ...(!isOpen(`s-${key}-skip`)
-                ? skipped.flatMap(o => [
-                    cardOf(`os-${o.id}`, [{ dot: STATE_COLOR.quiet, title: o.title, scope: projectName(o.from), pill: { text: '안 붙임' }, isMuted: true }]),
-                    <Box key={`osb-${o.id}`} flexDirection="row" marginTop={1}>{[<Button key={`at-${o.id}`} variant="secondary" label="다시 붙이기" onPress={() => place(o.id, true)} />]}</Box>,
-                  ])
+                ? skipped.map(o =>
+                    itemOf(`osb-${o.id}`, cardOf(`os-${o.id}`, [{ dot: STATE_COLOR.quiet, title: o.title, scope: projectName(o.from), pill: { text: '안 붙임' }, isMuted: true }]), [
+                      <Button key={`at-${o.id}`} variant="secondary" label="다시 붙이기" onPress={() => place(o.id, true)} />,
+                    ]),
+                  )
                 : []),
             ]
           : []),
@@ -1658,13 +1948,22 @@ export const register: Register = on => {
       const principles = await loadPrinciples($)
       const needs = await loadNeeds($)
       const cands = ((await $.store.get('candidates')) as Candidate[] | undefined) ?? []
-      const feedbackLog = (((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []).filter(f => f.project === project || own.find(c => c.id === f.cardId)?.scope === 'global')
+      const allCases = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+      const limit = await read($, listLimit)
+      const openCands = cands.filter(c => !c.isDeclined).sort((a, b) => b.cases.length - a.cases.length)
+      const promoCards = own
+        .filter(c => !c.isArchived && !c.isMuted && !c.isRule && !c.isPromotionDeclined && (c.count ?? 1) >= PROMOTE_AT)
+        .sort((a, b) => (b.count ?? 1) - (a.count ?? 1))
+      const hist = (await $.store.get('history')) as History | undefined
+      const isHistLive = isHistoryLive(hist, await $.clock.now())
+      const feedbackLog = allCases.filter(f => sameProject(f.project, project))
+      const otherCases = allCases.filter(f => !sameProject(f.project, project))
       // The ladder reads left to right: what was said, what was learned, what always holds.
-      // "+N": another project's items waiting for a decision here.
+      // "+N": what waits for the person's decision: another project's items, lesson and rule candidates.
       const ladder: { key: Tab; label: string; n: number; more?: number }[] = [
-        { key: 'feedback', label: '사례', n: feedbackLog.length, more: newHere(otherReqs).length },
-        { key: 'lessons', label: '교훈', n: mine.filter(c => !c.isRule && !c.isMuted).length, more: newHere(otherLessons).length },
-        { key: 'rules', label: '규칙', n: mine.filter(c => c.isRule).length, more: newHere(otherRules).length },
+        { key: 'feedback', label: '사례', n: allCases.length, more: newHere(otherReqs).length },
+        { key: 'lessons', label: '교훈', n: mine.filter(c => !c.isRule && !c.isMuted).length, more: newHere(otherLessons).length + openCands.length },
+        { key: 'rules', label: '규칙', n: mine.filter(c => c.isRule).length, more: newHere(otherRules).length + promoCards.length },
         { key: 'principles', label: '원칙', n: principles.filter(p => p.status === 'active').length },
         { key: 'needs', label: '근원 욕구', n: needs.filter(n => n.status === 'confirmed').length },
       ]
@@ -1730,7 +2029,7 @@ export const register: Register = on => {
               ? [
                   labelRow('s-pv-pr', '미리 본 원칙', ps.length),
                   ...ps.map((p, i) => (
-                    <Box key={`pvp-${i}`} flexDirection="column" marginTop={1}>
+                    <Box key={`pvp-${i}`} flexDirection="column" marginTop={ITEM_GAP}>
                       {cardOf(`pvpc-${i}`, [{ dot: '#8a8a8a', title: p.text, pill: { text: `미리 보기 · ${Math.round(p.fit * 100)}%`, color: STATE_COLOR.weigh }, sub: own.filter(c => p.from.includes(c.id)).map(c => ({ label: '교훈', value: c.lesson ?? c.text })) }])}
                       <Box flexDirection="row" marginTop={1}>{[<Button key={`pvk-${i}`} variant="secondary" label="원칙으로 확정" onPress={() => keepPreviewPrinciple($, i)} />]}</Box>
                     </Box>
@@ -1741,7 +2040,7 @@ export const register: Register = on => {
               ? [
                   labelRow('s-pv-nd', '미리 본 근원 욕구', preview.needs.length),
                   ...preview.needs.map((nd, i) => (
-                    <Box key={`pvn-${i}`} flexDirection="column" marginTop={1}>
+                    <Box key={`pvn-${i}`} flexDirection="column" marginTop={ITEM_GAP}>
                       {cardOf(`pvnc-${i}`, [{ dot: '#8a8a8a', title: nd.text, pill: { text: '가설', color: STATE_COLOR.weigh }, sub: nd.from.map(k => ps[k - 1]).filter(Boolean).map(p => ({ label: '원칙', value: p.text })) }])}
                       <Box flexDirection="row" marginTop={1}>{[<Button key={`pvnk-${i}`} variant="secondary" label="이걸로 확정" onPress={() => keepPreviewNeed($, i)} />]}</Box>
                     </Box>
@@ -1759,7 +2058,7 @@ export const register: Register = on => {
           labelRow('s-pr', '원칙', shownPs.length),
           ...(isOpen('s-pr')
             ? shownPs.map(p => (
-                <Box key={`pr-${p.id}`} flexDirection="column" marginTop={1}>
+                <Box key={`pr-${p.id}`} flexDirection="column" marginTop={ITEM_GAP}>
                   {cardOf(`prc-${p.id}`, [{
                     dot: '#8a8a8a',
                     title: p.text,
@@ -1800,7 +2099,7 @@ export const register: Register = on => {
             ? [
                 labelRow('s-hy', '가설', hyps.length),
                 ...hyps.map(n => (
-                  <Box key={`hy-${n.id}`} flexDirection="column" marginTop={1}>
+                  <Box key={`hy-${n.id}`} flexDirection="column" marginTop={ITEM_GAP}>
                     {cardOf(`hyc-${n.id}`, [{ dot: '#8a8a8a', title: n.text, pill: { text: '가설', color: STATE_COLOR.weigh }, sub: pText(n.from) }])}
                     <Box flexDirection="row" gap={1} marginTop={1}>
                       {[
@@ -1841,29 +2140,50 @@ export const register: Register = on => {
         scope: isBorrowed(rq) ? `${projectName(rq.project)}에서` : undefined,
         pill: attachedReqIds.includes(rq.id) ? { text: '반영 중', color: STATE_COLOR.hit } : { text: dateOf(rq.ts) },
       })
+      const moreButton = (key: string, total: number) =>
+        total > limit ? [<Box key={`${key}-more`} flexDirection="row" marginTop={1}>{[<Button key={`${key}-more-b`} variant="secondary" label={`${Math.min(30, total - limit)}개 더 보기 · ${total - limit}개 남음`} onPress={() => update($, listLimit, n => n + 30)} />]}</Box>] : []
+      const caseCard = (key: string, list: Feedback[], isOther: boolean) => {
+        const sv = caseCardSvg(paneW, list.slice(0, limit).map(f => {
+          const c = own.find(x => x.id === f.cardId)
+          const cd = cands.find(x => x.id === f.candidateId)
+          return { dot: c ? KIND_COLOR[c.kind] : '#8a8a8a', said: f.said ?? f.text, raw: f.text, when: isOther ? `${projectName(f.project)} · ${ago(f.at)}` : ago(f.at), before: f.before, did: f.did, after: f.after, understood: f.understood, meant: f.meant, judgment: f.judgment, lesson: c?.lesson ?? (cd ? `후보 · ${cd.lesson ?? '정리하는 중'}` : f.judgment ? '판단 1개 · 같은 판단이 한 번 더 나오면 교훈 후보' : undefined) }
+        }))
+        return <Svg key={key} source={sv.source} width={sv.width} height={sv.height} alt={list.map(f => f.said ?? f.text).join('. ')} />
+      }
+      const histView = () => {
+        const isLive = isHistLive
+        const text = !hist
+          ? `ani가 기록하기 전의 대화는 아직 보지 않았어요. 지난 ${HISTORY_DAYS}일 대화에서 교정을 찾아 사례로 정리하고, 같은 판단끼리 교훈 후보로 묶어요. 교정 하나에 Jev와 Haiku를 두세 번 써요.`
+          : isLive
+            ? `지난 대화를 읽는 중 · 기록 ${hist.filesDone}/${hist.files} · 요청 ${hist.prompts}개에서 교정 ${hist.found}개 · 정리 ${hist.enriched}/${hist.found}`
+            : hist.status === 'done'
+              ? `${dateOf(hist.since)}부터 ani 기록 전까지의 대화에서 요청 ${hist.prompts}개를 보고 교정 ${hist.found}개를 사례로 정리했어요`
+              : `멈췄어요${hist.error ? ` · ${hist.error}` : ''} · 기록 ${hist.filesDone}/${hist.files} · 다시 누르면 이어서 해요`
+        // Once done there is nothing left to read: what came after was recorded as it was said.
+        const label = !hist ? `지난 ${HISTORY_DAYS}일 대화에서 사례 찾기` : '이어서 찾기'
+        return [
+          <Box key="hist" flexDirection="column" marginBottom={1}>
+            <Text dimColor={!isLive} wrap="wrap">{text}</Text>
+            {isLive || hist?.status === 'done' ? null : <Box flexDirection="row" marginTop={1}>{[<Button key="hist-run" variant={hist ? 'secondary' : 'primary'} label={label} onPress={() => { $.clock.after(0, () => mineHistory($)) }} />]}</Box>}
+          </Box>,
+        ]
+      }
       const feedbackView = () => [
+        ...histView(),
         ...(feedbackLog.length
-          ? [
-              labelRow('s-fb', '사례', feedbackLog.length),
-              ...(isOpen('s-fb')
-                ? [(() => {
-                    const sv = caseCardSvg(paneW, feedbackLog.slice(0, 30).map(f => {
-                      const c = own.find(x => x.id === f.cardId)
-                      const cd = cands.find(x => x.id === f.candidateId)
-                      return { dot: c ? KIND_COLOR[c.kind] : '#8a8a8a', said: f.said ?? f.text, raw: f.text, when: ago(f.at), before: f.before, did: f.did, after: f.after, understood: f.understood, meant: f.meant, judgment: f.judgment, lesson: c?.lesson ?? (cd ? `후보 · ${cd.lesson ?? '정리하는 중'}` : f.judgment ? '판단 1개 · 같은 판단이 한 번 더 나오면 교훈 후보' : undefined) }
-                    }))
-                    return <Svg key="card-fb" source={sv.source} width={sv.width} height={sv.height} alt={feedbackLog.map(f => f.said ?? f.text).join('. ')} />
-                  })()]
-                : []),
-            ]
-          : [emptyNote('fb-empty', '아직 없어요. "아니 그게 아니라…"처럼 교정하면 사례로 쌓이고, 사례마다 판단 하나를 남겨요. 같은 판단이 2번 나오면 교훈 후보가 돼요.')]),
+          ? [labelRow('s-fb', '사례', feedbackLog.length), ...(isOpen('s-fb') ? [caseCard('card-fb', feedbackLog, false), ...moreButton('fb', feedbackLog.length)] : [])]
+          : [emptyNote('fb-empty', `${otherCases.length ? '이 프로젝트의 사례는 ' : ''}아직 없어요. "아니 그게 아니라…"처럼 교정하면 사례로 쌓이고, 사례마다 판단 하나를 남겨요. 같은 판단이 2번 나오면 교훈 후보가 돼요.`)]),
+        // Every other project's cases, each tagged with its project: what was said elsewhere stays in view.
+        ...(otherCases.length
+          ? [labelRow('s-fb-other', '다른 프로젝트의 사례', otherCases.length), ...(isOpen('s-fb-other') ? [caseCard('card-fb-other', otherCases, true), ...moreButton('fb-other', otherCases.length)] : [])]
+          : []),
         ...(reqs.length
           ? [
               labelRow('s-reqs', '직접 말한 지시', reqs.length),
               ...(isOpen('s-reqs')
                 ? isManaging
                   ? reqs.map(rq => (
-                      <Box key={`mrq-${rq.id}`} flexDirection="column" marginTop={1}>
+                      <Box key={`mrq-${rq.id}`} flexDirection="column" marginTop={ITEM_GAP}>
                         {cardOf(`mrqc-${rq.id}`, [reqRow(rq)])}
                         <Box flexDirection="row" marginTop={1}>
                           {[
@@ -1880,7 +2200,49 @@ export const register: Register = on => {
           : []),
         ...reqOthers(),
       ]
+      const candView = () =>
+        openCands.length
+          ? [
+              labelRow('s-cand', '교훈 후보 · 같은 판단이 2번 이상', openCands.length),
+              ...(isOpen('s-cand')
+                ? [
+                    ...openCands.slice(0, limit).map(c => {
+                      const cs = allCases.filter(f => c.cases.includes(f.at))
+                      const names = [...new Set(cs.map(f => projectName(f.project)))]
+                      return itemOf(`cand-b-${c.id}`,
+                        cardOf(`cand-${c.id}`, [{
+                          dot: STATE_COLOR.weigh,
+                          title: c.lesson ?? cs.find(f => f.judgment)?.judgment ?? '교훈 문장을 정리하는 중',
+                          scope: names.length > 1 ? `${names[0]} 외 ${names.length - 1}곳` : names[0],
+                          pill: { text: `사례 ${cs.length}`, color: STATE_COLOR.weigh },
+                          sub: cs.slice(0, 3).map(f => ({ label: '사례', value: f.said ?? f.text })),
+                        }], STATE_COLOR.weigh), [
+                          <Button key={`ca-${c.id}`} variant="primary" label="교훈으로" onPress={() => acceptCandidate($, c.id)} />,
+                          <Button key={`cd-${c.id}`} variant="secondary" label="아님" onPress={() => declineCandidate($, c.id)} />,
+                        ])
+                    }),
+                    ...moreButton('cand', openCands.length),
+                  ]
+                : []),
+            ]
+          : []
+      // Lessons corrected PROMOTE_AT times or more, every project: each waits for 규칙으로.
+      const promoView = () =>
+        promoCards.length
+          ? [
+              labelRow('s-promo', `규칙 후보 · 같은 교정 ${PROMOTE_AT}번 이상`, promoCards.length),
+              ...(isOpen('s-promo')
+                ? promoCards.map(c =>
+                    itemOf(`promo-b-${c.id}`, cardOf(`promo-${c.id}`, [{ ...cardRow(c, false), scope: appliesTo(c, project) ? scopeName(c) : projectName(c.project), pill: { text: `교정 ${c.count ?? 1}번`, color: STATE_COLOR.ask }, sub: subOf(c) }], STATE_COLOR.ask), [
+                      <Button key={`pr-${c.id}`} variant="primary" label="규칙으로" onPress={async () => { await editCard($, c.id, { isRule: true }); $.clock.after(0, () => findPrinciple($, c.id)) }} />,
+                      <Button key={`pn-${c.id}`} variant="secondary" label="아직 교훈으로" onPress={() => editCard($, c.id, { isPromotionDeclined: true })} />,
+                    ]),
+                  )
+                : []),
+            ]
+          : []
       const lessonCards = [
+        ...candView(),
         ...(pending.length
           ? [
               labelRow('s-maybe', '답 필요', pending.length),
@@ -1889,13 +2251,10 @@ export const register: Register = on => {
                     const c = mine.find(x => x.id === j.id)
                     if (!c) return []
                     return [
-                      cardOf(`ask-${c.id}`, [{ ...cardRow(c, false), pill: { text: '답 필요', color: STATE_COLOR.ask }, sub: subOf(c) }], STATE_COLOR.ask),
-                      <Box key={`ask-b-${c.id}`} flexDirection="row" gap={1} marginTop={1}>
-                        {[
-                          <Button key={`yes-${i}`} variant="primary" label="적용" onPress={() => label($, j, true)} />,
-                          <Button key={`no-${i}`} variant="secondary" label="이번엔 아님" onPress={() => label($, j, false)} />,
-                        ]}
-                      </Box>,
+                      itemOf(`ask-b-${c.id}`, cardOf(`ask-${c.id}`, [{ ...cardRow(c, false), pill: { text: '답 필요', color: STATE_COLOR.ask }, sub: subOf(c) }], STATE_COLOR.ask), [
+                        <Button key={`yes-${i}`} variant="primary" label="적용" onPress={() => label($, j, true)} />,
+                        <Button key={`no-${i}`} variant="secondary" label="이번엔 아님" onPress={() => label($, j, false)} />,
+                      ]),
                     ]
                   })
                 : []),
@@ -1931,6 +2290,7 @@ export const register: Register = on => {
           {hair('h-top')}
 
           {tab === 'sent' && sentView()}
+          {tab === 'rules' && promoView()}
 
           {tab === 'rules' && reqs.length === 0 && (
             <Box paddingY={2}><Text dimColor wrap="wrap">아직 없어요. "이미지는 Astra로"처럼 대상이 분명한 지시를 말하면 여기에 저장돼요.</Text></Box>

@@ -1,4 +1,4 @@
-import type { Card, Judgment, Kind, Requirement, Scope, Verdict } from '../types'
+import type { Card, Feedback, Judgment, Kind, Requirement, Scope, Verdict } from '../types'
 
 export const JEV_URL = 'https://api.typesafe.ai/v1/systemone'
 export const MAX_CANDIDATES = 24
@@ -50,6 +50,102 @@ export function parseIndex(markdown: string, scope: Scope, project: string): Car
     })
   }
   return cards
+}
+
+/** The one-line summary of every row in an ani INDEX.md, by id, whatever its status. */
+export function indexSummaries(markdown: string): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const line of markdown.split('\n')) {
+    const cells = line.split('|').map(c => c.trim())
+    if (cells.length >= 7 && /^[SKF]-/.test(cells[1] ?? '')) out[cells[1] as string] = cells[5] ?? ''
+  }
+  return out
+}
+
+/** One file of ani's `patterns/`: its frontmatter and its `## ` sections. */
+export type AniPattern = {
+  id: string
+  status: string
+  date?: string
+  project?: string
+  quote?: string
+  summary?: string
+  keywords: string[]
+  compiledFrom: string[]
+  recurrence: number
+  sections: Record<string, string>
+}
+
+export function parseAniPattern(markdown: string): AniPattern | null {
+  const m = markdown.replace(/\r\n/g, '\n').match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/)
+  if (!m) return null
+  const fm: Record<string, string> = {}
+  let last = ''
+  for (const line of (m[1] as string).split('\n')) {
+    const kv = line.match(/^([A-Za-z_]+):\s*(.*)$/)
+    if (kv) fm[(last = kv[1] as string)] = (kv[2] as string).trim()
+    else if (last && /^\s+\S/.test(line)) fm[last] = `${fm[last]} ${line.trim()}`
+  }
+  const list = (v?: string) => (v ?? '').replace(/^\[|\]$/g, '').split(',').map(x => x.trim()).filter(Boolean)
+  const unquote = (v?: string) => (v ? v.replace(/^["']|["']$/g, '') : undefined)
+  const sections: Record<string, string> = {}
+  for (const part of (m[2] as string).split(/^## /m).slice(1)) {
+    const nl = part.indexOf('\n')
+    sections[part.slice(0, nl < 0 ? undefined : nl).trim()] = nl < 0 ? '' : part.slice(nl + 1).trim()
+  }
+  if (!fm.id) return null
+  return {
+    id: fm.id,
+    status: fm.status ?? '',
+    date: fm.date ?? fm.date_compiled,
+    project: unquote(fm.project),
+    quote: unquote(fm.trigger_quote),
+    summary: unquote(fm.summary),
+    keywords: list(fm.keywords).map(k => k.toLowerCase()),
+    compiledFrom: list(fm.compiled_from),
+    recurrence: Number(fm.recurrence) || 0,
+    sections,
+  }
+}
+
+const plain = (s?: string, max = 160) => (s ? excerpt(s.replace(/\*\*|`/g, ''), max) : undefined)
+
+/**
+ * An ani pattern as a lesson here: an S is a lesson for every project, an F the
+ * lesson of the project it was said in. The summary is the INDEX row's line.
+ */
+export function aniCard(p: AniPattern, summary?: string): Card {
+  const isSkill = p.id.startsWith('S-')
+  return {
+    id: p.id,
+    ts: Date.parse(p.date ?? '') || 0,
+    text: p.quote ?? summary ?? p.summary ?? p.id,
+    kind: 'intent',
+    scope: isSkill || !p.project ? 'global' : 'personal-project',
+    project: p.project ?? '',
+    source: 'ani',
+    keywords: p.keywords,
+    lesson: (summary ?? p.summary)?.replace(/\*\*|`/g, '') ?? plain(p.sections.Correction ?? p.sections.Action),
+    intent: plain(p.sections.Intent ?? p.sections.Situation),
+    why: plain(p.sections.Misreading),
+    count: isSkill ? Math.max(1, p.compiledFrom.length) : 1 + p.recurrence,
+    ...(p.quote ? { examples: [p.quote] } : {}),
+  }
+}
+
+/** A compiled F: one of the cases the S it went into was made from. */
+export function aniCase(p: AniPattern, at: number, cardId: string, summary?: string): Feedback {
+  return {
+    at,
+    text: p.quote ?? summary ?? p.id,
+    cardId,
+    project: p.project ?? '',
+    aniId: p.id,
+    said: p.quote,
+    understood: plain(p.sections.Misreading),
+    meant: plain(p.sections.Intent),
+    judgment: summary?.replace(/\*\*|`/g, ''),
+  }
 }
 
 /** Narrowest scope first: team → personal-project → global; same id keeps the narrowest. */
@@ -215,6 +311,14 @@ export function isSamePath(a: string, b: string): boolean {
   return Boolean(a && b) && norm(a) === norm(b)
 }
 
+/**
+ * One project however it was recorded: `owner/repo` from the remote, the folder
+ * name, or a whole Windows path all name the same project by their last segment.
+ */
+export function sameProject(a: string | undefined, b: string | undefined): boolean {
+  return Boolean(a && b) && (a === b || projectName(a).toLowerCase() === projectName(b).toLowerCase())
+}
+
 type Placed = { scope?: Scope; project?: string; alsoIn?: string[]; skipIn?: string[] }
 
 /**
@@ -223,18 +327,18 @@ type Placed = { scope?: Scope; project?: string; alsoIn?: string[]; skipIn?: str
  * the person said no here.
  */
 export function appliesTo(x: Placed, project: string): boolean {
-  if (x.skipIn?.includes(project)) return false
-  return x.scope === 'global' || x.project === project || Boolean(x.alsoIn?.includes(project))
+  if (x.skipIn?.some(p => sameProject(p, project))) return false
+  return x.scope === 'global' || sameProject(x.project, project) || Boolean(x.alsoIn?.some(p => sameProject(p, project)))
 }
 
 /** Another project's item nobody has decided on here yet. */
 export function isUndecided(x: Placed, project: string): boolean {
-  return !appliesTo(x, project) && !x.skipIn?.includes(project)
+  return !appliesTo(x, project) && !x.skipIn?.some(p => sameProject(p, project))
 }
 
 /** The person's decision for this project: attach it here, or not. */
 export function placeIn<T extends Placed>(x: T, project: string, isAttached: boolean): T {
-  const without = (xs?: string[]) => (xs ?? []).filter(p => p !== project)
+  const without = (xs?: string[]) => (xs ?? []).filter(p => !sameProject(p, project))
   return isAttached
     ? { ...x, alsoIn: [...without(x.alsoIn), project], skipIn: without(x.skipIn) }
     : { ...x, alsoIn: without(x.alsoIn), skipIn: [...without(x.skipIn), project] }

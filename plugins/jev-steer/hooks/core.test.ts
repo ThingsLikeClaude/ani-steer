@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 import { isConcreteRequirement } from './register'
 
 import type { Card, Requirement } from '../types'
-import { appliesTo, buildQuestions, isSamePath, isUndecided, judge, parseIndex, pickCandidates, placeIn, projectName, scopeOf, slugOf, verdictOf } from './core'
+import { aniCard, appliesTo, buildQuestions, indexSummaries, isSamePath, isUndecided, judge, parseAniPattern, parseIndex, pickCandidates, placeIn, projectName, sameProject, scopeOf, slugOf, verdictOf } from './core'
 
 const card = (over: Partial<Card>): Card => ({
   id: 'J-1',
@@ -101,4 +101,76 @@ test('project names read short; one folder written two ways is one folder', asyn
   expect(isSamePath('C:\\Users\\me', '/c/Users/me/')).toBe(true)
   expect(isSamePath('C:\\Users\\me\\site', 'C:\\Users\\me')).toBe(false)
   expect(isSamePath('', '')).toBe(false)
+})
+
+const F_CAPTURED = [
+  '---',
+  'id: F-20260907-5j87qto0',
+  'status: captured',
+  'date: 2026-09-07',
+  'project: hmi2html',
+  'trigger_quote: "왼쪽에 메뉴바있어야됨. 그건 고정임"',
+  'keywords: [hmi, Navigation, left-menu]',
+  'recurrence: 1',
+  '---',
+  '',
+  '## Intent',
+  '',
+  'hmi2html 에서 **왼쪽 메뉴바는 고정 요구사항**이다.',
+  '',
+  '## Misreading',
+  '',
+  '"문제가 있다"를 "빼도 된다"로 읽었다.',
+].join('\n')
+
+const S_SKILL = [
+  '---',
+  'id: S-show-dont-instruct',
+  'status: active',
+  'compiled_from: [F-20260901-u24fdboq, F-20260902-mbci9l6d]',
+  'date_compiled: 2026-09-07',
+  'keywords: [working-style, handoff]',
+  'scope: global',
+  'summary: Use when about to show the user something visual — a mockup,',
+  '  or a local preview',
+  '---',
+  '',
+  '## Situation',
+  '',
+  '사용자에게 무언가를 보여 주려는 순간.',
+].join('\n')
+
+test('ani patterns: frontmatter, folded summary and sections are read', async () => {
+  const f = parseAniPattern(F_CAPTURED)
+  expect(f?.project).toBe('hmi2html')
+  expect(f?.quote).toBe('왼쪽에 메뉴바있어야됨. 그건 고정임')
+  expect(f?.keywords).toEqual(['hmi', 'navigation', 'left-menu'])
+  expect(f?.recurrence).toBe(1)
+  expect(f?.sections.Misreading).toBe('"문제가 있다"를 "빼도 된다"로 읽었다.')
+  const s = parseAniPattern(S_SKILL)
+  expect(s?.summary).toBe('Use when about to show the user something visual — a mockup, or a local preview')
+  expect(s?.compiledFrom).toEqual(['F-20260901-u24fdboq', 'F-20260902-mbci9l6d'])
+  expect(parseAniPattern('no frontmatter')).toBeNull()
+})
+
+test('an F is the lesson of its own project; an S is a lesson for every project', async () => {
+  const f = aniCard(parseAniPattern(F_CAPTURED)!, '메뉴바 문제를 제거 허가로 읽음')
+  expect(f.scope).toBe('personal-project')
+  expect(f.project).toBe('hmi2html')
+  expect(f.lesson).toBe('메뉴바 문제를 제거 허가로 읽음')
+  expect(f.intent).toBe('hmi2html 에서 왼쪽 메뉴바는 고정 요구사항이다.')
+  expect(f.count).toBe(2)
+  expect(appliesTo(f, 'D:\\00_PROJECTS\\hmi2html')).toBe(true)
+  expect(appliesTo(f, 'ThingsLikeClaude/sta_ai_seminar_v2')).toBe(false)
+  const s = aniCard(parseAniPattern(S_SKILL)!)
+  expect(s.scope).toBe('global')
+  expect(s.count).toBe(2)
+  expect(indexSummaries('| F-1 | captured | global | k | 한 줄 요약 | 2026-09-07 |')).toEqual({ 'F-1': '한 줄 요약' })
+})
+
+test('one project recorded as owner/repo, folder name or Windows path is one project', async () => {
+  expect(sameProject('ThingsLikeClaude/sta_ai_seminar_form', 'sta_ai_seminar_form')).toBe(true)
+  expect(sameProject('D:\\00_PROJECTS\\sta_ai_seminar_v2', 'ThingsLikeClaude/sta_ai_seminar_v2')).toBe(true)
+  expect(sameProject('me/site', 'me/other')).toBe(false)
+  expect(sameProject(undefined, 'me/site')).toBe(false)
 })
