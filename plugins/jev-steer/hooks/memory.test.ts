@@ -131,7 +131,7 @@ test('a memory lesson is listed as this project\'s own, and once forgotten it is
   const w = world(on, model)
   expect((await start($, w)).length).toBe(1)
   const term = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await term.find({ type: 'Text', text: /이 프로젝트에만 · 1\/12/ })).toBeDefined()
+  expect(await term.find({ type: 'Text', text: /이 프로젝트에만 · 1$/ })).toBeDefined()
   expect(await term.find({ type: 'Text', text: /되돌릴 땐 git diff로 내 변경만 골라 제거/ })).toBeDefined()
   await term.press({ key: 'rm-M-D--p-site-selective-revert-only' })
   await term.unmount()
