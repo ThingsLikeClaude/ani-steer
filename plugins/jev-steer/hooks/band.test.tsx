@@ -281,10 +281,26 @@ test('each card keeps its buttons with it, a clear step from the next card', asy
   await pane.unmount()
 })
 
+test("another project's cases are one line each, like lessons: what was said, where, when", async ($, on) => {
+  const feedbackLog = [
+    { at: 1_000, text: '아니 배포 링크 달라고', cardId: '', project: 'ThingsLikeClaude/stalab-web', said: '배포 링크 대신 로컬 주소를 넘김', before: '배포해줘 요청 맥락', did: 'localhost 주소를 보냄', judgment: '이 상황에서는 배포 주소가 필요했다' },
+  ]
+  engine(on, { feedbackLog })
+  const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await pane.press({ key: 'tab-feedback' })
+  const src = await sourceOf(pane, /배포 링크 대신 로컬 주소/)
+  expect(src).toContain('stalab-web')
+  // The case's detail stays in the store for Jev and Claude; the list shows none of it.
+  expect(src).not.toContain('localhost 주소를 보냄')
+  expect(src).not.toContain('배포해줘 요청 맥락')
+  expect(src).not.toContain('배포 주소가 필요했다')
+  await pane.unmount()
+})
+
 test('a long list of cases is drawn in pieces the engine accepts, never one that empties the pane', async ($, on) => {
   const long = '배포 링크를 달라고 했는데 로컬 주소를 넘겼고, 그다음에도 같은 실수를 반복해서 다시 설명해야 했다 '.repeat(4)
   const feedbackLog = Array.from({ length: 60 }, (_, i) => ({
-    at: 1_000 + i, text: long, cardId: '', project: `other-${i % 3}`, said: long, before: long, did: long, understood: long, meant: long, judgment: long,
+    at: 1_000 + i, text: long, cardId: '', project: 'unknown', said: long, before: long, did: long, understood: long, meant: long, judgment: long,
   }))
   engine(on, { feedbackLog, listLimit: 60 })
   // The engine refuses a pane holding an Svg over its limits: mounting at all is the check.
