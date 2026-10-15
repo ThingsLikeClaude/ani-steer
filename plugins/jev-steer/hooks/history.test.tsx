@@ -195,7 +195,7 @@ test('past conversations become cases, and the same mistake in two projects one 
 test('a run that stopped carries on where it stopped; nothing read is asked about twice', async ($, on) => {
   let asked = 0
   let isDown = true
-  // Jev is unreachable the first time beta's requests are asked about.
+  // Jev is unreachable while beta's requests are asked about: tried three more times, then the run stops.
   const clock = past(on, body => {
     if (body.includes('"items"')) asked++
     return isDown && body.includes('데모 주소')
@@ -204,17 +204,33 @@ test('a run that stopped carries on where it stopped; nothing read is asked abou
   await pane.press({ key: 'tab-feedback' })
   await pane.press({ key: 'hist-run' })
   await clock.settle()
-  expect(await pane.find({ type: 'Text', text: /멈췄어요 · Jev에 연결하지 못했어요/ })).toBeDefined()
-  expect(asked).toBe(2)
+  // Still trying: one 503 is Jev's moment, not a stop.
+  expect(await pane.find({ type: 'Text', text: /지난 대화를 읽는 중/ })).toBeDefined()
+  await clock.advance(20_000)
+  expect(await pane.find({ type: 'Text', text: /멈췄어요 · Jev에 연결하지 못했어요 \(HTTP 503\)/ })).toBeDefined()
+  expect(asked).toBe(5)
   isDown = false
   await pane.press({ key: 'hist-run' })
   await clock.settle()
   // Only beta is read again; alpha's case is not found twice.
-  expect(asked).toBe(3)
+  expect(asked).toBe(6)
   expect(await pane.find({ type: 'Text', text: /요청 5개를 보고 교정 2개를 사례로 정리했어요/ })).toBeDefined()
   // Read up to 45 days back: what is older is offered, not read on its own.
   expect((await pane.find({ key: 'hist-run' }))?.text).toMatch(/이전 대화도 찾기/)
   expect((await pane.find({ key: 'tab-feedback' }))?.text).toMatch(/사례 2/)
+  await pane.unmount()
+})
+
+test('one dropped Jev call does not stop the run: it is tried again', async ($, on) => {
+  let drops = 1
+  const clock = past(on, body => body.includes('"items"') && drops-- > 0)
+  const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await pane.press({ key: 'tab-feedback' })
+  await pane.press({ key: 'hist-run' })
+  await clock.settle()
+  await clock.advance(20_000)
+  expect(await pane.find({ type: 'Text', text: /멈췄어요/ })).toBeUndefined()
+  expect(await pane.find({ type: 'Text', text: /요청 5개를 보고 교정 2개를 사례로 정리했어요/ })).toBeDefined()
   await pane.unmount()
 })
 
