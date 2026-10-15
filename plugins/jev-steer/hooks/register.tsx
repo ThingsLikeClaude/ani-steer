@@ -3,7 +3,8 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { Candidate, Card, Display, Need, Preview, Principle, Feedback, Judgment, Kind, Label, Requirement, Scope, Sent, View } from '../types'
 import {
-  JEV_URL,
+  jevRouteOf,
+  type JevRoute,
   KIND_LABEL,
   MAX_PROMPT_CHARS,
   aniCard,
@@ -82,6 +83,8 @@ const expandedSections = atom({ plugin: 'jev-steer', key: 'expandedSections' } a
 const pinned = atom({ plugin: 'jev-steer', key: 'pinned' } as const, [] as string[])
 const keyLater = atom({ plugin: 'jev-steer', key: 'keyLater' } as const, false)
 const hasKey = atom({ plugin: 'jev-steer', key: 'hasKey' } as const, true)
+/** Which service carries Jev in this session: OpenRouter or TypeSafe. */
+const jevVia = atom({ plugin: 'jev-steer', key: 'jevVia' } as const, '')
 /**
  * The engine refuses the whole pane, and draws none of it, when one Svg's
  * source is longer than 131072 characters or it is taller than 4096 pixels.
@@ -1180,10 +1183,10 @@ type Result = { judgments: Judgment[]; candidates: Card[]; reqIds: string[] }
  * commit: the request went out on a draft's judgment; record only, leave the view.
  */
 async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'submit' | 'commit' = 'submit', prevAttached: readonly string[] = [], isPerson = true): Promise<Result | null> {
-  const key = await $.env.get('TYPESAFE_API_KEY')
-  await update($, hasKey, () => Boolean(key))
-  if (!key) {
-    await update($, view, v => ({ ...v, error: 'Jev 키가 없어요 · /jev-steer:ani-key로 설정' }))
+  const route = await jevRoute($)
+  await update($, hasKey, () => Boolean(route))
+  if (!route) {
+    await update($, view, v => ({ ...v, error: 'Jev 키가 없어요 · OPENROUTER_API_KEY 또는 /jev-steer:ani-key로 설정' }))
     return null
   }
   const seq = mode === 'commit' ? latestSeq : ++latestSeq
@@ -1210,14 +1213,14 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
       assistant_last_reply: lastAnswer.slice(-1500),
       project,
     }
-    const body = JSON.stringify({ model: 'jev-latest', state, questions: buildQuestions(candidates, reqs, attachedBefore) })
-    const headers = { authorization: `Bearer ${key}`, 'content-type': 'application/json' }
+    const body = JSON.stringify({ model: route.model, state, questions: buildQuestions(candidates, reqs, attachedBefore) })
+    const headers = { authorization: `Bearer ${route.key}`, 'content-type': 'application/json' }
     // 5xx and 429 are transient on Jev's side: two retries with backoff.
-    let res = await $.http.fetch(JEV_URL, { method: 'POST', headers, body })
+    let res = await $.http.fetch(route.url, { method: 'POST', headers, body })
     for (const wait of [400, 1500]) {
       if (res.ok || !(res.status >= 500 || res.status === 429) || seq !== latestSeq) break
       await $.clock.sleep(wait)
-      res = await $.http.fetch(JEV_URL, { method: 'POST', headers, body })
+      res = await $.http.fetch(route.url, { method: 'POST', headers, body })
     }
     const beatMs = (await $.clock.now()) - started
     await update($, beat, () => ({ ok: res.ok, ms: beatMs, at: started, detail: res.ok ? undefined : `HTTP ${res.status}` }))
@@ -1306,6 +1309,13 @@ async function loadNeeds($: EngineInterface): Promise<Need[]> {
 }
 
 /** One yes/no batch to Jev; null when Jev is unreachable. */
+/** The person's keys, OpenRouter first; the service it picks is shown under 설정. */
+async function jevRoute($: EngineInterface): Promise<JevRoute | null> {
+  const route = jevRouteOf({ openRouter: await $.env.get('OPENROUTER_API_KEY'), typeSafe: await $.env.get('TYPESAFE_API_KEY') })
+  await update($, jevVia, () => route?.name ?? '')
+  return route
+}
+
 /** Why the last background Jev call failed, said with the stop it caused. */
 let jevFailure = ''
 
@@ -1316,14 +1326,14 @@ let jevFailure = ''
  * asked once: the request does not wait on Jev's moment.
  */
 async function askJev($: EngineInterface, state: Record<string, unknown>, questions: Record<string, unknown>, opts: { isQuick?: boolean } = {}): Promise<Answers | null> {
-  const key = await $.env.get('TYPESAFE_API_KEY')
-  if (!key || !Object.keys(questions).length) return null
+  const route = await jevRoute($)
+  if (!route || !Object.keys(questions).length) return null
   const call = () =>
     $.http
-      .fetch(JEV_URL, {
+      .fetch(route.url, {
         method: 'POST',
-        headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ model: 'jev-latest', state, questions }),
+        headers: { authorization: `Bearer ${route.key}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ model: route.model, state, questions }),
       })
       .catch(() => null)
   let res = await call()
@@ -1932,15 +1942,15 @@ function capReqs(rs: Requirement[]): Requirement[] {
 
 /** A tiny Jev call that only proves the line is up. */
 async function ping($: EngineInterface) {
-  const key = await $.env.get('TYPESAFE_API_KEY')
+  const route = await jevRoute($)
   const at = await $.clock.now()
-  await update($, hasKey, () => Boolean(key))
-  if (!key) return update($, beat, () => ({ ok: false, ms: 0, at, detail: '키 없음' }))
+  await update($, hasKey, () => Boolean(route))
+  if (!route) return update($, beat, () => ({ ok: false, ms: 0, at, detail: '키 없음' }))
   try {
-    const res = await $.http.fetch(JEV_URL, {
+    const res = await $.http.fetch(route.url, {
       method: 'POST',
-      headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'jev-latest', state: { ping: true }, questions: { ok: { type: 'noul', instructions: 'Is this a connectivity check?', criteria: { true: 'yes', false: 'no' } } } }),
+      headers: { authorization: `Bearer ${route.key}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: route.model, state: { ping: true }, questions: { ok: { type: 'noul', instructions: 'Is this a connectivity check?', criteria: { true: 'yes', false: 'no' } } } }),
     })
     const ms = (await $.clock.now()) - at
     await update($, beat, () => ({ ok: res.ok, ms, at, detail: res.ok ? undefined : `HTTP ${res.status}` }))
@@ -1993,7 +2003,7 @@ export const register: Register = on => {
     if ((await $.store.get('isBandOpen')) === true) await update($, isBandOpen, () => true)
     await $.command.register({ name: 'steer', description: 'ani: 기억한 교훈 보기·정리' })
     await $.command.register({ name: 'ani', description: 'ani 패널 열기' })
-    { const k = await $.env.get('TYPESAFE_API_KEY'); await update($, hasKey, () => Boolean(k)) }
+    { const route = await jevRoute($); await update($, hasKey, () => Boolean(route)) }
     // The pane is where ani lives: open it beside the transcript from the start.
     if ((await read($, display)).pane) $.clock.after(0, () => $.ui.open({ id: PANE, title: TITLE }))
     $.clock.after(0, () => backfill($))
@@ -2376,6 +2386,7 @@ export const register: Register = on => {
       const expandedEarly = new Set(await read($, expandedSections))
       const isOpenEarly = (k: string) => !expandedEarly.has(k)
       const pulse = pulseOf(await read($, beat), await $.clock.now())
+      const via = await read($, jevVia)
       const reqOn = reqs.filter(x => attachedReqIds.includes(x.id)).length
       const riding = reqOn || nowApplying.length ? `이번 요청에 규칙 ${reqOn} · 교훈 ${nowApplying.length} 반영` : ''
       const head = paneHeaderSvg(paneW, pulse, riding)
@@ -2761,7 +2772,7 @@ export const register: Register = on => {
       const settingsView = () => [
         capOnly('set-h', '설정', ''),
         cardOf('set-card', [
-          { dot: pulse.state === 'live' ? STATE_COLOR.hit : '#8a8a8a', title: `Jev 연결 · ${pulse.text}`, pill: { text: pulse.state === 'live' ? '정상' : '확인 필요', color: pulse.state === 'live' ? STATE_COLOR.hit : STATE_COLOR.ask } },
+          { dot: pulse.state === 'live' ? STATE_COLOR.hit : '#8a8a8a', title: `Jev 연결${via ? ` (${via})` : ''} · ${pulse.text}`, pill: { text: pulse.state === 'live' ? '정상' : '확인 필요', color: pulse.state === 'live' ? STATE_COLOR.hit : STATE_COLOR.ask } },
           { dot: '#8a8a8a', title: '프롬프트 위 상태 줄', pill: shown.band ? { text: '켜짐', color: STATE_COLOR.hit } : { text: '꺼짐' } },
           { dot: '#8a8a8a', title: 'ani 패널 자동으로 열기 · 언제든 /ani', pill: shown.pane ? { text: '켜짐', color: STATE_COLOR.hit } : { text: '꺼짐' } },
           { dot: '#8a8a8a', title: '토스트 알림', pill: shown.toast ? { text: '켜짐', color: STATE_COLOR.hit } : { text: '꺼짐' } },

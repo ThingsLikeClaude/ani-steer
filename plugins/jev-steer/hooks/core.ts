@@ -1,6 +1,17 @@
 import type { Card, Feedback, Judgment, Kind, Requirement, Scope, Verdict } from '../types'
 
 export const JEV_URL = 'https://api.typesafe.ai/v1/systemone'
+
+/**
+ * Where Jev is reached. OpenRouter carries the same Jev on the same System One
+ * API, billed to the OpenRouter account; with its key set it is used first.
+ */
+export type JevRoute = { name: 'OpenRouter' | 'TypeSafe'; url: string; model: string; key: string }
+export function jevRouteOf(keys: { openRouter?: string; typeSafe?: string }): JevRoute | null {
+  if (keys.openRouter) return { name: 'OpenRouter', url: 'https://openrouter.ai/api/v1/systemone', model: '~typesafe/jev-latest', key: keys.openRouter }
+  if (keys.typeSafe) return { name: 'TypeSafe', url: JEV_URL, model: 'jev-latest', key: keys.typeSafe }
+  return null
+}
 export const MAX_CANDIDATES = 24
 /** Rules weighed per request: every rule in scope, the ones sharing the request's words first. */
 export const MAX_RULE_CANDIDATES = 16
