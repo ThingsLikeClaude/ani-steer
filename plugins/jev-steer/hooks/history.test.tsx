@@ -59,6 +59,29 @@ test('a past request carries the conversation around it; what the person did not
   expect(c.after).toEqual(['좋아', '다음은 README'])
 })
 
+test("a file stops being read once the rest can give nothing: a tool's session at once, a past window once its last request has what follows", () => {
+  const observer = pastPromptReader(0)
+  observer.line(user('o1', T(0), 'C:\\Users\\me\\.claude-mem\\observer', '세션 요약해줘'))
+  expect(observer.over()).toBe('agent')
+  const scripted = pastPromptReader(0)
+  scripted.line(user('s1', T(0), '/p', '정리해줘', { entrypoint: 'sdk-cli' }))
+  expect(scripted.over()).toBe('agent')
+  // The window ends at minute 5: the request at minute 4 still gets the two requests after it.
+  const r = pastPromptReader(0, Date.parse(T(5)))
+  r.line(user('p1', T(4), '/p', '아니 그거 말고 푸터'))
+  r.line(agent('푸터를 고쳤어요'))
+  r.line(user('p2', T(6), '/p', '좋아 다음은 헤더'))
+  expect(r.over()).toBe('')
+  r.line(user('p3', T(7), '/p', '헤더 색만'))
+  expect(r.over()).toBe('past')
+  expect(r.prompts().map(p => [p.text, p.after])).toEqual([['아니 그거 말고 푸터', ['좋아 다음은 헤더', '헤더 색만']]])
+  // A session that began after the window gives nothing from its first line.
+  const later = pastPromptReader(0, Date.parse(T(5)))
+  later.line(user('l1', T(9), '/p', '아니 그거 말고'))
+  expect(later.over()).toBe('past')
+  expect(later.prompts()).toEqual([])
+})
+
 test("a session another program started, or a tool's own workspace, is never the person's", () => {
   const scripted = pastPromptReader(0)
   scripted.line(user('x1', T(0), '/p', '아니 그거 말고 다시', { entrypoint: 'sdk-cli' }))
@@ -204,8 +227,8 @@ test('a run that stopped carries on where it stopped; nothing read is asked abou
   await pane.press({ key: 'tab-feedback' })
   await pane.press({ key: 'hist-run' })
   await clock.settle()
-  // Still trying: one 503 is Jev's moment, not a stop.
-  expect(await pane.find({ type: 'Text', text: /지난 대화를 읽는 중/ })).toBeDefined()
+  // Still trying: one 503 is Jev's moment, not a stop. What it is doing is said: which record, how big, which step.
+  expect(await pane.find({ type: 'Text', text: /지난 대화를 읽는 중[\s\S]*지금 p-beta 기록 0MB · Jev가 교정인지 판정 1\/1/ })).toBeDefined()
   await clock.advance(20_000)
   expect(await pane.find({ type: 'Text', text: /멈췄어요 · Jev에 연결하지 못했어요 \(HTTP 503\)/ })).toBeDefined()
   expect(asked).toBe(5)
@@ -218,6 +241,15 @@ test('a run that stopped carries on where it stopped; nothing read is asked abou
   // Read up to 45 days back: what is older is offered, not read on its own.
   expect((await pane.find({ key: 'hist-run' }))?.text).toMatch(/이전 대화도 찾기/)
   expect((await pane.find({ key: 'tab-feedback' }))?.text).toMatch(/사례 2/)
+  await pane.unmount()
+})
+
+test('a run whose session closed says so, and offers to carry on', async ($, on) => {
+  past(on, () => false, { history: { status: 'running', at: Date.parse('2026-10-13T00:00:00Z'), since: 0, until: 1, files: 15372, filesDone: 1811, prompts: 1398, found: 375, enriched: 0, v: 2, range: 'all' } })
+  const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await pane.press({ key: 'tab-feedback' })
+  expect(await pane.find({ type: 'Text', text: /멈췄어요 · 읽던 세션이 닫혔거나 플러그인이 업데이트됐어요 · 기록 1811\/15372/ })).toBeDefined()
+  expect((await pane.find({ key: 'hist-run' }))?.text).toMatch(/이어서 찾기/)
   await pane.unmount()
 })
 

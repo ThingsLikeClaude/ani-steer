@@ -149,6 +149,8 @@ declare module 'claude-code' {
       hasKey: boolean
       /** Which service carries Jev: 'OpenRouter', 'TypeSafe', or '' with no key. */
       jevVia: string
+      /** The past-conversation run as it goes, in this session: kept off the store, written every few seconds. */
+      histNow: { file: string; mb: number; step: string; startedAt: number; filesDone: number; files: number; prompts: number; found: number; ofRun: number; skipped: number } | null
       listLimit: number
     }
   }

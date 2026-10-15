@@ -126,14 +126,32 @@ export function pastPromptReader(since: number, until = Infinity, isTypedOnly = 
   let open: PastPrompt[] = []
   /** The last typed request, when it was taken: the agent's next reply is its `next`. */
   let pending: PastPrompt | null = null
+  /** A line written after the window, with no request taken still waiting on what follows. */
+  const isPast = (raw: string) => {
+    if (open.length || (pending && pending.next === undefined)) return false
+    const at = Date.parse(raw.match(/"timestamp":"([^"]+)"/)?.[1] ?? '')
+    return at >= until
+  }
   const closeReply = () => {
     if (pending && pending.next === undefined && reply) pending.next = reply.slice(-400)
   }
   /** The session's folder, for a queued prompt, whose line has none. */
   let folder = ''
+  /**
+   * Why the rest of the file can give nothing, once it is known: a session a
+   * tool or a script ran (none of it is the person's), or the window's end
+   * passed with every request taken holding its after-context.
+   */
+  let over: 'agent' | 'past' | '' = ''
   return {
+    over: () => over,
     line(raw: string) {
+      if (over) return
       if (!folder && raw.includes('"cwd":"')) folder = raw.match(/"cwd":"((?:[^"\\]|\\.)*)"/)?.[1]?.replace(/\\\\/g, '\\') ?? ''
+      if (isTypedOnly && (AGENT_CWD.test(folder) || (raw.includes('"type":"user"') && raw.includes('"entrypoint":"sdk-')))) {
+        over = 'agent'
+        return
+      }
       // A queued prompt is delivered when it leaves the queue: an app's message (a CI event) may be found only there.
       if (!isTypedOnly && raw.includes('"type":"queue-operation"') && raw.includes('"operation":"remove"')) {
         let q: Line & { content?: unknown }
@@ -150,6 +168,10 @@ export function pastPromptReader(since: number, until = Infinity, isTypedOnly = 
       const isUser = raw.includes('"type":"user"')
       const isAgent = !isUser && raw.includes('"type":"assistant"')
       if (!isUser && !isAgent) return
+      if (isPast(raw)) {
+        over = 'past'
+        return
+      }
       if (isAgent) {
         if (raw.includes('"isSidechain":true')) return
         if (raw.includes('"type":"tool_use"')) tools = [...tools, ...toolsOf(raw)].slice(-TOOLS_MAX)
@@ -203,6 +225,7 @@ export function pastPromptReader(since: number, until = Infinity, isTypedOnly = 
       }
       reply = ''
       tools = []
+      if (isPast(raw)) over = 'past'
     },
     prompts: () => {
       closeReply()
