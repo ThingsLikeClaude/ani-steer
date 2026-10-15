@@ -2,6 +2,8 @@ import type { Card, Feedback, Judgment, Kind, Requirement, Scope, Verdict } from
 
 export const JEV_URL = 'https://api.typesafe.ai/v1/systemone'
 export const MAX_CANDIDATES = 24
+/** Rules weighed per request: every rule in scope, the ones sharing the request's words first. */
+export const MAX_RULE_CANDIDATES = 16
 export const MAX_REQUIREMENTS = 7
 export const MAX_PROMPT_CHARS = 4000
 
@@ -279,7 +281,8 @@ export function parseMemoryNote(markdown: string): MemoryNote | null {
 }
 
 /** Narrowest scope first: team → personal-project → global; same id keeps the narrowest. */
-export function pickCandidates(prompt: string, cards: readonly Card[], project: string): Card[] {
+/** isEvery: weigh every card in scope (rules), not only those sharing a word with the request. */
+export function pickCandidates(prompt: string, cards: readonly Card[], project: string, opts: { isEvery?: boolean; max?: number } = {}): Card[] {
   const order: Record<Scope, number> = { 'team-project': 0, 'personal-project': 1, global: 2 }
   const words = new Set(tokenize(prompt))
   const seen = new Set<string>()
@@ -291,9 +294,9 @@ export function pickCandidates(prompt: string, cards: readonly Card[], project: 
       const keys = c.keywords.length > 0 ? c.keywords : tokenize(c.text)
       return { c, hits: keys.filter(k => words.has(k) || prompt.toLowerCase().includes(k)).length }
     })
-    .filter(x => x.hits > 0 || x.c.source === 'jev')
+    .filter(x => opts.isEvery || x.hits > 0 || x.c.source === 'jev')
     .sort((a, b) => b.hits - a.hits || b.c.ts - a.c.ts)
-    .slice(0, MAX_CANDIDATES)
+    .slice(0, opts.max ?? MAX_CANDIDATES)
     .map(x => x.c)
 }
 

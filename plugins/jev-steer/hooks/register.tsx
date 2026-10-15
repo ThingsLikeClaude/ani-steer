@@ -22,6 +22,7 @@ import {
   parseIndex,
   parseMemoryNote,
   pickCandidates,
+  MAX_RULE_CANDIDATES,
   placeIn,
   projectName,
   sameProject,
@@ -53,6 +54,8 @@ const ARCHIVE_MAX = 200
 const FEEDBACK_MAX = 1000
 const REATTACH_EVERY = 6
 const MAX_ATTACHED_LESSONS = 2
+/** Rules Jev judged to bear on a request, attached to it at most. */
+const MAX_ATTACHED_RULES = 3
 /** A lesson the same correction has hit this often is offered as a rule. */
 const PROMOTE_AT = 3
 /** Two-letter type tags for lesson kinds, as the file tree tags JS / PDF. */
@@ -1150,8 +1153,12 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
   const said = mode === 'draft' || isScriptedSession || !isPerson ? '' : personText(prompt)
   try {
     const allCards = await loadCards($)
-    // Rules ride every request; Jev weighs only lessons.
-    const candidates = pickCandidates(prompt, allCards.filter(c => !c.isRule), project)
+    // Jev weighs rules as it weighs lessons: every rule in scope, lessons sharing a word with the request.
+    // Only principles and the confirmed need ride every request.
+    const candidates = [
+      ...pickCandidates(prompt, allCards.filter(c => c.isRule), project, { isEvery: true, max: MAX_RULE_CANDIDATES }),
+      ...pickCandidates(prompt, allCards.filter(c => !c.isRule), project),
+    ]
     const attachedBefore = mode === 'draft' ? [] : allCards.filter(c => prevAttached.includes(c.id))
     if (mode !== 'commit') await update($, view, v => ({ ...v, weighing: candidates.map(c => c.id) }))
     const reqs = (await loadReqs($)).filter(r => r.active >= 0.4 && appliesTo(r, project))
@@ -1224,7 +1231,7 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
       return { judgments, candidates, reqIds }
     }
     if (seq !== latestSeq) return null // a newer prompt is being judged; drop this stale answer
-    const applied = judgments.filter(j => j.verdict === 'apply').sort((x, y) => y.same - x.same).slice(0, MAX_ATTACHED_LESSONS).map(j => j.id)
+    const applied = appliedIds(judgments, candidates)
     const lastMs = (await $.clock.now()) - started
     await update($, beat, () => ({ ok: true, ms: lastMs, at: started }))
     await update($, view, v => {
@@ -1454,10 +1461,15 @@ async function keepPreviewNeed($: EngineInterface, i: number) {
   await save($, 'preview', { ...pv, needs: [] })
 }
 
+/** What rides a request: the rules and the lessons Jev judged to apply, the strongest first, each capped. */
+function appliedIds(judgments: readonly Judgment[], candidates: readonly Card[]): string[] {
+  const isRule = new Set(candidates.filter(c => c.isRule).map(c => c.id))
+  const on = judgments.filter(j => j.verdict === 'apply').sort((x, y) => y.same - x.same)
+  return [...on.filter(j => isRule.has(j.id)).slice(0, MAX_ATTACHED_RULES), ...on.filter(j => !isRule.has(j.id)).slice(0, MAX_ATTACHED_LESSONS)].map(j => j.id)
+}
+
 async function attachment($: EngineInterface, r: Result): Promise<{ text: string; lessonIds: string[]; reqIds: string[] } | null> {
-  const applied = r.judgments.filter(j => j.verdict === 'apply').sort((x, y) => y.same - x.same).slice(0, MAX_ATTACHED_LESSONS)
-  const rules = mineOf(await ownCards($)).filter(c => c.isRule && !c.isMuted)
-  const lessons = [...rules, ...applied.map(j => r.candidates.find(c => c.id === j.id)).filter((c): c is Card => !!c)]
+  const lessons = appliedIds(r.judgments, r.candidates).map(id => r.candidates.find(c => c.id === id)).filter((c): c is Card => !!c)
   const reqs = (await loadReqs($)).filter(x => r.reqIds.includes(x.id) && isConcreteRequirement(x.text))
   const need = (await loadNeeds($)).find(n => n.status === 'confirmed')
   const principles = (await loadPrinciples($)).filter(p => p.status === 'active')
@@ -1485,7 +1497,7 @@ async function attachment($: EngineInterface, r: Result): Promise<{ text: string
     '[ani] From this user\'s own past corrections and standing requirements, judged to bear on this request. Follow them:',
     ...(freshNeed ? [`What this user wants underneath (their own words): ${freshNeed.text}`] : []),
     ...(freshPrinciples.length ? ['Principles (always):', ...freshPrinciples.map(p => `- ${p.text}`)] : []),
-    ...(ruleLines.length ? ['Rules (always):', ...ruleLines.map(lessonLine)] : []),
+    ...(ruleLines.length ? ['Rules:', ...ruleLines.map(lessonLine)] : []),
     ...(lessonLines.length ? ['Lessons:', ...lessonLines.map(lessonLine)] : []),
     ...(freshReqs.length ? ['Requirements still in force:', ...freshReqs.map(x => `- ${x.text}`)] : []),
   ].join('\n')
@@ -1616,11 +1628,13 @@ async function statusModel($: EngineInterface): Promise<{ lead: Lead; inventory:
   const rules = mineOf(await ownCards($)).filter(c => c.isRule && !c.isMuted).length
   const out = await read($, sent)
   const onIds = [...new Set([...(out?.lessonIds ?? []), ...pinnedIds])]
-  const lessonsOn = onIds.length
+  const ruleIds = new Set(mineOf(await ownCards($)).filter(c => c.isRule).map(c => c.id))
+  const lessonsOn = onIds.filter(id => !ruleIds.has(id)).length
+  const rulesOn = onIds.filter(id => ruleIds.has(id)).length
   const firstOn = mineOf(await ownCards($)).find(c => c.id === onIds[0])
-  const rulesOn = attachedReqIds.length
+  const reqsOn = attachedReqIds.length
   const inventory = `교훈 ${live} · 규칙 ${rules}`
-  const parts = [lessonsOn ? `교훈 ${lessonsOn}개` : '', rulesOn ? `규칙 ${rulesOn}개` : ''].filter(Boolean).join(' · ')
+  const parts = [lessonsOn ? `교훈 ${lessonsOn}개` : '', rulesOn ? `규칙 ${rulesOn}개` : '', reqsOn ? `지시 ${reqsOn}개` : ''].filter(Boolean).join(' · ')
   const draftOn = v.isDraft ? mineOf(await ownCards($)).filter(c => v.applied.includes(c.id)) : []
   const lead: Lead = v.isDraft && !v.isBusy
     ? draftOn.length
@@ -2503,7 +2517,7 @@ export const register: Register = on => {
                 : []),
               ...(v.judgments.length
                 ? [
-                    capOnly('sent-j', 'Jev가 판단한 교훈', `${v.judgments.length}`),
+                    capOnly('sent-j', 'Jev가 판단한 교훈 · 규칙', `${v.judgments.length}`),
                     cardOf('sent-jc', v.judgments.map(j => {
                       const c = mine.find(x => x.id === j.id)
                       const isOut = out.lessonIds.includes(j.id)
@@ -2513,7 +2527,7 @@ export const register: Register = on => {
                 : []),
             ]
       const ruleView = () => [
-        ...(ruleCards.length ? [] : [emptyNote('rules-empty', `아직 없어요. 같은 교정이 ${PROMOTE_AT}번 쌓인 교훈은 규칙으로 올릴지 물어봐요. 규칙은 그 범위의 모든 요청에 항상 붙어요.`)]),
+        ...(ruleCards.length ? [] : [emptyNote('rules-empty', `아직 없어요. 같은 교정이 ${PROMOTE_AT}번 쌓인 교훈은 규칙으로 올릴지 물어봐요. 규칙은 요청마다 Jev가 관련 있는지 보고 최대 ${MAX_ATTACHED_RULES}개까지 붙여요. 항상 붙는 건 원칙과 근원 욕구뿐이에요.`)]),
         ...ruleOthers(),
       ]
       const preview = (await $.store.get('preview')) as Preview | undefined
@@ -2822,7 +2836,7 @@ export const register: Register = on => {
             ...(isOpen('s-rules')
               ? isManaging
                 ? ruleCards.map(c => manageRow(c, false))
-                : [cardOf('card-rules', ruleCards.map(c => ({ ...cardRow(c, false), pill: c.isMuted ? { text: '꺼둠' } : { text: '항상', color: STATE_COLOR.hit }, sub: subOf(c) })))]
+                : [cardOf('card-rules', ruleCards.map(c => ({ ...cardRow(c, sentIds.includes(c.id)), ...(c.isMuted ? { pill: { text: '꺼둠' } } : {}), sub: subOf(c) })))]
               : []),
           ]}
           {(tab === 'lessons' || tab === 'rules' || tab === 'feedback') && (mine.length > 0 || reqs.length > 0 || others.length > 0 || otherReqs.length > 0) && (
