@@ -253,6 +253,23 @@ test('a run whose session closed says so, and offers to carry on', async ($, on)
   await pane.unmount()
 })
 
+test('a run kept by an earlier version (a list of every file name) carries on from it', async ($, on) => {
+  const bodies: string[] = []
+  const clock = past(on, body => (body.includes('"items"') && bodies.push(body), false), {
+    history: { status: 'error', at: 1, since: Date.parse('2026-08-30T00:00:00Z'), until: Date.parse('2026-10-14T00:00:00Z'), files: 2, filesDone: 1, prompts: 3, found: 1, enriched: 0, v: 2, range: 'recent' },
+    historyFiles: ['s1.jsonl'],
+  })
+  const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await pane.press({ key: 'tab-feedback' })
+  expect((await pane.find({ key: 'hist-run' }))?.text).toMatch(/이어서 찾기/)
+  await pane.press({ key: 'hist-run' })
+  await clock.settle()
+  // alpha (s1) was read before: only beta is asked about.
+  expect(bodies.some(b => b.includes('데모 주소'))).toBe(true)
+  expect(bodies.some(b => b.includes('배포 링크 줘'))).toBe(false)
+  await pane.unmount()
+})
+
 test('one dropped Jev call does not stop the run: it is tried again', async ($, on) => {
   let drops = 1
   const clock = past(on, body => body.includes('"items"') && drops-- > 0)

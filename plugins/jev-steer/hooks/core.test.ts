@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { isConcreteRequirement } from './register'
+import { isConcreteRequirement, keptCases } from './register'
 
 import type { Card, Requirement } from '../types'
 import { aniCard, appliesTo, buildQuestions, indexSummaries, isSamePath, isUndecided, jevBody, judge, parseAniPattern, parseIndex, parseMemoryNote, pickCandidates, placeIn, projectName, sameProject, scopeOf, slugOf, verdictOf } from './core'
@@ -265,4 +265,19 @@ test('a Jev body never carries half an emoji: cut text is mended, whole emoji ke
   const back = JSON.parse(body) as { state: { items: { user_message: string }[]; lone: string } }
   expect(back.state.items[0]?.user_message).toBe('좋아요 🙂 그리고 �')
   expect(back.state.lone).toBe('�끝')
+})
+
+test('cases fit the store: a judged case drops its conversation, and the oldest go past the budget', async () => {
+  const conversation = '사용자: 배포 링크 줘\n에이전트: 여기 있어요'.repeat(40)
+  const judged = { at: 3, text: '아니 그건 로컬이잖아', cardId: '', project: 'p', context: conversation, judgment: '배포 주소가 필요했다', pattern: '요청한 대상을 바꿈' }
+  const waiting = { at: 2, text: '아니 푸터 말고', cardId: '', project: 'p', context: conversation }
+  const old = { at: 1, text: '아니 헤더 말고', cardId: '', project: 'p', context: conversation }
+  const kept = keptCases([old, judged, waiting])
+  // Newest first; only judging reads the conversation, so a judged case no longer carries it.
+  expect(kept.map(f => f.at)).toEqual([3, 2, 1])
+  expect(kept[0]?.context).toBeUndefined()
+  expect(kept[1]?.context).toBe(conversation)
+  // Past the budget the oldest go first.
+  const budget = JSON.stringify(kept.slice(0, 2)).length * 3
+  expect(keptCases([old, judged, waiting], budget).map(f => f.at)).toEqual([3, 2])
 })
