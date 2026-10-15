@@ -3,6 +3,15 @@ import type { Card, Feedback, Judgment, Kind, Requirement, Scope, Verdict } from
 export const JEV_URL = 'https://api.typesafe.ai/v1/systemone'
 
 /**
+ * A Jev request body. Text cut to a length can split an emoji's surrogate pair,
+ * and Jev refuses the whole request with a 400 ("invalid Unicode text"): a half
+ * left alone becomes U+FFFD.
+ */
+export function jevBody(value: unknown): string {
+  return JSON.stringify(value, (_, v) => (typeof v === 'string' ? v.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD') : v))
+}
+
+/**
  * Where Jev is reached. OpenRouter carries the same Jev on the same System One
  * API, billed to the OpenRouter account; with its key set it is used first.
  */
