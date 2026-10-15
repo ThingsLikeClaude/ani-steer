@@ -147,6 +147,8 @@ declare module 'claude-code' {
       pinned: string[]
       keyLater: boolean
       hasKey: boolean
+      /** Which service carries Jev: 'OpenRouter', 'TypeSafe', or '' with no key. */
+      jevVia: string
       listLimit: number
     }
   }
