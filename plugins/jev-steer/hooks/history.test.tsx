@@ -330,3 +330,46 @@ test("old records show the person's words: ani's English summary is said again i
   expect(cases).not.toContain('npm test')
   await pane.unmount()
 })
+
+/** A session starting: when ani tidies what it keeps. */
+async function startSession($: Parameters<TestBody>[0], on: Parameters<TestBody>[1]) {
+  on('session.start', ($, e) => ({ cwd: (e as { cwd: string }).cwd }) as never)
+  on('session.root', () => ({ value: '/p' }) as never)
+  on('session.messages', () => ({ value: [] }) as never)
+  on('command.register', ($, e) => ({ value: { command: (e as { name: string }).name } }) as never)
+  on('ui.open', () => ({ value: { isPlaced: false } }) as never)
+  await $.session.start({ cwd: '/p', surface: null, isInteractive: false } as never)
+}
+
+const STRUNG = '이 상황에서 그림체 지시를 놓쳤다 / 이 상황에서 트리거 설계를 되돌려 맡겼다'
+const caseOf = (at: number, judgment: string, link: Record<string, string>) => ({ at, text: '아니 그게 아니라', cardId: '', project: 'unknown', judgment, ...link })
+
+test('a candidate accepted before it was worded becomes one worded lesson, never its judgments strung together', async ($, on) => {
+  const clock = past(on, () => false, {
+    candidates: [{ id: 'C-1', cases: [11, 12], kind: 'intent', scope: 'global', project: 'unknown' }],
+    feedbackLog: [caseOf(12, '이 상황에서 그림체 지시를 놓쳤다', { candidateId: 'C-1' }), caseOf(11, '이 상황에서 트리거 설계를 되돌려 맡겼다', { candidateId: 'C-1' })],
+  })
+  const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await pane.press({ key: 'tab-lessons' })
+  await pane.press({ key: 'ca-C-1' })
+  await clock.settle()
+  const drawn = (await pane.findAll({ type: 'Svg' })).map(x => `${String(x.props.alt ?? '')} ${String(x.props.source ?? '')}`).join('\n')
+  expect(drawn).toContain('주소를 넘길 땐 배포된 주소인지 확인')
+  expect(drawn).not.toContain(STRUNG)
+  await pane.unmount()
+})
+
+test('a rule saved as strung-together judgments is worded again from its cases when a session starts; it stays a rule', async ($, on) => {
+  const clock = past(on, () => false, {
+    cards: [{ id: 'J-s', ts: 1, text: '아니 그게 아니라', kind: 'intent', scope: 'global', project: '', source: 'jev', keywords: [], count: 2, isRule: true, lesson: STRUNG }],
+    feedbackLog: [caseOf(12, '이 상황에서 그림체 지시를 놓쳤다', { cardId: 'J-s' }), caseOf(11, '이 상황에서 트리거 설계를 되돌려 맡겼다', { cardId: 'J-s' })],
+  })
+  await startSession($, on)
+  await clock.settle()
+  const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await pane.press({ key: 'tab-rules' })
+  const drawn = (await pane.findAll({ type: 'Svg' })).map(x => `${String(x.props.alt ?? '')} ${String(x.props.source ?? '')}`).join('\n')
+  expect(drawn).toContain('주소를 넘길 땐 배포된 주소인지 확인')
+  expect(drawn).not.toContain(STRUNG)
+  await pane.unmount()
+})

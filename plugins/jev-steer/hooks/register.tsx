@@ -594,7 +594,8 @@ async function placeCase($: EngineInterface, at: number) {
   const judgment = me.judgment
   // Cases are weighed by the habit they show: the same habit in another task or project is the same lesson.
   const habit = (f: Feedback) => (f.pattern ? `${f.pattern} — ${f.judgment ?? ''}` : (f.judgment as string))
-  const firstJudgment = (c: Candidate) => { const f = fb.find(x => c.cases.includes(x.at) && x.judgment); return f ? habit(f) : '' }
+  // A candidate not yet worded is all its cases: a new one must share their habit, not only the first's.
+  const firstJudgment = (c: Candidate) => fb.filter(x => c.cases.includes(x.at) && x.judgment).slice(0, 4).map(habit).join(' | ')
   const key = me.pattern ? `${me.pattern} ${judgment}` : judgment
   const lessons = nearest(key, (await ownCards($)).filter(c => c.lesson && !c.isArchived && !c.isMuted), c => `${c.lesson} ${c.why ?? ''}`, 8)
   const cands = nearest(key, (((await $.store.get('candidates')) as Candidate[] | undefined) ?? []).filter(c => !c.isDeclined), c => c.lesson ?? firstJudgment(c), 8)
@@ -649,24 +650,70 @@ async function placeCase($: EngineInterface, at: number) {
   await save($, 'candidates', [...cs, cand])
   const latest = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
   await save($, 'feedbackLog', latest.map(f => (f.at === at || f.at === other.at ? { ...f, candidateId: id } : f)))
-  // The lesson text, drafted from both cases by the small model.
-  const r = await $.model.complete({
-    model: 'haiku',
-    maxTokens: 400,
-    timeoutMs: 20000,
-    system:
-      '같은 판단을 낳은 사례 두 개가 주어집니다. 둘을 함께 덮는 교훈 하나를 만드세요. JSON만 답하세요: {"intent": "...", "why": "...", "lesson": "...", "short": "..."}. 모두 한국어 한 문장, 말줄임표 금지. ' +
-      'intent: 사용자가 실제로 원한 것(30자 이내). why: 에이전트가 왜 잘못 읽었는지(40자 이내). lesson: 그 상황에서 다음엔 할 일, 상황으로 시작(40자 이내). short: lesson을 20자 이내로 다시 요약.',
-    prompt: [other, me].map((f, i) => `사례 ${i + 1}\n요청: ${f.before ?? ''}\n에이전트가 이해한 것: ${f.understood ?? ''}\n실제 의도: ${f.meant ?? ''}\n피드백: ${f.said ?? f.text}\n판단: ${f.judgment}${f.pattern ? `\n습관: ${f.pattern}` : ''}`).join('\n\n'),
-  })
-  if (!r.isAnswered) return
+  // The lesson text, drafted from both cases by the small model; worded again at a later start when it fails.
+  const t = await wordCases($, [other, me])
+  if (!t) return
+  const now = ((await $.store.get('candidates')) as Candidate[] | undefined) ?? []
+  await save($, 'candidates', now.map(c => (c.id === id ? { ...c, ...t } : c)))
+}
+
+/**
+ * One lesson worded by the small model from the cases it covers. Null when it
+ * could not: a lesson is never the cases' judgments strung together.
+ */
+async function wordCases($: EngineInterface, cases: readonly Feedback[]): Promise<Pick<Card, 'intent' | 'why' | 'lesson' | 'short'> | null> {
+  if (!cases.length) return null
+  const r = await $.model
+    .complete({
+      model: 'haiku',
+      maxTokens: 400,
+      timeoutMs: 20000,
+      system:
+        `같은 판단을 낳은 사례 ${cases.length}개가 주어집니다. 모두를 함께 덮는 교훈 하나를 만드세요. JSON만 답하세요: {"intent": "...", "why": "...", "lesson": "...", "short": "..."}. 모두 한국어 한 문장, 말줄임표 금지, 사례를 나열하지 말 것. ` +
+        'intent: 사용자가 실제로 원한 것(30자 이내). why: 에이전트가 왜 잘못 읽었는지(40자 이내). lesson: 그 상황에서 다음엔 할 일, 상황으로 시작(40자 이내). short: lesson을 20자 이내로 다시 요약.',
+      prompt: cases
+        .slice(0, 8)
+        .map((f, i) => `사례 ${i + 1}\n요청: ${f.before ?? ''}\n에이전트가 이해한 것: ${f.understood ?? ''}\n실제 의도: ${f.meant ?? ''}\n피드백: ${f.said ?? f.text.slice(0, 300)}\n판단: ${f.judgment ?? ''}${f.pattern ? `\n습관: ${f.pattern}` : ''}`)
+        .join('\n\n'),
+    })
+    .catch(() => null)
+  if (!r?.isAnswered) return null
   try {
     const t = JSON.parse(r.text.match(/\{[\s\S]*\}/)?.[0] ?? '') as { intent?: string; why?: string; lesson?: string; short?: string }
-    const short = t.short && [...t.short].length <= SHORT_MAX ? t.short : undefined
-    const now = ((await $.store.get('candidates')) as Candidate[] | undefined) ?? []
-    await save($, 'candidates', now.map(c => (c.id === id ? { ...c, intent: t.intent, why: t.why, lesson: t.lesson, short } : c)))
+    if (!t.lesson || t.lesson.includes(' / ')) return null
+    return { intent: t.intent, why: t.why, lesson: t.lesson, short: t.short && [...t.short].length <= SHORT_MAX ? t.short : undefined }
   } catch {
-    // stays a candidate without wording; the card falls back to the judgments
+    return null
+  }
+}
+
+/** A lesson saved as its cases' judgments strung together, before lessons were always worded. */
+const isStrung = (c: Card) => (c.lesson?.split(' / ').length ?? 0) >= 2 && !c.intent
+
+let isRewording = false
+
+/**
+ * Candidates offered without wording are worded, and lessons saved as their
+ * cases' judgments strung together are worded again from those cases. The
+ * person's choices stay: the same cases, the same lesson or rule, its scope.
+ */
+async function rewordLessons($: EngineInterface) {
+  if (isRewording) return
+  isRewording = true
+  try {
+    const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+    for (const c of (((await $.store.get('candidates')) as Candidate[] | undefined) ?? []).filter(x => !x.lesson && !x.isDeclined)) {
+      const t = await wordCases($, fb.filter(f => c.cases.includes(f.at)))
+      if (!t) continue
+      const now = ((await $.store.get('candidates')) as Candidate[] | undefined) ?? []
+      await save($, 'candidates', now.map(x => (x.id === c.id ? { ...x, ...t } : x)))
+    }
+    for (const c of (await ownCards($)).filter(isStrung)) {
+      const t = await wordCases($, fb.filter(f => f.cardId === c.id))
+      if (t) await editCard($, c.id, t)
+    }
+  } finally {
+    isRewording = false
   }
 }
 
@@ -678,6 +725,8 @@ async function acceptCandidate($: EngineInterface, id: string) {
   const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
   const cases = fb.filter(f => c.cases.includes(f.at))
   const now = await $.clock.now()
+  // Not worded when it was offered: worded now; failing that, one case's judgment, never all of them strung together.
+  const worded = c.lesson ? null : await wordCases($, cases)
   const card: Card = {
     id: `J-${now}`,
     ts: now,
@@ -689,10 +738,10 @@ async function acceptCandidate($: EngineInterface, id: string) {
     keywords: tokenize(cases.map(f => f.text).join(' ')).slice(0, 6),
     count: cases.length,
     examples: cases.map(f => f.text.slice(0, 300)),
-    intent: c.intent,
-    why: c.why,
-    lesson: c.lesson ?? cases.map(f => f.judgment).filter(Boolean).join(' / '),
-    short: c.short,
+    intent: c.intent ?? worded?.intent,
+    why: c.why ?? worded?.why,
+    lesson: c.lesson ?? worded?.lesson ?? cases.find(f => f.judgment)?.judgment,
+    short: c.short ?? worded?.short,
   }
   await save($, 'cards', enforceCapacity([...(await ownCards($)), card]))
   await save($, 'feedbackLog', fb.map(f => (c.cases.includes(f.at) ? { ...f, cardId: card.id, candidateId: undefined } : f)))
@@ -1885,6 +1934,7 @@ export const register: Register = on => {
       await keepPersonWords($)
       await koreanizeAni($)
       await regroupCases($)
+      await rewordLessons($)
     })
     $.clock.after(0, () => importMemory($))
     $.clock.after(0, () => settleReqs($))
