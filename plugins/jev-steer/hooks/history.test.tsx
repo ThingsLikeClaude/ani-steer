@@ -51,7 +51,7 @@ test('a past request carries the conversation around it; what the person did not
   for (const l of lines) r.line(l)
   const got = r.prompts()
   expect(got.map(p => p.text)).toEqual(['카드 배경 어둡게', '버튼도 둥글게', '아니 배경이라니까, 글자 말고', '좋아', '다음은 README'])
-  const c = got[2]
+  const c = got[2]!
   expect(c.earlier).toEqual(['카드 배경 어둡게', '버튼도 둥글게'])
   expect(c.tools).toEqual(['Edit src/app.tsx'])
   expect(c.reply).toBe('둥글게 했어요')

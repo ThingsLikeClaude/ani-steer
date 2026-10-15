@@ -389,7 +389,7 @@ async function bringInMemory($: EngineInterface) {
       id: t.id,
       ts: t.ts,
       // Claude's note is not the person's words, and often English: the card shows the lesson in their place.
-      text: worded.lesson,
+      text: worded.lesson ?? t.note.name,
       kind: 'intent',
       ...(places.get(t.slug) as Pick<Card, 'scope' | 'project'>),
       source: 'memory',
