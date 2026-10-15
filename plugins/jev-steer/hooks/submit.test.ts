@@ -149,37 +149,48 @@ test('a rule that does not bear on the request stays home', async ($, on) => {
   expect(context ?? []).toEqual([])
 })
 
-test('Jev goes through OpenRouter when its key is set, even with a TypeSafe key', async ($, on) => {
+/** Jev answering at whichever service is asked; each call's service, key and model recorded. */
+function routed(on: Parameters<TestBody>[1], env: Record<string, string>, refuse: (url: string) => number = () => 0) {
   const sent: { url: string; auth: string; model: string }[] = []
-  const world = (env: Record<string, string>) => {
-    mock.store(on, { cards: [lesson] })
-    mock.clock(on)
-    mock.env(on, { HOME: '/tmp', ...env })
-    on('http.fetch', ($, e) => {
-      const { url, init } = e as { url: string; init?: { body?: string; headers?: Record<string, string> } }
-      sent.push({ url, auth: init?.headers?.authorization ?? '', model: (JSON.parse(String(init?.body)) as { model: string }).model })
-      return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ answers: { is_correction: { noul: 0.05 } } }) } } as never
-    })
-    on('ui.toast', () => ({ value: undefined }) as never)
-    on('prompt.submit', ($, e) => ({ text: e.text }) as never)
-  }
-  world({ OPENROUTER_API_KEY: 'sk-or-test', TYPESAFE_API_KEY: 'ts-test' })
-  await $.prompt.submit({ text: '다크모드 카드 배경 좀 어둡게 해줘' } as never)
-  expect(sent[0]).toEqual({ url: 'https://openrouter.ai/api/v1/systemone', auth: 'Bearer sk-or-test', model: '~typesafe/jev-latest' })
-})
-
-test('with only the TypeSafe key, Jev is reached at TypeSafe', async ($, on) => {
-  let sent = { url: '', model: '' }
   mock.store(on, { cards: [lesson] })
   mock.clock(on)
-  mock.env(on, { HOME: '/tmp', TYPESAFE_API_KEY: 'ts-test' })
+  mock.env(on, { HOME: '/tmp', ...env })
   on('http.fetch', ($, e) => {
-    const { url, init } = e as { url: string; init?: { body?: string } }
-    sent = { url, model: (JSON.parse(String(init?.body)) as { model: string }).model }
-    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ answers: { is_correction: { noul: 0.05 } } }) } } as never
+    const { url, init } = e as { url: string; init?: { body?: string; headers?: Record<string, string> } }
+    sent.push({ url, auth: init?.headers?.authorization ?? '', model: (JSON.parse(String(init?.body)) as { model: string }).model })
+    const status = refuse(url)
+    if (status) return { value: { status, ok: false, headers: {}, text: '' } } as never
+    const answers = { is_correction: { noul: 0.05 }, has_requirement: { noul: 0.1 }, c0_same: { noul: 0.9 }, c0_satisfy: { noul: 0.9 }, c0_flip: { noul: 0.05 } }
+    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ answers }) } } as never
   })
   on('ui.toast', () => ({ value: undefined }) as never)
-  on('prompt.submit', ($, e) => ({ text: e.text }) as never)
+  let context: readonly string[] | undefined
+  on('prompt.submit', ($, e) => {
+    context = e.context
+    return { text: e.text } as never
+  })
+  return { sent, context: () => (context ?? []).join('\n') }
+}
+
+const TYPESAFE = { url: 'https://api.typesafe.ai/v1/systemone', auth: 'Bearer ts-test', model: 'jev-latest' }
+const OPENROUTER = { url: 'https://openrouter.ai/api/v1/systemone', auth: 'Bearer sk-or-test', model: '~typesafe/jev-latest' }
+
+test("a request's own judging goes to TypeSafe first: the faster line, with both keys set", async ($, on) => {
+  const w = routed(on, { OPENROUTER_API_KEY: 'sk-or-test', TYPESAFE_API_KEY: 'ts-test' })
   await $.prompt.submit({ text: '다크모드 카드 배경 좀 어둡게 해줘' } as never)
-  expect(sent).toEqual({ url: 'https://api.typesafe.ai/v1/systemone', model: 'jev-latest' })
+  expect(w.sent[0]).toEqual(TYPESAFE)
+  expect(w.context()).toContain('밝기 요청은 바꿀 속성부터 확인')
+})
+
+test('when TypeSafe refuses (an empty balance), the request is judged through OpenRouter', async ($, on) => {
+  const w = routed(on, { OPENROUTER_API_KEY: 'sk-or-test', TYPESAFE_API_KEY: 'ts-test' }, url => (url.includes('typesafe.ai') ? 402 : 0))
+  await $.prompt.submit({ text: '다크모드 카드 배경 좀 어둡게 해줘' } as never)
+  expect(w.sent).toEqual([TYPESAFE, OPENROUTER])
+  expect(w.context()).toContain('밝기 요청은 바꿀 속성부터 확인')
+})
+
+test('with one key, every call goes where that key reaches', async ($, on) => {
+  const w = routed(on, { OPENROUTER_API_KEY: 'sk-or-test' })
+  await $.prompt.submit({ text: '다크모드 카드 배경 좀 어둡게 해줘' } as never)
+  expect(w.sent[0]).toEqual(OPENROUTER)
 })
