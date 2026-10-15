@@ -80,6 +80,43 @@ const expandedSections = atom({ plugin: 'jev-steer', key: 'expandedSections' } a
 const pinned = atom({ plugin: 'jev-steer', key: 'pinned' } as const, [] as string[])
 const keyLater = atom({ plugin: 'jev-steer', key: 'keyLater' } as const, false)
 const hasKey = atom({ plugin: 'jev-steer', key: 'hasKey' } as const, true)
+/**
+ * The engine refuses the whole pane, and draws none of it, when one Svg's
+ * source is longer than 131072 characters or it is taller than 4096 pixels.
+ */
+const SVG_MAX = { chars: 131_072, height: 4096 }
+/** What one drawing is filled to: under the limits with room to spare. */
+const SVG_BUDGET = { chars: 100_000, height: 3200 }
+
+type Drawn = { source: string; height: number }
+const fitsEngine = (sv: Drawn) => sv.source.length <= SVG_MAX.chars && sv.height <= SVG_MAX.height
+
+/**
+ * Items split into as few drawings as stay under SVG_BUDGET, each item
+ * measured by drawing it alone once. A long list of cases is several
+ * drawings, not one that empties the pane.
+ */
+export function bySize<T>(items: readonly T[], measure: (x: T) => Drawn, budget = SVG_BUDGET): T[][] {
+  const out: T[][] = []
+  let cur: T[] = []
+  let chars = 0
+  let height = 0
+  for (const x of items) {
+    const m = measure(x)
+    if (cur.length && (chars + m.source.length > budget.chars || height + m.height > budget.height)) {
+      out.push(cur)
+      cur = []
+      chars = 0
+      height = 0
+    }
+    cur.push(x)
+    chars += m.source.length
+    height += m.height
+  }
+  if (cur.length) out.push(cur)
+  return out
+}
+
 /** Rows between one card-with-buttons and the next: twice the gap between a card and its own buttons. */
 const ITEM_GAP = 2
 /** How many rows a long list in the panel shows before "더 보기". */
@@ -1882,9 +1919,14 @@ export const register: Register = on => {
           </Box>
         )
       }
+      // A drawing the engine would refuse is said in words instead: one refusal empties the whole pane.
+      const svgOr = (key: string, sv: Drawn & { width: number }, alt: string) =>
+        fitsEngine(sv) ? <Svg key={key} source={sv.source} width={sv.width} height={sv.height} alt={alt} /> : <Text key={key} wrap="wrap">{alt}</Text>
       const cardOf = (key: string, rows: CardRow[], tone?: string) => {
-        const sv = listCardSvg(paneW, rows, tone)
-        return <Svg key={key} source={sv.source} width={sv.width} height={sv.height} alt={rows.map(r => r.title).join('. ')} />
+        const parts = rows.length > 1 ? bySize(rows, r => listCardSvg(paneW, [r], tone)) : [rows]
+        const draw = (k: string, rs: CardRow[]) => svgOr(k, listCardSvg(paneW, rs, tone), rs.map(r => r.title).join('. '))
+        if (parts.length === 1) return draw(key, rows)
+        return <Box key={key} flexDirection="column" gap={1}>{parts.map((rs, i) => draw(`${key}-${i}`, rs))}</Box>
       }
       // One card with its buttons, kept together: the buttons sit just under their own card and
       // the next card starts a clear step below, so no button reads as the next card's.
@@ -2143,12 +2185,18 @@ export const register: Register = on => {
       const moreButton = (key: string, total: number) =>
         total > limit ? [<Box key={`${key}-more`} flexDirection="row" marginTop={1}>{[<Button key={`${key}-more-b`} variant="secondary" label={`${Math.min(30, total - limit)}개 더 보기 · ${total - limit}개 남음`} onPress={() => update($, listLimit, n => n + 30)} />]}</Box>] : []
       const caseCard = (key: string, list: Feedback[], isOther: boolean) => {
-        const sv = caseCardSvg(paneW, list.slice(0, limit).map(f => {
+        const views = list.slice(0, limit).map(f => {
           const c = own.find(x => x.id === f.cardId)
           const cd = cands.find(x => x.id === f.candidateId)
-          return { dot: c ? KIND_COLOR[c.kind] : '#8a8a8a', said: f.said ?? f.text, raw: f.text, when: isOther ? `${projectName(f.project)} · ${ago(f.at)}` : ago(f.at), before: f.before, did: f.did, after: f.after, understood: f.understood, meant: f.meant, judgment: f.judgment, lesson: c?.lesson ?? (cd ? `후보 · ${cd.lesson ?? '정리하는 중'}` : f.judgment ? '판단 1개 · 같은 판단이 한 번 더 나오면 교훈 후보' : undefined) }
-        }))
-        return <Svg key={key} source={sv.source} width={sv.width} height={sv.height} alt={list.map(f => f.said ?? f.text).join('. ')} />
+          return { f, v: { dot: c ? KIND_COLOR[c.kind] : '#8a8a8a', said: f.said ?? f.text, raw: f.text, when: isOther ? `${projectName(f.project)} · ${ago(f.at)}` : ago(f.at), before: f.before, did: f.did, after: f.after, understood: f.understood, meant: f.meant, judgment: f.judgment, lesson: c?.lesson ?? (cd ? `후보 · ${cd.lesson ?? '정리하는 중'}` : f.judgment ? '판단 1개 · 같은 판단이 한 번 더 나오면 교훈 후보' : undefined) } }
+        })
+        // A case is several thousand characters drawn: thirty in one drawing passed the engine's limit.
+        const parts = bySize(views, x => caseCardSvg(paneW, [x.v]))
+        return (
+          <Box key={key} flexDirection="column" gap={1}>
+            {parts.map((part, i) => svgOr(`${key}-${i}`, caseCardSvg(paneW, part.map(x => x.v)), part.map(x => x.f.said ?? x.f.text).join('. ')))}
+          </Box>
+        )
       }
       const histView = () => {
         const isLive = isHistLive

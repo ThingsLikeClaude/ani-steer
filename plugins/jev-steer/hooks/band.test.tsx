@@ -274,3 +274,21 @@ test('each card keeps its buttons with it, a clear step from the next card', asy
   }
   await pane.unmount()
 })
+
+test('a long list of cases is drawn in pieces the engine accepts, never one that empties the pane', async ($, on) => {
+  const long = '배포 링크를 달라고 했는데 로컬 주소를 넘겼고, 그다음에도 같은 실수를 반복해서 다시 설명해야 했다 '.repeat(4)
+  const feedbackLog = Array.from({ length: 60 }, (_, i) => ({
+    at: 1_000 + i, text: long, cardId: '', project: `other-${i % 3}`, said: long, before: long, did: long, understood: long, meant: long, judgment: long,
+  }))
+  engine(on, { feedbackLog, listLimit: 60 })
+  // The engine refuses a pane holding an Svg over its limits: mounting at all is the check.
+  const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await pane.press({ key: 'tab-feedback' })
+  const drawn = (await pane.findAll({ type: 'Svg' })).filter(s => String(s.props.alt).includes('배포 링크'))
+  expect(drawn.length).toBeGreaterThan(1)
+  for (const s of drawn) {
+    expect(String(s.props.source).length).toBeLessThanOrEqual(131_072)
+    expect(Number(s.props.height)).toBeLessThanOrEqual(4096)
+  }
+  await pane.unmount()
+})
