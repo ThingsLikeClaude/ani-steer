@@ -2710,11 +2710,11 @@ export const register: Register = on => {
         scope: isBorrowed(rq) ? `${projectName(rq.project)}에서` : rq.scope === 'global' ? '모든 프로젝트' : undefined,
         pill: attachedReqIds.includes(rq.id) ? { text: '반영 중', color: STATE_COLOR.hit } : { text: dateOf(rq.ts) },
       })
-      const caseCard = (key: string, list: Feedback[], isOther: boolean) => {
+      const caseCard = (key: string, list: Feedback[]) => {
         const views = list.slice(0, limit).map(f => {
           const c = own.find(x => x.id === f.cardId)
           const cd = cands.find(x => x.id === f.candidateId)
-          return { f, v: { dot: c ? KIND_COLOR[c.kind] : '#8a8a8a', said: f.said ?? f.text, raw: f.text, when: isOther ? `${projectName(f.project)} · ${ago(f.at)}` : ago(f.at), before: f.before, did: f.did, after: f.after, understood: f.understood, meant: f.meant, judgment: f.judgment, lesson: c?.lesson ?? (cd ? `후보 · ${cd.lesson ?? '정리하는 중'}` : f.judgment ? '판단 1개 · 같은 판단이 한 번 더 나오면 교훈 후보' : undefined) } }
+          return { f, v: { dot: c ? KIND_COLOR[c.kind] : '#8a8a8a', said: f.said ?? f.text, raw: f.text, when: ago(f.at), before: f.before, did: f.did, after: f.after, understood: f.understood, meant: f.meant, judgment: f.judgment, lesson: c?.lesson ?? (cd ? `후보 · ${cd.lesson ?? '정리하는 중'}` : f.judgment ? '판단 1개 · 같은 판단이 한 번 더 나오면 교훈 후보' : undefined) } }
         })
         // A case is several thousand characters drawn: thirty in one drawing passed the engine's limit.
         const parts = bySize(views, x => drawnOnce(`case|${paneW}|${JSON.stringify(x.v)}`, () => caseCardSvg(paneW, [x.v])))
@@ -2723,6 +2723,10 @@ export const register: Register = on => {
             {parts.map((part, i) => svgOr(`${key}-${i}`, drawnOnce(`case|${paneW}|${JSON.stringify(part.map(x => x.v))}`, () => caseCardSvg(paneW, part.map(x => x.v))), part.map(x => x.f.said ?? x.f.text).join('. ')))}
           </Box>
         )
+      }
+      const otherCaseRow = (f: Feedback): CardRow => {
+        const kind = own.find(x => x.id === f.cardId)?.kind ?? f.kind
+        return { dot: kind ? KIND_COLOR[kind] : STATE_COLOR.quiet, title: f.said ?? f.text, scope: projectName(f.project), pill: { text: dateOf(f.at) } }
       }
       const histView = () => {
         const isLive = isHistLive
@@ -2760,11 +2764,12 @@ export const register: Register = on => {
       const feedbackView = () => [
         ...histView(),
         ...(feedbackLog.length
-          ? [labelRow('s-fb', '사례', feedbackLog.length), ...(isOpen('s-fb') ? [caseCard('card-fb', feedbackLog, false), ...moreButton('fb', feedbackLog.length)] : [])]
+          ? [labelRow('s-fb', '사례', feedbackLog.length), ...(isOpen('s-fb') ? [caseCard('card-fb', feedbackLog), ...moreButton('fb', feedbackLog.length)] : [])]
           : [emptyNote('fb-empty', `${otherCases.length ? '이 프로젝트의 사례는 ' : ''}아직 없어요. "아니 그게 아니라…"처럼 교정하면 사례로 쌓이고, 사례마다 판단 하나를 남겨요. 같은 판단이 2번 나오면 교훈 후보가 돼요.`)]),
-        // Every other project's cases, each tagged with its project: what was said elsewhere stays in view.
+        // Every other project's cases, one line each like a lesson: what was said, where, when.
+        // The full case (before, did, after, judgment) stays in the store for Jev and Claude.
         ...(otherCases.length
-          ? [labelRow('s-fb-other', '다른 프로젝트의 사례', otherCases.length), ...(isOpen('s-fb-other') ? [caseCard('card-fb-other', otherCases, true), ...moreButton('fb-other', otherCases.length)] : [])]
+          ? [labelRow('s-fb-other', '다른 프로젝트의 사례', otherCases.length), ...(isOpen('s-fb-other') ? [<Box key="card-fb-other" marginTop={1}>{cardOf('card-fb-other-list', otherCases.slice(0, limit).map(otherCaseRow))}</Box>, ...moreButton('fb-other', otherCases.length)] : [])]
           : []),
         ...(reqs.length
           ? [
