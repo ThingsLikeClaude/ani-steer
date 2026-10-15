@@ -13,6 +13,11 @@ function engine(on: On, entries?: Record<string, unknown>) {
   })
 }
 
+/** The source of the first drawn Svg whose alt text matches: an Svg is not found by its key. */
+async function sourceOf(ui: { findAll: (q: { type: string }) => Promise<{ props: Record<string, unknown> }[]> }, alt: RegExp) {
+  return String((await ui.findAll({ type: 'Svg' })).find(s => alt.test(String(s.props.alt ?? '')))?.props.source)
+}
+
 /** Whether any drawn Svg's alt text matches: ElementQuery does not match on alt. */
 async function hasSvg(ui: { findAll: (q: { type: string }) => Promise<{ props: Record<string, unknown> }[]> }, alt: RegExp) {
   return (await ui.findAll({ type: 'Svg' })).some(s => alt.test(String(s.props.alt ?? '')))
@@ -168,36 +173,33 @@ test('promoting a lesson to a rule clears the card at once (store writes redraw)
   await band.unmount()
 })
 
-test('another project\'s lesson is listed with its project and rides here only once attached', async ($, on) => {
+test('another project\'s lesson is listed for reference, folded, with its project; 모든 프로젝트로 brings it here', async ($, on) => {
   engine(on, { cards: [card({ id: 'J-9', project: 'me/other', lesson: '위치를 지정받으면 그 자리에 정확히 둔다' })] })
   const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await pane.press({ key: 'tab-lessons' })
+  // Nothing waits for a decision: no "+", and the reference list starts folded.
+  expect((await pane.find({ key: 'tab-lessons' }))?.text).toMatch(/교훈 0$/)
+  expect(await hasSvg(pane, /위치를 지정받으면/)).toBe(false)
+  await pane.press({ key: 's-ls-other-fold' })
   expect(await hasSvg(pane, /위치를 지정받으면/)).toBe(true)
-  expect(await pane.find({ key: 'at-J-9' })).toBeDefined()
-  await pane.press({ key: 'at-J-9' })
-  expect(await pane.find({ key: 'at-J-9' })).toBeUndefined()
+  expect(await sourceOf(pane, /위치를 지정받으면/)).toContain('other')
+  expect(await pane.find({ key: 'gl-J-9' })).toBeUndefined()
+  await pane.press({ key: 'manage' })
+  await pane.press({ key: 'gl-J-9' })
+  expect((await pane.find({ key: 'tab-lessons' }))?.text).toMatch(/교훈 1$/)
   await pane.unmount()
-  // Attached: it now sits with this project's lessons, tagged with where it came from.
-  const term = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await term.find({ type: 'Text', text: /other에서/ })).toBeDefined()
-  expect(await term.find({ key: 'rm-J-9' })).toBeUndefined()
-  await term.press({ key: 'dt-J-9' })
-  expect(await term.find({ type: 'Text', text: /other에서/ })).toBeUndefined()
-  await term.unmount()
 })
 
-test('requirements from before projects were recorded wait for a decision; not-here folds them away', async ($, on) => {
+test('a requirement with no project yet is listed for reference as 출처 모름, and asks nothing', async ($, on) => {
   engine(on, { requirements: [{ id: 'R-1', text: '0 raw 원문 본문 수정 금지', ts: 1, active: 1 }] })
   const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await pane.press({ key: 'tab-feedback' })
-  expect(await pane.find({ key: 'at-R-1' })).toBeDefined()
-  expect((await pane.find({ key: 'tab-feedback' }))?.text).toMatch(/사례 0 \+1$/)
-  expect((await pane.find({ key: 'tab-lessons' }))?.text).toMatch(/교훈 0$/)
-  await pane.press({ key: 'sk-R-1' })
+  expect((await pane.find({ key: 'tab-feedback' }))?.text).toMatch(/사례 0$/)
+  await pane.press({ key: 's-rq-other-fold' })
+  const listed = await sourceOf(pane, /0 raw 원문/)
+  expect(listed).toContain('0 raw 원문 본문 수정 금지')
+  expect(listed).toContain('출처 모름')
   expect(await pane.find({ key: 'at-R-1' })).toBeUndefined()
-  expect(await pane.find({ key: 's-rq-skip' })).toBeDefined()
-  await pane.press({ key: 's-rq-skip-fold' })
-  expect(await pane.find({ key: 'at-R-1' })).toBeDefined()
   await pane.unmount()
 })
 
@@ -237,16 +239,16 @@ test("ani's records from every project are listed here, each tagged with its pro
   await clock.settle()
   const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await pane.press({ key: 'tab-lessons' })
-  // hmi2html's lesson waits for a decision here; the S is a lesson for every project.
-  expect(await pane.find({ key: 'at-F-1' })).toBeDefined()
+  // The S is a lesson for every project; hmi2html's F is listed for reference with its project.
   expect(await hasSvg(pane, /Use when about to hand the user a deployed URL/)).toBe(true)
+  await pane.press({ key: 's-ls-other-fold' })
+  expect(await sourceOf(pane, /메뉴바/)).toContain('hmi2html')
   await pane.press({ key: 'tab-feedback' })
   expect(await pane.find({ key: 's-fb-other' })).toBeDefined()
   expect(await hasSvg(pane, /배포 링크 404야/)).toBe(true)
   await pane.unmount()
   // Forgotten here, it is not brought back by the next request.
   const term = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await term.find({ type: 'Text', text: /\[hmi2html\]/ })).toBeDefined()
   await term.press({ key: 'rm-S-deploy' })
   await term.unmount()
   await $.prompt.submit({ text: '두 번째 요청' } as never)
@@ -257,18 +259,22 @@ test("ani's records from every project are listed here, each tagged with its pro
 })
 
 test('each card keeps its buttons with it, a clear step from the next card', async ($, on) => {
-  engine(on, { requirements: [{ id: 'R-1', text: '0 raw 원문 본문 수정 금지', ts: 1, active: 1 }, { id: 'R-2', text: '2 Permanent 폴더 수정 금지', ts: 2, active: 1 }] })
+  engine(on, { requirements: [{ id: 'R-1', text: '0 raw 원문 본문 수정 금지', ts: 1, active: 1, project: 'unknown' }, { id: 'R-2', text: '2 Permanent 폴더 수정 금지', ts: 2, active: 1, project: 'unknown', scope: 'global' }] })
   const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await pane.press({ key: 'tab-feedback' })
+  await pane.press({ key: 'manage' })
   type El = { type: string; props: Record<string, unknown> }
   const texts: Record<string, string> = { 'R-1': '0 raw 원문 본문 수정 금지', 'R-2': '2 Permanent 폴더 수정 금지' }
   for (const id of ['R-1', 'R-2']) {
-    const item = await pane.find({ key: `ob-${id}` })
-    const [card, row] = (item?.children ?? []) as El[]
+    const item = await pane.find({ key: `mrq-${id}` })
+    const [cardEl, row] = (item?.children ?? []) as El[]
     // The card and its own buttons are one group, the buttons right under the card...
-    expect(card.type).toBe('Svg')
-    expect(String(card.props.alt)).toContain(texts[id])
-    expect(((row as El & { children: El[] }).children ?? []).map(b => b.props.label)).toEqual(['여기에도 붙이기', '안 붙임'])
+    expect(cardEl.type).toBe('Svg')
+    expect(String(cardEl.props.alt)).toContain(texts[id])
+    const buttons = ((row as El & { children: El[] }).children ?? []).map(b => b.props)
+    expect(buttons.map(b => b.label)).toEqual(['이 프로젝트', '모든 프로젝트', '잊기'])
+    // ...the one in force is marked...
+    expect(buttons.find(b => b.variant === 'primary')?.label).toBe(id === 'R-2' ? '모든 프로젝트' : '이 프로젝트')
     // ...and the next group starts further down than the buttons sit from their card.
     expect(Number(item?.props.marginTop)).toBeGreaterThan(Number(row.props.marginTop))
   }

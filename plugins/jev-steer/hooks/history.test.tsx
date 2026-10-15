@@ -38,6 +38,11 @@ test('streamed text is cut into whole lines', () => {
   expect(s.end()).toEqual(['{"c":3}'])
 })
 
+/** The source of the first drawn Svg whose alt text matches: an Svg is not found by its key. */
+async function sourceOf(ui: { findAll: (q: { type: string }) => Promise<{ props: Record<string, unknown> }[]> }, alt: RegExp) {
+  return String((await ui.findAll({ type: 'Svg' })).find(s => alt.test(String(s.props.alt ?? '')))?.props.source)
+}
+
 const PANE = { plugin: 'jev-steer', component: 'Pane', requestId: 'jev-steer', props: {} as never } as const
 const ALPHA_AT = '2026-10-01T01:01:00Z'
 const BETA_AT = '2026-10-03T02:01:00Z'
@@ -56,8 +61,8 @@ const DISK: Record<string, string> = {
 }
 
 /** Past transcripts on disk, Jev and the small model answering beneath the plugin. */
-function past(on: Parameters<TestBody>[1], jevDown: (body: string) => boolean = () => false) {
-  mock.store(on)
+function past(on: Parameters<TestBody>[1], jevDown: (body: string) => boolean = () => false, entries?: Record<string, unknown>) {
+  mock.store(on, entries)
   const clock = mock.clock(on, { now: Date.parse('2026-10-14T00:00:00Z') })
   mock.env(on, { CLAUDE_CONFIG_DIR: '/cfg', TYPESAFE_API_KEY: 'test-key' })
   const at = Date.parse('2026-10-05T00:00:00Z')
@@ -81,10 +86,14 @@ function past(on: Parameters<TestBody>[1], jevDown: (body: string) => boolean = 
   on('http.fetch', ($, e) => {
     const raw = String((e as { init?: { body?: string } }).init?.body)
     if (jevDown(raw)) return { value: { status: 503, ok: false, headers: {}, text: '' } } as never
-    const body = JSON.parse(raw) as { state: { items?: { user_message: string }[] }; questions: Record<string, unknown> }
-    const answers = Object.fromEntries(
-      Object.keys(body.questions).map(k => [k, { noul: k.startsWith('h') ? (body.state.items?.[Number(k.slice(1))]?.user_message.startsWith('아니') ? 0.9 : 0.05) : 0.9 }]),
-    )
+    const body = JSON.parse(raw) as { state: { items?: { user_message: string }[]; requirements?: string[] }; questions: Record<string, unknown> }
+    // A past request is a correction when it starts with 아니; a requirement holds everywhere when it is about replies.
+    const noulOf = (k: string) =>
+      /^h\d/.test(k) ? (body.state.items?.[Number(k.slice(1))]?.user_message.startsWith('아니') ? 0.9 : 0.05)
+      : /^g\d/.test(k) ? (body.state.requirements?.[Number(k.slice(1))]?.includes('응답') ? 0.9 : 0.1)
+      : /^[lkp]\d/.test(k) ? 0.9
+      : 0.05
+    const answers = Object.fromEntries(Object.keys(body.questions).map(k => [k, { noul: noulOf(k) }]))
     return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ answers }) } } as never
   })
   on('model.complete', () => ({
@@ -95,6 +104,7 @@ function past(on: Parameters<TestBody>[1], jevDown: (body: string) => boolean = 
     },
   }) as never)
   on('ui.toast', () => ({ value: undefined }) as never)
+  on('prompt.submit', ($, e) => ({ text: (e as { text: string }).text }) as never)
   return clock
 }
 
@@ -140,5 +150,30 @@ test('a run that stopped carries on where it stopped; nothing read is asked abou
   expect(await pane.find({ type: 'Text', text: /요청 5개를 보고 교정 2개를 사례로 정리했어요/ })).toBeDefined()
   expect(await pane.find({ key: 'hist-run' })).toBeUndefined()
   expect((await pane.find({ key: 'tab-feedback' }))?.text).toMatch(/사례 2/)
+  await pane.unmount()
+})
+
+test('a requirement saved before projects were recorded gets the project it was said in, and Jev says where it holds', async ($, on) => {
+  // Saved the moment alpha's correction and beta's were sent; neither knew its project.
+  const clock = past(on, () => false, {
+    requirements: [
+      { id: 'R-a', text: 'src/generated 폴더는 수정 금지', ts: Date.parse(ALPHA_AT), active: 1 },
+      { id: 'R-b', text: '응답은 영어가 아닌 한국어로 작성', ts: Date.parse(BETA_AT), active: 1 },
+    ],
+  })
+  await $.prompt.submit({ text: '아무 요청이나 하나' } as never)
+  await clock.settle()
+  const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await pane.press({ key: 'tab-feedback' })
+  // About replies: it holds in every project, this one included.
+  const own = await sourceOf(pane, /한국어로 작성/)
+  expect(own).toContain('한국어로 작성')
+  expect(own).toContain('모든 프로젝트')
+  // About one project's files: it stays with alpha, listed here for reference.
+  await pane.press({ key: 's-rq-other-fold' })
+  const others = await sourceOf(pane, /src\/generated/)
+  expect(others).toContain('src/generated')
+  expect(others).toContain('alpha')
+  expect(others).not.toContain('출처 모름')
   await pane.unmount()
 })
