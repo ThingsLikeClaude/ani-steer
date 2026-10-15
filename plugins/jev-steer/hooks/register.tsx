@@ -86,6 +86,10 @@ const keyLater = atom({ plugin: 'jev-steer', key: 'keyLater' } as const, false)
 const hasKey = atom({ plugin: 'jev-steer', key: 'hasKey' } as const, true)
 /** Which service carries Jev in this session: OpenRouter or TypeSafe. */
 const jevVia = atom({ plugin: 'jev-steer', key: 'jevVia' } as const, '')
+type HistNow = { file: string; mb: number; step: string; startedAt: number; filesDone: number; files: number; prompts: number; found: number; ofRun: number; skipped: number }
+const histNow = atom({ plugin: 'jev-steer', key: 'histNow' } as const, null as HistNow | null)
+/** How often a run writes its progress to the store: every write rewrites the whole store file. */
+const HISTORY_FLUSH = { files: 25, ms: 15_000 }
 /**
  * The engine refuses the whole pane, and draws none of it, when one Svg's
  * source is longer than 131072 characters or it is taller than 4096 pixels.
@@ -986,15 +990,52 @@ async function readHistory($: EngineInterface, range?: HistoryRange) {
   const slugs = new Map<string, string>()
   // A forked or resumed session repeats the messages it carried over: each is asked about once.
   const asked = new Set<string>()
-  for (const f of files) {
-    if (done.has(f.name)) continue
+  // Progress is shown as it goes and written to the store every few files: each write rewrites the whole store file.
+  const start = (await $.store.get('history')) as History
+  const now0 = await $.clock.now()
+  let run: HistNow = { file: '', mb: 0, step: '', startedAt: now0, filesDone: start.filesDone, files: files.length, prompts: start.prompts, found: start.found, ofRun: 0, skipped: 0 }
+  let flushed = { files: 0, at: now0 }
+  // Every drawing of the pane costs time, so the progress is drawn at most once a second;
+  // a step that waits (a Jev call, a big file) is drawn as it starts.
+  let shownAt = 0
+  const show = async (change: Partial<HistNow>, isNow = false) => {
+    run = { ...run, ...change }
+    const t = await $.clock.now()
+    if (!isNow && t - shownAt < 1000) return
+    shownAt = t
+    await update($, histNow, () => run)
+  }
+  const flush = async () => {
+    await save($, 'historyFiles', [...done])
+    await setHistory($, { filesDone: run.filesDone, prompts: run.prompts, found: run.found })
+    flushed = { files: run.ofRun, at: await $.clock.now() }
+  }
+  try {
+    for (const f of files) {
+      if (done.has(f.name)) continue
+      await readOne(f)
+      done.add(f.name)
+      await show({ filesDone: run.filesDone + 1, ofRun: run.ofRun + 1 })
+      if (run.ofRun - flushed.files >= HISTORY_FLUSH.files || (await $.clock.now()) - flushed.at >= HISTORY_FLUSH.ms) await flush()
+    }
+  } finally {
+    await flush()
+    await update($, histNow, () => null)
+  }
+
+  async function readOne(f: { path: string; name: string; size: number }) {
+    const dir = f.path.replace(/\\/g, '/').split('/').slice(-2, -1)[0] ?? ''
+    await show({ file: dir.replace(/^[A-Za-z]--/, ''), mb: Math.round(f.size / 100_000) / 10, step: '읽는 중' }, f.size >= 1_000_000)
     const reader = pastPromptReader(since, until)
     let n = 0
     for await (const line of transcriptLines($, f.path, f.size)) {
       reader.line(line)
+      // Nothing more to take from it: leaving the loop ends the read.
+      if (reader.over()) break
       // A long transcript is read in the session's own process: let it breathe.
       if (++n % 2000 === 0) await $.clock.sleep(0)
     }
+    if (reader.over() === 'agent') return show({ skipped: run.skipped + 1 })
     const prompts = reader.prompts().filter(p => !asked.has(p.uuid))
     for (const p of prompts) asked.add(p.uuid)
     const byAt = new Map((((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []).map(x => [x.at, x]))
@@ -1004,6 +1045,7 @@ async function readHistory($: EngineInterface, range?: HistoryRange) {
     let found = 0
     for (let i = 0; i < fresh.length; i += HISTORY_BATCH) {
       const batch = fresh.slice(i, i + HISTORY_BATCH)
+      await show({ step: `Jev가 교정인지 판정 ${i / HISTORY_BATCH + 1}/${Math.ceil(fresh.length / HISTORY_BATCH)}` }, true)
       const answers = await askJev(
         $,
         { items: batch.map(itemOf) },
@@ -1027,15 +1069,12 @@ async function readHistory($: EngineInterface, range?: HistoryRange) {
       await save($, 'feedbackLog', [...fb, ...add].sort((a, b) => b.at - a.at).slice(0, FEEDBACK_MAX))
       found += add.length
     }
-    done.add(f.name)
-    await save($, 'historyFiles', [...done])
-    const h = (await $.store.get('history')) as History
-    await setHistory($, { filesDone: h.filesDone + 1, prompts: h.prompts + fresh.length, found: h.found + found })
+    await show({ prompts: run.prompts + fresh.length, found: run.found + found })
   }
 }
 
 /**
- * Each case found in past conversations is worded and placed like a live one,
+ * Each case found in past conversations is worded and placed like a run one,
  * oldest first: new ones, and earlier ones that now have their conversation
  * and no habit yet, so they are paired by it.
  */
@@ -1047,6 +1086,7 @@ async function judgeHistory($: EngineInterface) {
     const next = fb.filter(f => f.fromHistory && !tried.has(f.at) && (!f.judgment || (!f.pattern && f.context && isWaiting(f)))).sort((a, b) => a.at - b.at)[0]
     if (!next) return
     tried.add(next.at)
+    await update($, histNow, n => (n ? { ...n, file: '', mb: 0, step: '찾은 교정을 판단 문장으로 정리하는 중' } : n))
     const transcript = next.context ?? ([next.before && `사용자: ${next.before}`, next.did && `에이전트: ${next.did}`].filter(Boolean).join('\n') || '(앞 대화 기록 없음)')
     await judgeCase($, next.at, next.text, transcript)
     const h = (await $.store.get('history')) as History
@@ -2833,20 +2873,31 @@ export const register: Register = on => {
         const kind = own.find(x => x.id === f.cardId)?.kind ?? f.kind
         return { dot: kind ? KIND_COLOR[kind] : STATE_COLOR.quiet, title: f.said ?? f.text, scope: projectName(f.project), pill: { text: dateOf(f.at) } }
       }
+      const histLive = await read($, histNow)
+      const histAt = await $.clock.now()
       const histView = () => {
         const isLive = isHistLive
+        const left = histLive ? histLive.files - histLive.filesDone : 0
+        const elapsed = histLive ? histAt - histLive.startedAt : 0
+        const eta = histLive && histLive.ofRun >= 20 && elapsed >= 30_000 ? (left * elapsed) / histLive.ofRun : 0
+        const etaText = !eta ? '' : eta < 3_600_000 ? `약 ${Math.max(1, Math.round(eta / 60_000))}분 남음` : `약 ${Math.floor(eta / 3_600_000)}시간 ${Math.round((eta % 3_600_000) / 60_000)}분 남음`
+        const nowText = histLive
+          ? [histLive.file ? `지금 ${histLive.file} 기록 ${histLive.mb}MB · ${histLive.step}` : histLive.step, histLive.skipped ? `도구·스크립트가 돌린 세션 ${histLive.skipped}개는 내가 친 말이 없어 건너뜀` : '', etaText].filter(Boolean).join('\n')
+          : ''
         const isOld = hist?.status === 'done' && (hist.v ?? 1) < HISTORY_V
         const isRecentDone = hist?.status === 'done' && !isOld && hist.range !== 'all'
         const from = hist && hist.since > 0 ? `${dateOf(hist.since)}부터` : '처음부터'
         const text = !hist
           ? `ani가 기록하기 전의 대화는 아직 보지 않았어요. 지난 ${HISTORY_DAYS}일 대화에서 교정을 찾아 사례로 정리하고, 같은 습관끼리 교훈 후보로 묶어요. 교정 하나에 Jev와 Haiku를 두세 번 써요.`
           : isLive
-            ? `지난 대화를 읽는 중 · 기록 ${hist.filesDone}/${hist.files} · 요청 ${hist.prompts}개에서 교정 ${hist.found}개 · 정리 ${hist.enriched}개`
+            ? histLive
+              ? `지난 대화를 읽는 중 · 기록 ${histLive.filesDone}/${histLive.files} · 요청 ${histLive.prompts}개에서 교정 ${histLive.found}개 · 정리 ${hist.enriched}개\n${nowText}`
+              : `지난 대화를 읽는 중 · 기록 ${hist.filesDone}/${hist.files} · 요청 ${hist.prompts}개에서 교정 ${hist.found}개 · 정리 ${hist.enriched}개 · 다른 세션에서 읽고 있어요`
             : isOld
               ? `예전 기준으로 요청 ${hist.prompts}개에서 교정 ${hist.found}개를 찾았어요. 새 기준은 질문으로 한 교정도 찾고, 앞뒤 대화와 에이전트가 한 작업까지 봐요. 내가 친 말이 아닌 것(앱 알림, 예약 작업, 다른 프로그램이 보낸 지시)은 빼요.`
               : hist.status === 'done'
                 ? `${from} ani 기록 전까지의 대화에서 요청 ${hist.prompts}개를 보고 교정 ${hist.found}개를 사례로 정리했어요${isRecentDone ? `. 그 전 대화(${dateOf(hist.since)} 이전)는 아직 안 봤어요. 오래 걸리고 Jev를 많이 써요.` : ''}`
-                : `멈췄어요${hist.error ? ` · ${hist.error}` : ''} · 기록 ${hist.filesDone}/${hist.files} · 다시 누르면 이어서 해요`
+                : `멈췄어요 · ${hist.error ?? '읽던 세션이 닫혔거나 플러그인이 업데이트됐어요'} · 기록 ${hist.filesDone}/${hist.files} · 다시 누르면 이어서 해요`
         const run = (range?: HistoryRange) => () => { $.clock.after(0, () => mineHistory($, range)) }
         const button = isLive
           ? null
