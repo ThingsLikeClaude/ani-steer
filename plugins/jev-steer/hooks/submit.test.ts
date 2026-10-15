@@ -148,3 +148,38 @@ test('a rule that does not bear on the request stays home', async ($, on) => {
   await $.prompt.submit({ text: 'README 오타 고쳐줘' } as never)
   expect(context ?? []).toEqual([])
 })
+
+test('Jev goes through OpenRouter when its key is set, even with a TypeSafe key', async ($, on) => {
+  const sent: { url: string; auth: string; model: string }[] = []
+  const world = (env: Record<string, string>) => {
+    mock.store(on, { cards: [lesson] })
+    mock.clock(on)
+    mock.env(on, { HOME: '/tmp', ...env })
+    on('http.fetch', ($, e) => {
+      const { url, init } = e as { url: string; init?: { body?: string; headers?: Record<string, string> } }
+      sent.push({ url, auth: init?.headers?.authorization ?? '', model: (JSON.parse(String(init?.body)) as { model: string }).model })
+      return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ answers: { is_correction: { noul: 0.05 } } }) } } as never
+    })
+    on('ui.toast', () => ({ value: undefined }) as never)
+    on('prompt.submit', ($, e) => ({ text: e.text }) as never)
+  }
+  world({ OPENROUTER_API_KEY: 'sk-or-test', TYPESAFE_API_KEY: 'ts-test' })
+  await $.prompt.submit({ text: '다크모드 카드 배경 좀 어둡게 해줘' } as never)
+  expect(sent[0]).toEqual({ url: 'https://openrouter.ai/api/v1/systemone', auth: 'Bearer sk-or-test', model: '~typesafe/jev-latest' })
+})
+
+test('with only the TypeSafe key, Jev is reached at TypeSafe', async ($, on) => {
+  let sent = { url: '', model: '' }
+  mock.store(on, { cards: [lesson] })
+  mock.clock(on)
+  mock.env(on, { HOME: '/tmp', TYPESAFE_API_KEY: 'ts-test' })
+  on('http.fetch', ($, e) => {
+    const { url, init } = e as { url: string; init?: { body?: string } }
+    sent = { url, model: (JSON.parse(String(init?.body)) as { model: string }).model }
+    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ answers: { is_correction: { noul: 0.05 } } }) } } as never
+  })
+  on('ui.toast', () => ({ value: undefined }) as never)
+  on('prompt.submit', ($, e) => ({ text: e.text }) as never)
+  await $.prompt.submit({ text: '다크모드 카드 배경 좀 어둡게 해줘' } as never)
+  expect(sent).toEqual({ url: 'https://api.typesafe.ai/v1/systemone', model: 'jev-latest' })
+})
