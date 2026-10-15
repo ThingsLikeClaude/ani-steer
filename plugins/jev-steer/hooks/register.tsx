@@ -3,6 +3,7 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { Candidate, Card, Display, Need, Preview, Principle, Feedback, Judgment, Kind, Label, Requirement, Scope, Sent, View } from '../types'
 import {
+  jevBody,
   jevRouteOf,
   type JevRoute,
   KIND_LABEL,
@@ -1213,7 +1214,7 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
       assistant_last_reply: lastAnswer.slice(-1500),
       project,
     }
-    const body = JSON.stringify({ model: route.model, state, questions: buildQuestions(candidates, reqs, attachedBefore) })
+    const body = jevBody({ model: route.model, state, questions: buildQuestions(candidates, reqs, attachedBefore) })
     const headers = { authorization: `Bearer ${route.key}`, 'content-type': 'application/json' }
     // 5xx and 429 are transient on Jev's side: two retries with backoff.
     let res = await $.http.fetch(route.url, { method: 'POST', headers, body })
@@ -1333,7 +1334,7 @@ async function askJev($: EngineInterface, state: Record<string, unknown>, questi
       .fetch(route.url, {
         method: 'POST',
         headers: { authorization: `Bearer ${route.key}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ model: route.model, state, questions }),
+        body: jevBody({ model: route.model, state, questions }),
       })
       .catch(() => null)
   let res = await call()
@@ -1950,7 +1951,7 @@ async function ping($: EngineInterface) {
     const res = await $.http.fetch(route.url, {
       method: 'POST',
       headers: { authorization: `Bearer ${route.key}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ model: route.model, state: { ping: true }, questions: { ok: { type: 'noul', instructions: 'Is this a connectivity check?', criteria: { true: 'yes', false: 'no' } } } }),
+      body: jevBody({ model: route.model, state: { ping: true }, questions: { ok: { type: 'noul', instructions: 'Is this a connectivity check?', criteria: { true: 'yes', false: 'no' } } } }),
     })
     const ms = (await $.clock.now()) - at
     await update($, beat, () => ({ ok: res.ok, ms, at, detail: res.ok ? undefined : `HTTP ${res.status}` }))
