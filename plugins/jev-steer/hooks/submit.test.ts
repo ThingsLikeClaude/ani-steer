@@ -104,3 +104,47 @@ test("an app's notice in the person's turn is not recorded", async ($, on) => {
   const { cases } = await sendAsPerson($, on, '<system-reminder>The user started your suggested background task.</system-reminder>')
   expect(cases).toMatch(/사례 0/)
 })
+
+const rule = (n: number, lesson: string) => ({ id: `J-r${n}`, ts: n, text: lesson, kind: 'intent', scope: 'global', project: '', source: 'jev', keywords: [], count: 3, isRule: true, lesson })
+
+test('Jev weighs rules too: only those bearing on the request ride, three at most; principles always ride', async ($, on) => {
+  const commitRules = [1, 2, 3, 4, 5].map(n => rule(n, `커밋 규칙 ${n}번: 메시지는 한국어로`))
+  mock.store(on, {
+    cards: [...commitRules, rule(6, '배포 주소는 직접 열어 보고 넘긴다')],
+    principles: [{ id: 'P-1', text: '사용자가 정한 범위를 넘지 않는다', from: [], status: 'active', ts: 1 }],
+  })
+  mock.clock(on)
+  mock.env(on, { TYPESAFE_API_KEY: 'test-key', HOME: '/tmp' })
+  // Jev: a rule bears on this request when it is about commits.
+  on('http.fetch', ($, e) => {
+    const body = JSON.parse(String((e as { init?: { body?: string } }).init?.body)) as { questions: Record<string, { instructions?: string }> }
+    const answers = Object.fromEntries(Object.entries(body.questions).map(([k, q]) => [k, { noul: /_same$/.test(k) ? (q.instructions?.includes('커밋') ? 0.9 : 0.1) : /_flip$/.test(k) ? 0.05 : 0.05 }]))
+    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ answers }) } } as never
+  })
+  on('ui.toast', () => ({ value: undefined }) as never)
+  let context: readonly string[] | undefined
+  on('prompt.submit', ($, e) => {
+    context = e.context
+    return { text: e.text } as never
+  })
+  await $.prompt.submit({ text: '지금까지 바꾼 거 커밋해줘' } as never)
+  const sent = (context ?? []).join('\n')
+  expect(sent.match(/커밋 규칙/g)?.length).toBe(3)
+  expect(sent).not.toContain('배포 주소는 직접 열어')
+  expect(sent).not.toContain('Rules (always)')
+  expect(sent).toContain('사용자가 정한 범위를 넘지 않는다')
+})
+
+test('a rule that does not bear on the request stays home', async ($, on) => {
+  mock.store(on, { cards: [rule(1, '배포 주소는 직접 열어 보고 넘긴다')] })
+  mock.clock(on)
+  mock.env(on, { TYPESAFE_API_KEY: 'test-key', HOME: '/tmp' })
+  jev(on, { is_correction: { noul: 0.05 }, has_requirement: { noul: 0.1 }, c0_same: { noul: 0.1 } })
+  let context: readonly string[] | undefined = ['unset']
+  on('prompt.submit', ($, e) => {
+    context = e.context
+    return { text: e.text } as never
+  })
+  await $.prompt.submit({ text: 'README 오타 고쳐줘' } as never)
+  expect(context ?? []).toEqual([])
+})
