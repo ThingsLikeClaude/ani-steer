@@ -157,6 +157,127 @@ export function aniCase(p: AniPattern, at: number, cardId: string, summary?: str
   }
 }
 
+/** One note of Claude Code's auto memory (`<config>/projects/<slug>/memory/*.md`). */
+export type MemoryNote = {
+  name: string
+  description: string
+  /** `feedback`, `user`, `project` or `reference`. */
+  type: string
+  /** The fact: the body before its **Why:** and **How to apply:** parts. */
+  body: string
+  why?: string
+  how?: string
+}
+
+/** A YAML scalar as written: quotes removed only when they enclose the whole value. */
+function unquoteYaml(v: string): string {
+  const s = v.trim()
+  if (/^"(?:[^"\\]|\\.)*"$/s.test(s)) {
+    try {
+      return String(JSON.parse(s.replace(/\n/g, ' ')))
+    } catch {
+      return s.slice(1, -1).replace(/\\(.)/g, '$1')
+    }
+  }
+  if (/^'(?:[^']|'')*'$/s.test(s)) return s.slice(1, -1).replace(/''/g, "'")
+  return s
+}
+
+/** A quoted scalar whose closing quote is still to come on a later line. */
+function isOpenQuote(v: string): boolean {
+  if (v.startsWith('"')) return !/^"(?:[^"\\]|\\.)*"/s.test(v)
+  if (v.startsWith("'")) return !/^'(?:[^']|'')*'(?!')/s.test(v)
+  return false
+}
+
+/**
+ * Frontmatter as flat keys: `type: x` is `type`, `type: x` under `metadata:` is
+ * `metadata.type`. Values may be quoted, continue on indented lines, span lines
+ * inside quotes, or be `|` / `>` blocks.
+ */
+function frontmatterOf(text: string): Record<string, string> {
+  type Value = { key: string; parts: string[]; style: 'plain' | 'quoted' | 'literal' | 'folded' }
+  const out: Record<string, string> = {}
+  const KEY = /^[ \t]*([A-Za-z_][\w-]*):(?:[ \t]+(.*?))?[ \t]*$/
+  const start = (key: string, value: string): Value =>
+    /^[|>][-+]?$/.test(value)
+      ? { key, parts: [], style: value.startsWith('|') ? 'literal' : 'folded' }
+      : { key, parts: value ? [value] : [], style: isOpenQuote(value) ? 'quoted' : 'plain' }
+  let cur: Value | null = null
+  let curIndent = 0
+  // The top-level key with no value of its own: indented `key: value` lines under it are its children.
+  let parent = ''
+  let childIndent = -1
+  const close = () => {
+    if (!cur) return
+    const v = cur.style === 'literal' ? cur.parts.join('\n').trim() : cur.parts.join(' ').replace(/\s+/g, ' ').trim()
+    out[cur.key] = cur.style === 'plain' || cur.style === 'quoted' ? unquoteYaml(v) : v
+    cur = null
+  }
+  for (const line of text.split('\n')) {
+    const kv = line.match(KEY)
+    const indent = (line.match(/^[ \t]*/) as RegExpMatchArray)[0].length
+    if (cur?.style === 'quoted' && !(kv && indent === 0)) {
+      cur.parts.push(line.trim())
+      if (!isOpenQuote(cur.parts.join(' '))) close()
+      continue
+    }
+    if (!line.trim()) {
+      if (cur?.style === 'literal' || cur?.style === 'folded') cur.parts.push('')
+      continue
+    }
+    if (kv && indent === 0) {
+      close()
+      parent = kv[2] ? '' : (kv[1] as string)
+      childIndent = -1
+      cur = start(kv[1] as string, kv[2] ?? '')
+      curIndent = 0
+      continue
+    }
+    if (cur && cur.key !== parent && indent > curIndent) {
+      cur.parts.push(cur.style === 'literal' || cur.style === 'folded' ? line.replace(/^[ \t]+/, '') : line.trim())
+      continue
+    }
+    if (parent && kv && (childIndent < 0 || indent === childIndent)) {
+      close()
+      childIndent = curIndent = indent
+      cur = start(`${parent}.${kv[1]}`, kv[2] ?? '')
+      continue
+    }
+    if (cur && cur.key === parent && childIndent < 0) cur.parts.push(line.trim())
+  }
+  close()
+  return out
+}
+
+const MEMORY_MARK = /\*\*(?:Why|How to apply)(?::\*\*|\*\*:)/i
+
+/** The text after a **Why:** or **How to apply:** mark, up to the next mark, heading or paragraph. */
+function memorySection(body: string, mark: RegExp): string | undefined {
+  const m = mark.exec(body)
+  if (!m) return undefined
+  const rest = body.slice(m.index + m[0].length).replace(/^\s+/, '')
+  const end = rest.search(/\*\*(?:Why|How to apply)(?::\*\*|\*\*:)|\n#{1,6} |\n[ \t]*\n(?![ \t]*(?:[-*+]|\d+\.)[ \t])/i)
+  return (end < 0 ? rest : rest.slice(0, end)).trim() || undefined
+}
+
+/** A memory note: its frontmatter, flat or nested under `metadata:`, and its body. Null when it has no frontmatter. */
+export function parseMemoryNote(markdown: string): MemoryNote | null {
+  const m = markdown.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').match(/^---[ \t]*\n(?:([\s\S]*?)\n)?---[ \t]*(?:\n([\s\S]*))?$/)
+  if (!m) return null
+  const fm = frontmatterOf(m[1] ?? '')
+  const body = (m[2] ?? '').trim()
+  const at = body.search(MEMORY_MARK)
+  return {
+    name: fm.name ?? '',
+    description: fm.description ?? '',
+    type: (fm.type || fm['metadata.type'] || '').toLowerCase(),
+    body: (at < 0 ? body : body.slice(0, at)).trim(),
+    why: memorySection(body, /\*\*Why(?::\*\*|\*\*:)/i),
+    how: memorySection(body, /\*\*How to apply(?::\*\*|\*\*:)/i),
+  }
+}
+
 /** Narrowest scope first: team → personal-project → global; same id keeps the narrowest. */
 export function pickCandidates(prompt: string, cards: readonly Card[], project: string): Card[] {
   const order: Record<Scope, number> = { 'team-project': 0, 'personal-project': 1, global: 2 }

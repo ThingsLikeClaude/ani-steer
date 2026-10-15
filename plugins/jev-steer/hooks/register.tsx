@@ -20,6 +20,7 @@ import {
   isLatin,
   parseAniPattern,
   parseIndex,
+  parseMemoryNote,
   pickCandidates,
   placeIn,
   projectName,
@@ -29,6 +30,7 @@ import {
   tokenize,
   type AniPattern,
   type Answers,
+  type MemoryNote,
 } from './core'
 import { contextOf, isPersonOrigin, isScriptedEntry, lineSplitter, pastPromptReader, personText } from './history'
 import type { PastPrompt } from './history'
@@ -335,6 +337,142 @@ async function koreanizeAni($: EngineInterface) {
   }
 }
 
+/**
+ * Corrections the person approved earlier, kept in Claude Code's auto memory
+ * (`<config>/projects/<slug>/memory/*.md`, type `feedback`), join the lessons in
+ * Korean. Each note comes in once; one the person forgets here is not brought
+ * back, and one the small model could not word is tried again next session.
+ * The files are left as they are.
+ */
+let isImportingMemory = false
+/** Notes worded per session start: one small-model call each. */
+const MEMORY_PER_START = 12
+
+async function importMemory($: EngineInterface) {
+  if (isImportingMemory) return
+  isImportingMemory = true
+  try {
+    await bringInMemory($)
+  } finally {
+    isImportingMemory = false
+  }
+}
+
+const memoryId = (slug: string, name: string) => `M-${slug}-${name.trim()}`.replace(/[^\p{L}\p{N}_.-]+/gu, '-')
+
+async function bringInMemory($: EngineInterface) {
+  const homeDir = home || ((await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE')) ?? '')
+  const base = `${(await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${homeDir}/.claude`}/projects`
+  const done = new Set(((await $.store.get('memoryImported')) as string[] | undefined) ?? [])
+  const have = new Set((await ownCards($)).map(c => c.id))
+  const todo: { slug: string; id: string; note: MemoryNote; ts: number }[] = []
+  for (const d of await $.fs.list(base).catch(() => [])) {
+    if (todo.length >= MEMORY_PER_START) break
+    if (d.kind !== 'dir') continue
+    for (const f of await $.fs.list(`${base}/${d.name}/memory`).catch(() => [])) {
+      if (todo.length >= MEMORY_PER_START) break
+      if (f.kind !== 'file' || !/\.md$/i.test(f.name) || f.name === 'MEMORY.md') continue
+      const note = parseMemoryNote(String(await $.fs.read(`${base}/${d.name}/memory/${f.name}`).catch(() => '')))
+      if (note?.type !== 'feedback') continue
+      const id = memoryId(d.name, note.name || f.name.replace(/\.md$/i, ''))
+      if (!done.has(id) && !have.has(id) && !todo.some(t => t.id === id)) todo.push({ slug: d.name, id, note, ts: f.mtimeMs })
+    }
+  }
+  const places = new Map<string, Pick<Card, 'scope' | 'project'>>()
+  const slugs = new Map<string, string>()
+  let isShortMissing = false
+  for (const t of todo) {
+    if (!places.has(t.slug)) places.set(t.slug, await memoryPlace($, `${base}/${t.slug}`, t.slug, homeDir, slugs))
+    const worded = await wordMemory($, t.note)
+    if (!worded) continue
+    const card: Card = {
+      id: t.id,
+      ts: t.ts,
+      // Claude's note is not the person's words, and often English: the card shows the lesson in their place.
+      text: worded.lesson,
+      kind: 'intent',
+      ...(places.get(t.slug) as Pick<Card, 'scope' | 'project'>),
+      source: 'memory',
+      keywords: [...new Set([...tokenize(`${worded.lesson} ${worded.intent ?? ''}`), ...tokenize(t.note.description)])].slice(0, 8),
+      count: 1,
+      ...worded,
+    }
+    await save($, 'cards', [...(await ownCards($)).filter(c => c.id !== card.id), card])
+    done.add(t.id)
+    await save($, 'memoryImported', [...done])
+    if (!card.short) isShortMissing = true
+  }
+  if (isShortMissing) $.clock.after(0, () => shorten($))
+}
+
+/**
+ * Where a memory folder's notes were said: the folder its newest transcript ran
+ * in, named as cases are. The home folder means every project.
+ */
+async function memoryPlace($: EngineInterface, dir: string, slug: string, homeDir: string, slugs: Map<string, string>): Promise<Pick<Card, 'scope' | 'project'>> {
+  const transcripts = (await $.fs.list(dir).catch(() => [])).filter(f => f.kind === 'file' && f.name.endsWith('.jsonl')).sort((a, b) => b.mtimeMs - a.mtimeMs)
+  for (const f of transcripts.slice(0, 3)) {
+    const cwd = await cwdOf($, `${dir}/${f.name}`, f.size)
+    if (cwd) return { scope: isSamePath(cwd, homeDir) ? 'global' : 'personal-project', project: await projectOf($, cwd, slugs) }
+  }
+  return { scope: 'personal-project', project: slug }
+}
+
+/** The first `cwd` a transcript records; empty when it records none or cannot be read. */
+async function cwdOf($: EngineInterface, path: string, size: number): Promise<string> {
+  try {
+    for await (const line of transcriptLines($, path, size)) {
+      if (!line.includes('"cwd"')) continue
+      try {
+        const cwd = (JSON.parse(line) as { cwd?: unknown }).cwd
+        if (typeof cwd === 'string' && cwd) return cwd
+      } catch {
+        // a line cut short: read on
+      }
+    }
+  } catch {
+    // unreadable: no folder
+  }
+  return ''
+}
+
+/** The small model words one memory note as a lesson, all in Korean; null when it could not. */
+async function wordMemory($: EngineInterface, note: MemoryNote): Promise<Pick<Card, 'intent' | 'why' | 'lesson' | 'short'> | null> {
+  const r = await $.model
+    .complete({
+      model: 'haiku',
+      maxTokens: 400,
+      timeoutMs: 20000,
+      system:
+        'You turn a note a coding agent saved about a correction its user made into a lesson the agent keeps. The note may be in English; the lesson is not. ' +
+        'Reply with JSON only: {"intent": "...", "why": "...", "lesson": "...", "short": "..."}, all in Korean, each one complete short sentence. ' +
+        'intent: what the user actually wanted (≤ 30자). ' +
+        'why: why the agent got it wrong — the misreading, not just the action (≤ 40자). ' +
+        'lesson: what to do next time in that situation, as a rule starting with the situation (≤ 40자). Keep the tools, files and names the note gives. ' +
+        'short: the same lesson re-said in ≤ 20자 so it fits one short line whole — keep the key object and action, drop the rest.',
+      prompt: [
+        `Note summary:\n${note.description || note.name}`,
+        note.body && `Note:\n${note.body.slice(0, 1500)}`,
+        note.why && `Why:\n${note.why.slice(0, 600)}`,
+        note.how && `How to apply:\n${note.how.slice(0, 600)}`,
+      ]
+        .filter(Boolean)
+        .join('\n\n'),
+    })
+    .catch(() => null)
+  if (!r?.isAnswered) return null
+  try {
+    const t = JSON.parse(r.text.match(/\{[\s\S]*\}/)?.[0] ?? '') as { intent?: string; why?: string; lesson?: string; short?: string }
+    const korean = (s?: string) => (typeof s === 'string' && /[가-힣]/.test(s) ? s.trim() : undefined)
+    const lesson = korean(t.lesson)
+    if (!lesson) return null
+    const short = korean(t.short)
+    return { intent: korean(t.intent), why: korean(t.why), lesson, short: short && [...short].length <= SHORT_MAX ? short : undefined }
+  } catch {
+    return null
+  }
+}
+
 async function editCard($: EngineInterface, id: string, change: Partial<Card> | null) {
   const own = await ownCards($)
   const next = change === null ? own.filter(c => c.id !== id) : own.map(c => (c.id === id ? { ...c, ...change } : c))
@@ -422,7 +560,7 @@ async function remember($: EngineInterface, prompt: string, answers: Answers, ca
 const PATTERN_RULE = '에이전트가 고쳐야 할 작업 습관을 이 사례보다 한 단계 일반화해서 30자 이내 한 문장으로 쓰세요. 특정 화면·파일·값·도구 이름은 빼고 일의 종류와 습관만 남길 것. 예: "지정된 범위를 넓혀서 해석함", "확인하지 않고 완료라고 보고함", "보여 줄 것을 사용자에게 실행시킴".'
 
 /** Where a lesson came from when it was not made here from a correction. */
-const SOURCE_LABEL: Partial<Record<Card['source'], string>> = { ani: '옛 ani 기록에서' }
+const SOURCE_LABEL: Partial<Record<Card['source'], string>> = { ani: '옛 ani 기록에서', memory: 'Claude 메모리에서' }
 
 const CANDIDATE_AT = 0.7
 /** How many lessons, lesson candidates and waiting cases one new case is weighed against. */
@@ -1734,6 +1872,7 @@ export const register: Register = on => {
       await koreanizeAni($)
       await regroupCases($)
     })
+    $.clock.after(0, () => importMemory($))
     $.clock.after(0, () => settleReqs($))
     // Feedback logged before the walk-back existed gets its context now.
     $.clock.after(0, async () => {

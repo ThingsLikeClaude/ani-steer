@@ -13,7 +13,7 @@ export type Card = {
   kind: Kind
   scope: Scope
   project: string
-  source: 'jev' | 'ani'
+  source: 'jev' | 'ani' | 'memory'
   keywords: string[]
   isMuted?: boolean
   /** What the user meant. ani's Intent. */
