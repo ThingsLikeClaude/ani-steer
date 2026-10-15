@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 import { isConcreteRequirement } from './register'
 
 import type { Card, Requirement } from '../types'
-import { aniCard, appliesTo, buildQuestions, indexSummaries, isSamePath, isUndecided, judge, parseAniPattern, parseIndex, pickCandidates, placeIn, projectName, sameProject, scopeOf, slugOf, verdictOf } from './core'
+import { aniCard, appliesTo, buildQuestions, indexSummaries, isSamePath, isUndecided, judge, parseAniPattern, parseIndex, parseMemoryNote, pickCandidates, placeIn, projectName, sameProject, scopeOf, slugOf, verdictOf } from './core'
 
 const card = (over: Partial<Card>): Card => ({
   id: 'J-1',
@@ -173,4 +173,86 @@ test('one project recorded as owner/repo, folder name or Windows path is one pro
   expect(sameProject('D:\\00_PROJECTS\\sta_ai_seminar_v2', 'ThingsLikeClaude/sta_ai_seminar_v2')).toBe(true)
   expect(sameProject('me/site', 'me/other')).toBe(false)
   expect(sameProject(undefined, 'me/site')).toBe(false)
+})
+
+test('memory notes: flat frontmatter with CRLF; the fact, why and how are read apart', async () => {
+  const md = [
+    '---',
+    'name: selective-revert-only',
+    'description: When reverting changes, NEVER use git checkout on entire files.',
+    'type: feedback',
+    'metadata:',
+    '  managed_by: memory-layer',
+    '',
+    '---',
+    '',
+    '파일에 미커밋 작업이 있을 때 전체를 되돌리면 안 됨.',
+    '',
+    '**Why:** 사용자의 기존 작업이 소실됨.',
+    '',
+    '**How to apply:**',
+    '- 먼저 `git diff`로 확인',
+    '- 내 변경만 Edit로 제거',
+    '',
+    '## 추가',
+    '다른 이야기',
+  ].join('\r\n')
+  const n = parseMemoryNote(md)
+  expect(n?.name).toBe('selective-revert-only')
+  expect(n?.description).toBe('When reverting changes, NEVER use git checkout on entire files.')
+  expect(n?.type).toBe('feedback')
+  expect(n?.body).toBe('파일에 미커밋 작업이 있을 때 전체를 되돌리면 안 됨.')
+  expect(n?.why).toBe('사용자의 기존 작업이 소실됨.')
+  expect(n?.how).toBe('- 먼저 `git diff`로 확인\n- 내 변경만 Edit로 제거')
+})
+
+test('memory notes: type nested under metadata; quoted values lose only enclosing quotes', async () => {
+  const n = parseMemoryNote([
+    '---',
+    'name: light-must-spill',
+    'description: "AI 이미지에서 \\"빛\\"이 페인트로 보이는 원인"',
+    'metadata: ',
+    '  node_type: memory',
+    '  type: feedback',
+    "  note: 'it''s quoted'",
+    '---',
+    'Light must spill.',
+    '**Why**: glow was banned.',
+    '**How to apply**: ask what the light falls on.',
+  ].join('\n'))
+  expect(n?.description).toBe('AI 이미지에서 "빛"이 페인트로 보이는 원인')
+  expect(n?.type).toBe('feedback')
+  expect(n?.body).toBe('Light must spill.')
+  expect(n?.why).toBe('glow was banned.')
+  expect(n?.how).toBe('ask what the light falls on.')
+  expect(parseMemoryNote("---\nname: 'it''s'\ntype: feedback\n---\n")?.name).toBe("it's")
+  // Only starting with a quote, it is kept as written.
+  expect(parseMemoryNote('---\ndescription: "제목+불릿4줄" 패턴 반복 금지\ntype: feedback\n---\n')?.description).toBe('"제목+불릿4줄" 패턴 반복 금지')
+})
+
+test('memory notes: values that run over several lines', async () => {
+  const n = parseMemoryNote([
+    '---',
+    'name: >-',
+    '  folded',
+    '  name',
+    'description: "a quoted value',
+    '  that ends later"',
+    'summary: a plain value',
+    '  continued: with a colon',
+    'metadata:',
+    '  why: |',
+    '    line one',
+    '    line two',
+    '  type: project',
+    '---',
+  ].join('\n'))
+  expect(n?.name).toBe('folded name')
+  expect(n?.description).toBe('a quoted value that ends later')
+  expect(n?.type).toBe('project')
+  expect(n?.body).toBe('')
+  expect(n?.why).toBeUndefined()
+  expect(parseMemoryNote('---\ndescription:\n  starts on\n  the next line\n---\n')?.description).toBe('starts on the next line')
+  expect(parseMemoryNote('no frontmatter')).toBeNull()
+  expect(parseMemoryNote('---\n---\nonly a body')?.body).toBe('only a body')
 })
