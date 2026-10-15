@@ -23,6 +23,14 @@ const GAP = 4
  * Advance width at 11px in the system UI font, per character class. Erring
  * small keeps the pill tight; the text is centred, so any error splits evenly.
  */
+/** Text cut to a width at a font size, ending in "…" when it was cut. */
+export function fitText(t: string, sz: number, room: number): string {
+  if (textWidth(t) * (sz / 11) <= room) return t
+  let c = t
+  while (c.length > 1 && textWidth(c + '…') * (sz / 11) > room) c = c.slice(0, -1)
+  return c + '…'
+}
+
 export function textWidth(text: string): number {
   let w = 0
   for (const ch of text) {
@@ -369,12 +377,7 @@ export function leadStripSvg(
   const invW = inventory ? textWidth(inventory) * (12 / 11) : 0
   const right = width - 8
   const room = right - (inventory ? invW + 24 : 0) - x0
-  const fit = (t: string, sz: number, r: number) => {
-    if (textWidth(t) * (sz / 11) <= r) return t
-    let c = t
-    while (c.length > 1 && textWidth(c + '…') * (sz / 11) > r) c = c.slice(0, -1)
-    return c + '…'
-  }
+  const fit = fitText
   const two = isTwoLines && Boolean(lead.quote)
   const top = 10
   // Nothing is cut: a lesson that does not fit wraps inside its block.
@@ -751,16 +754,27 @@ export type CardRow = {
  * the title, a scope cell, a status pill), detail lines only where given.
  * Titles wrap instead of being cut.
  */
+/** How much wider than measured a short name may draw. */
+const SCOPE_SLACK = 1.15
+
 export function listCardSvg(width: number, rows: readonly CardRow[], tone?: string): { source: string; width: number; height: number } {
   const padX = 16
   const padY = 8
   const size = 13.5
   const lineH = 20
   const pillRight = width - padX
-  const pillW = 64
-  const scopeX = pillRight - pillW - 92
+  const pillWOf = (r: CardRow) => (r.pill ? textWidth(r.pill.text) * (11.5 / 11) + 18 : 0)
+  const pillCol = Math.max(0, ...rows.map(pillWOf))
+  // The project or scope column: as wide as its longest name needs, up to a
+  // fifth of the card; a longer name ends in "…" before the pill, never under it.
+  // Names are measured a little wide: latin letters vary more than the table says.
+  const scopeSize = 12
+  const scopeMax = Math.min(160, Math.round(width * 0.2))
+  const scopeCol = Math.ceil(Math.min(scopeMax, Math.max(0, ...rows.map(r => (r.scope ? textWidth(r.scope) * (scopeSize / 11) * SCOPE_SLACK : 0)))))
+  const scopeRight = pillRight - (pillCol ? pillCol + 12 : 0)
+  const scopeX = scopeRight - scopeCol
   const textX = padX + (rows.some(r => r.badge) ? 40 : 16)
-  const textW = scopeX - textX - 16
+  const textW = (scopeCol ? scopeX - 16 : scopeRight - 12) - textX
   const parts: string[] = [THEME]
   const defs: string[] = []
   let y = padY
@@ -785,7 +799,7 @@ export function listCardSvg(width: number, rows: readonly CardRow[], tone?: stri
     lines.forEach((l, k) =>
       parts.push(`<text x="${textX}" y="${cy - ((lines.length - 1) * lineH) / 2 + k * lineH}" dominant-baseline="central" font-family="${FONT}" font-size="${size}" font-weight="${r.tone ? 700 : isStrong ? 600 : 400}" ${fill}${r.isMuted ? ' text-decoration="line-through"' : ''}>${escapeXml(l)}</text>`),
     )
-    if (r.scope) parts.push(`<text x="${scopeX}" y="${cy}" dominant-baseline="central" font-family="${FONT}" font-size="12" class="t3">${escapeXml(r.scope)}</text>`)
+    if (r.scope) parts.push(`<text x="${scopeX}" y="${cy}" dominant-baseline="central" font-family="${FONT}" font-size="${scopeSize}" class="t3">${escapeXml(fitText(r.scope, scopeSize, scopeCol / SCOPE_SLACK))}</text>`)
     if (r.pill) {
       const pw = textWidth(r.pill.text) * (11.5 / 11) + 18
       if (r.pill.color) parts.push(`<rect x="${pillRight - pw}" y="${cy - 11}" width="${pw}" height="22" rx="11" fill="${r.pill.color}" fill-opacity="0.24"/>`)

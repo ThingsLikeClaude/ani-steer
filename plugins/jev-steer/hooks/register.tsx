@@ -80,6 +80,8 @@ const expandedSections = atom({ plugin: 'jev-steer', key: 'expandedSections' } a
 const pinned = atom({ plugin: 'jev-steer', key: 'pinned' } as const, [] as string[])
 const keyLater = atom({ plugin: 'jev-steer', key: 'keyLater' } as const, false)
 const hasKey = atom({ plugin: 'jev-steer', key: 'hasKey' } as const, true)
+/** Rows between one card-with-buttons and the next: twice the gap between a card and its own buttons. */
+const ITEM_GAP = 2
 /** How many rows a long list in the panel shows before "더 보기". */
 const listLimit = atom({ plugin: 'jev-steer', key: 'listLimit' } as const, 30)
 
@@ -1884,11 +1886,17 @@ export const register: Register = on => {
         const sv = listCardSvg(paneW, rows, tone)
         return <Svg key={key} source={sv.source} width={sv.width} height={sv.height} alt={rows.map(r => r.title).join('. ')} />
       }
-      const manageRow = (c: Card, isOn: boolean) => (
-        <Box key={`m-${c.id}`} flexDirection="column" marginTop={1}>
-          {cardOf(`mc-${c.id}`, [cardRow(c, isOn)])}
-          <Box flexDirection="row" gap={1} marginTop={1}>
-            {isBorrowed(c) ? [
+      // One card with its buttons, kept together: the buttons sit just under their own card and
+      // the next card starts a clear step below, so no button reads as the next card's.
+      const itemOf = (key: string, card: JSX.Element, buttons: JSX.Element[]) => (
+        <Box key={key} flexDirection="column" marginTop={ITEM_GAP}>
+          {card}
+          <Box flexDirection="row" gap={1} marginTop={1}>{buttons}</Box>
+        </Box>
+      )
+      const manageRow = (c: Card, isOn: boolean) =>
+        itemOf(`m-${c.id}`, cardOf(`mc-${c.id}`, [cardRow(c, isOn)]),
+            isBorrowed(c) ? [
               // Scope, mute and forget would change it in the project it came from.
               <Button key={`dt-${c.id}`} variant="secondary" label="여기서 떼기" onPress={() => placeCard($, c.id, false)} />,
             ] : [
@@ -1896,10 +1904,7 @@ export const register: Register = on => {
               <Button key={`to-gl-${c.id}`} variant={!c.isMuted && c.scope === 'global' ? 'primary' : 'secondary'} label="모든 프로젝트" onPress={() => editCard($, c.id, { isMuted: false, scope: 'global' })} />,
               <Button key={`mute-${c.id}`} variant={c.isMuted ? 'primary' : 'secondary'} label={c.isMuted ? '켜기' : '끄기'} onPress={() => editCard($, c.id, { isMuted: !c.isMuted })} />,
               <Button key={`rm-${c.id}`} variant="secondary" label="잊기" onPress={() => editCard($, c.id, null)} />,
-            ]}
-          </Box>
-        </Box>
-      )
+            ])
       // Another project's lessons, rules or requirements: tagged with the project
       // they come from; the person attaches each one here, or says not here.
       type Other = { id: string; title: string; from?: string; badge?: CardRow['badge']; sub?: CardRow['sub'] }
@@ -1908,15 +1913,12 @@ export const register: Register = on => {
           ? [
               labelRow(`s-${key}-new`, `다른 프로젝트의 ${what} · 여기에도 붙일까요`, undecided.length),
               ...(isOpen(`s-${key}-new`)
-                ? undecided.flatMap(o => [
-                    cardOf(`on-${o.id}`, [{ dot: STATE_COLOR.quiet, badge: o.badge, title: o.title, scope: projectName(o.from), pill: { text: '다른 프로젝트', color: STATE_COLOR.ask }, sub: o.sub }], STATE_COLOR.ask),
-                    <Box key={`ob-${o.id}`} flexDirection="row" gap={1} marginTop={1}>
-                      {[
-                        <Button key={`at-${o.id}`} variant="primary" label="여기에도 붙이기" onPress={() => place(o.id, true)} />,
-                        <Button key={`sk-${o.id}`} variant="secondary" label="안 붙임" onPress={() => place(o.id, false)} />,
-                      ]}
-                    </Box>,
-                  ])
+                ? undecided.map(o =>
+                    itemOf(`ob-${o.id}`, cardOf(`on-${o.id}`, [{ dot: STATE_COLOR.quiet, badge: o.badge, title: o.title, scope: projectName(o.from), pill: { text: '다른 프로젝트', color: STATE_COLOR.ask }, sub: o.sub }], STATE_COLOR.ask), [
+                      <Button key={`at-${o.id}`} variant="primary" label="여기에도 붙이기" onPress={() => place(o.id, true)} />,
+                      <Button key={`sk-${o.id}`} variant="secondary" label="안 붙임" onPress={() => place(o.id, false)} />,
+                    ]),
+                  )
                 : []),
             ]
           : []),
@@ -1924,10 +1926,11 @@ export const register: Register = on => {
           ? [
               labelRow(`s-${key}-skip`, `여기엔 안 붙인 ${what}`, skipped.length, true),
               ...(!isOpen(`s-${key}-skip`)
-                ? skipped.flatMap(o => [
-                    cardOf(`os-${o.id}`, [{ dot: STATE_COLOR.quiet, title: o.title, scope: projectName(o.from), pill: { text: '안 붙임' }, isMuted: true }]),
-                    <Box key={`osb-${o.id}`} flexDirection="row" marginTop={1}>{[<Button key={`at-${o.id}`} variant="secondary" label="다시 붙이기" onPress={() => place(o.id, true)} />]}</Box>,
-                  ])
+                ? skipped.map(o =>
+                    itemOf(`osb-${o.id}`, cardOf(`os-${o.id}`, [{ dot: STATE_COLOR.quiet, title: o.title, scope: projectName(o.from), pill: { text: '안 붙임' }, isMuted: true }]), [
+                      <Button key={`at-${o.id}`} variant="secondary" label="다시 붙이기" onPress={() => place(o.id, true)} />,
+                    ]),
+                  )
                 : []),
             ]
           : []),
@@ -2026,7 +2029,7 @@ export const register: Register = on => {
               ? [
                   labelRow('s-pv-pr', '미리 본 원칙', ps.length),
                   ...ps.map((p, i) => (
-                    <Box key={`pvp-${i}`} flexDirection="column" marginTop={1}>
+                    <Box key={`pvp-${i}`} flexDirection="column" marginTop={ITEM_GAP}>
                       {cardOf(`pvpc-${i}`, [{ dot: '#8a8a8a', title: p.text, pill: { text: `미리 보기 · ${Math.round(p.fit * 100)}%`, color: STATE_COLOR.weigh }, sub: own.filter(c => p.from.includes(c.id)).map(c => ({ label: '교훈', value: c.lesson ?? c.text })) }])}
                       <Box flexDirection="row" marginTop={1}>{[<Button key={`pvk-${i}`} variant="secondary" label="원칙으로 확정" onPress={() => keepPreviewPrinciple($, i)} />]}</Box>
                     </Box>
@@ -2037,7 +2040,7 @@ export const register: Register = on => {
               ? [
                   labelRow('s-pv-nd', '미리 본 근원 욕구', preview.needs.length),
                   ...preview.needs.map((nd, i) => (
-                    <Box key={`pvn-${i}`} flexDirection="column" marginTop={1}>
+                    <Box key={`pvn-${i}`} flexDirection="column" marginTop={ITEM_GAP}>
                       {cardOf(`pvnc-${i}`, [{ dot: '#8a8a8a', title: nd.text, pill: { text: '가설', color: STATE_COLOR.weigh }, sub: nd.from.map(k => ps[k - 1]).filter(Boolean).map(p => ({ label: '원칙', value: p.text })) }])}
                       <Box flexDirection="row" marginTop={1}>{[<Button key={`pvnk-${i}`} variant="secondary" label="이걸로 확정" onPress={() => keepPreviewNeed($, i)} />]}</Box>
                     </Box>
@@ -2055,7 +2058,7 @@ export const register: Register = on => {
           labelRow('s-pr', '원칙', shownPs.length),
           ...(isOpen('s-pr')
             ? shownPs.map(p => (
-                <Box key={`pr-${p.id}`} flexDirection="column" marginTop={1}>
+                <Box key={`pr-${p.id}`} flexDirection="column" marginTop={ITEM_GAP}>
                   {cardOf(`prc-${p.id}`, [{
                     dot: '#8a8a8a',
                     title: p.text,
@@ -2096,7 +2099,7 @@ export const register: Register = on => {
             ? [
                 labelRow('s-hy', '가설', hyps.length),
                 ...hyps.map(n => (
-                  <Box key={`hy-${n.id}`} flexDirection="column" marginTop={1}>
+                  <Box key={`hy-${n.id}`} flexDirection="column" marginTop={ITEM_GAP}>
                     {cardOf(`hyc-${n.id}`, [{ dot: '#8a8a8a', title: n.text, pill: { text: '가설', color: STATE_COLOR.weigh }, sub: pText(n.from) }])}
                     <Box flexDirection="row" gap={1} marginTop={1}>
                       {[
@@ -2180,7 +2183,7 @@ export const register: Register = on => {
               ...(isOpen('s-reqs')
                 ? isManaging
                   ? reqs.map(rq => (
-                      <Box key={`mrq-${rq.id}`} flexDirection="column" marginTop={1}>
+                      <Box key={`mrq-${rq.id}`} flexDirection="column" marginTop={ITEM_GAP}>
                         {cardOf(`mrqc-${rq.id}`, [reqRow(rq)])}
                         <Box flexDirection="row" marginTop={1}>
                           {[
@@ -2203,24 +2206,20 @@ export const register: Register = on => {
               labelRow('s-cand', '교훈 후보 · 같은 판단이 2번 이상', openCands.length),
               ...(isOpen('s-cand')
                 ? [
-                    ...openCands.slice(0, limit).flatMap(c => {
+                    ...openCands.slice(0, limit).map(c => {
                       const cs = allCases.filter(f => c.cases.includes(f.at))
                       const names = [...new Set(cs.map(f => projectName(f.project)))]
-                      return [
+                      return itemOf(`cand-b-${c.id}`,
                         cardOf(`cand-${c.id}`, [{
                           dot: STATE_COLOR.weigh,
                           title: c.lesson ?? cs.find(f => f.judgment)?.judgment ?? '교훈 문장을 정리하는 중',
                           scope: names.length > 1 ? `${names[0]} 외 ${names.length - 1}곳` : names[0],
                           pill: { text: `사례 ${cs.length}`, color: STATE_COLOR.weigh },
                           sub: cs.slice(0, 3).map(f => ({ label: '사례', value: f.said ?? f.text })),
-                        }], STATE_COLOR.weigh),
-                        <Box key={`cand-b-${c.id}`} flexDirection="row" gap={1} marginTop={1}>
-                          {[
-                            <Button key={`ca-${c.id}`} variant="primary" label="교훈으로" onPress={() => acceptCandidate($, c.id)} />,
-                            <Button key={`cd-${c.id}`} variant="secondary" label="아님" onPress={() => declineCandidate($, c.id)} />,
-                          ]}
-                        </Box>,
-                      ]
+                        }], STATE_COLOR.weigh), [
+                          <Button key={`ca-${c.id}`} variant="primary" label="교훈으로" onPress={() => acceptCandidate($, c.id)} />,
+                          <Button key={`cd-${c.id}`} variant="secondary" label="아님" onPress={() => declineCandidate($, c.id)} />,
+                        ])
                     }),
                     ...moreButton('cand', openCands.length),
                   ]
@@ -2233,15 +2232,12 @@ export const register: Register = on => {
           ? [
               labelRow('s-promo', `규칙 후보 · 같은 교정 ${PROMOTE_AT}번 이상`, promoCards.length),
               ...(isOpen('s-promo')
-                ? promoCards.flatMap(c => [
-                    cardOf(`promo-${c.id}`, [{ ...cardRow(c, false), scope: appliesTo(c, project) ? scopeName(c) : projectName(c.project), pill: { text: `교정 ${c.count ?? 1}번`, color: STATE_COLOR.ask }, sub: subOf(c) }], STATE_COLOR.ask),
-                    <Box key={`promo-b-${c.id}`} flexDirection="row" gap={1} marginTop={1}>
-                      {[
-                        <Button key={`pr-${c.id}`} variant="primary" label="규칙으로" onPress={async () => { await editCard($, c.id, { isRule: true }); $.clock.after(0, () => findPrinciple($, c.id)) }} />,
-                        <Button key={`pn-${c.id}`} variant="secondary" label="아직 교훈으로" onPress={() => editCard($, c.id, { isPromotionDeclined: true })} />,
-                      ]}
-                    </Box>,
-                  ])
+                ? promoCards.map(c =>
+                    itemOf(`promo-b-${c.id}`, cardOf(`promo-${c.id}`, [{ ...cardRow(c, false), scope: appliesTo(c, project) ? scopeName(c) : projectName(c.project), pill: { text: `교정 ${c.count ?? 1}번`, color: STATE_COLOR.ask }, sub: subOf(c) }], STATE_COLOR.ask), [
+                      <Button key={`pr-${c.id}`} variant="primary" label="규칙으로" onPress={async () => { await editCard($, c.id, { isRule: true }); $.clock.after(0, () => findPrinciple($, c.id)) }} />,
+                      <Button key={`pn-${c.id}`} variant="secondary" label="아직 교훈으로" onPress={() => editCard($, c.id, { isPromotionDeclined: true })} />,
+                    ]),
+                  )
                 : []),
             ]
           : []
@@ -2255,13 +2251,10 @@ export const register: Register = on => {
                     const c = mine.find(x => x.id === j.id)
                     if (!c) return []
                     return [
-                      cardOf(`ask-${c.id}`, [{ ...cardRow(c, false), pill: { text: '답 필요', color: STATE_COLOR.ask }, sub: subOf(c) }], STATE_COLOR.ask),
-                      <Box key={`ask-b-${c.id}`} flexDirection="row" gap={1} marginTop={1}>
-                        {[
-                          <Button key={`yes-${i}`} variant="primary" label="적용" onPress={() => label($, j, true)} />,
-                          <Button key={`no-${i}`} variant="secondary" label="이번엔 아님" onPress={() => label($, j, false)} />,
-                        ]}
-                      </Box>,
+                      itemOf(`ask-b-${c.id}`, cardOf(`ask-${c.id}`, [{ ...cardRow(c, false), pill: { text: '답 필요', color: STATE_COLOR.ask }, sub: subOf(c) }], STATE_COLOR.ask), [
+                        <Button key={`yes-${i}`} variant="primary" label="적용" onPress={() => label($, j, true)} />,
+                        <Button key={`no-${i}`} variant="secondary" label="이번엔 아님" onPress={() => label($, j, false)} />,
+                      ]),
                     ]
                   })
                 : []),

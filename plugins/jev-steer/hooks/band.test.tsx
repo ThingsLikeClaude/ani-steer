@@ -255,3 +255,22 @@ test("ani's records from every project are listed here, each tagged with its pro
   expect(await again.find({ type: 'Text', text: /deployed URL/ })).toBeUndefined()
   await again.unmount()
 })
+
+test('each card keeps its buttons with it, a clear step from the next card', async ($, on) => {
+  engine(on, { requirements: [{ id: 'R-1', text: '0 raw 원문 본문 수정 금지', ts: 1, active: 1 }, { id: 'R-2', text: '2 Permanent 폴더 수정 금지', ts: 2, active: 1 }] })
+  const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await pane.press({ key: 'tab-feedback' })
+  type El = { type: string; props: Record<string, unknown> }
+  const texts: Record<string, string> = { 'R-1': '0 raw 원문 본문 수정 금지', 'R-2': '2 Permanent 폴더 수정 금지' }
+  for (const id of ['R-1', 'R-2']) {
+    const item = await pane.find({ key: `ob-${id}` })
+    const [card, row] = (item?.children ?? []) as El[]
+    // The card and its own buttons are one group, the buttons right under the card...
+    expect(card.type).toBe('Svg')
+    expect(String(card.props.alt)).toContain(texts[id])
+    expect(((row as El & { children: El[] }).children ?? []).map(b => b.props.label)).toEqual(['여기에도 붙이기', '안 붙임'])
+    // ...and the next group starts further down than the buttons sit from their card.
+    expect(Number(item?.props.marginTop)).toBeGreaterThan(Number(row.props.marginTop))
+  }
+  await pane.unmount()
+})

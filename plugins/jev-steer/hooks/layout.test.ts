@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { detailSvg, leadStripSvg, textWidth, titleRowSvg } from './ui'
+import { detailSvg, leadStripSvg, listCardSvg, textWidth, titleRowSvg } from './ui'
 
 // Layout lint: nothing is cut with an ellipsis, and no text runs past its
 // image's right edge (estimated with the same width table the layout uses).
@@ -38,5 +38,18 @@ test('strip: the 다음엔 line is one line or absent, never wrapped', () => {
     expect((short.source.match(/class="t1">UI는/g) ?? []).length).toBe(1)
     const long = leadStripSvg(w, { label: '이것도 적용할까요?', quote: LONG, color: '#8b7cf6' }, true, 'live')
     expect(long.height).toBeLessThanOrEqual(56)
+  }
+})
+
+test('list card: a long project name ends in … before the pill, and the title stops before the name', () => {
+  for (const width of [822, 520, 380]) {
+    const sv = listCardSvg(width, [{ dot: '#8a8a8a', title: LONG, scope: 'deep_twin-doom-orchestrator-v2', pill: { text: '다른 프로젝트', color: '#f5873a' } }], '#f5873a')
+    const texts = [...sv.source.matchAll(/<text ([^>]*)>([^<]*)<\/text>/g)]
+    const xOf = (attrs: string) => Number(/\bx="([\d.]+)"/.exec(attrs)?.[1])
+    const scope = texts.find(m => m[2].startsWith('deep_twin'))
+    const pillX = Number(/<rect x="([\d.]+)" y="[\d.]+" width="[\d.]+" height="22"/.exec(sv.source)?.[1])
+    expect(scope?.[2]).toMatch(/…$/)
+    expect(xOf(scope?.[1] ?? '') + textWidth(scope?.[2] ?? '') * (12 / 11)).toBeLessThan(pillX)
+    for (const m of texts.filter(t => /font-size="13.5"/.test(t[1]))) expect(xOf(m[1]) + textWidth(m[2]) * (13.5 / 11)).toBeLessThan(xOf(scope?.[1] ?? ''))
   }
 })
