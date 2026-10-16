@@ -34,6 +34,10 @@ export type Card = {
   examples?: string[]
   /** Promoted by the person: a rule, attached to every request in its scope without asking Jev. */
   isRule?: boolean
+  /** Made by the AI from its cases, never confirmed by the person: kept and corrected, not attached to requests. */
+  isAuto?: boolean
+  /** Archived because this newer lesson asks the opposite in the same situation. */
+  replacedBy?: string
   /** The person said not yet to promoting it. */
   isPromotionDeclined?: boolean
   /** How often the person corrected in the opposite direction right after it was attached. */

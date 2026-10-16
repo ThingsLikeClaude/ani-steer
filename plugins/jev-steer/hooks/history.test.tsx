@@ -195,7 +195,7 @@ function past(on: Parameters<TestBody>[1], jevDown: (body: string) => boolean = 
   return clock
 }
 
-test('past conversations become cases, and the same mistake in two projects one lesson candidate', async ($, on) => {
+test('past conversations become cases, and the same mistake in two projects one lesson the AI registers, not attached', async ($, on) => {
   const clock = past(on)
   const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await pane.press({ key: 'tab-feedback' })
@@ -205,13 +205,11 @@ test('past conversations become cases, and the same mistake in two projects one 
   expect(await pane.find({ type: 'Text', text: /요청 5개를 보고 교정 2개를 사례로 정리했어요/ })).toBeDefined()
   expect((await pane.find({ key: 'tab-feedback' }))?.text).toMatch(/사례 2/)
   expect(await pane.find({ key: 's-fb-other' })).toBeDefined()
-  // Both say the same thing: one candidate, offered for every project, waiting for the person.
-  expect((await pane.find({ key: 'tab-lessons' }))?.text).toMatch(/교훈 0 \+1$/)
-  await pane.press({ key: 'tab-lessons' })
-  expect(await pane.find({ key: 's-cand' })).toBeDefined()
-  await pane.press({ key: `ca-C-${Date.parse(BETA_AT)}` })
-  expect(await pane.find({ key: 's-cand' })).toBeUndefined()
+  // Both say the same thing: one lesson for every project, registered by the AI without asking, kept off requests.
   expect((await pane.find({ key: 'tab-lessons' }))?.text).toMatch(/교훈 1$/)
+  await pane.press({ key: 'tab-lessons' })
+  expect(await pane.find({ key: 's-cand' })).toBeUndefined()
+  expect(await sourceOf(pane, /주소를 넘길 땐 배포된 주소인지 확인/)).toContain('AI 등록 · 안 붙음')
   await pane.unmount()
 })
 
@@ -409,15 +407,15 @@ async function startSession($: Parameters<TestBody>[0], on: Parameters<TestBody>
 const STRUNG = '이 상황에서 그림체 지시를 놓쳤다 / 이 상황에서 트리거 설계를 되돌려 맡겼다'
 const caseOf = (at: number, judgment: string, link: Record<string, string>) => ({ at, text: '아니 그게 아니라', cardId: '', project: 'unknown', judgment, ...link })
 
-test('a candidate accepted before it was worded becomes one worded lesson, never its judgments strung together', async ($, on) => {
+test('a candidate left waiting from before becomes one worded lesson at a session start, never its judgments strung together', async ($, on) => {
   const clock = past(on, () => false, {
     candidates: [{ id: 'C-1', cases: [11, 12], kind: 'intent', scope: 'global', project: 'unknown' }],
     feedbackLog: [caseOf(12, '이 상황에서 그림체 지시를 놓쳤다', { candidateId: 'C-1' }), caseOf(11, '이 상황에서 트리거 설계를 되돌려 맡겼다', { candidateId: 'C-1' })],
   })
+  await startSession($, on)
+  await clock.settle()
   const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await pane.press({ key: 'tab-lessons' })
-  await pane.press({ key: 'ca-C-1' })
-  await clock.settle()
   const drawn = (await pane.findAll({ type: 'Svg' })).map(x => `${String(x.props.alt ?? '')} ${String(x.props.source ?? '')}`).join('\n')
   expect(drawn).toContain('주소를 넘길 땐 배포된 주소인지 확인')
   expect(drawn).not.toContain(STRUNG)
