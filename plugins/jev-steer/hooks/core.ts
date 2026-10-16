@@ -453,7 +453,7 @@ export function excerpt(text: string, max = 120): string {
 
 export async function slugOf(remote: string, root: string): Promise<string> {
   const m = remote.trim().match(/[:/]([^/:]+\/[^/]+?)(?:\.git)?$/)
-  return m?.[1] ?? root.split('/').filter(Boolean).pop() ?? 'unknown'
+  return m?.[1] ?? root.split(/[\\/]/).filter(Boolean).pop() ?? 'unknown'
 }
 
 /** A project slug as a person reads it: the last segment of `owner/repo` or of a folder path. */

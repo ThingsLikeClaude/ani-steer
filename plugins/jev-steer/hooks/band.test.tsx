@@ -115,7 +115,7 @@ test('the panel groups lessons by scope with their counts, no capacity, and cont
 })
 
 test('desktop panel: every ladder tab always shows; instructions live under feedback', async ($, on) => {
-  engine(on, { cards: [card({ lesson: '밝기 요청은 바꿀 속성부터 확인' })], requirements: [{ id: 'R-1', text: '이미지는 Codex CLI의 Astra로', ts: 1, active: 1, project: 'unknown' }] })
+  engine(on, { cards: [card({ lesson: '밝기 요청은 바꿀 속성부터 확인' })], requirements: [{ id: 'R-1', text: '테스트는 vitest로', ts: 1, active: 1, project: 'unknown' }] })
   const first = await $.ui.mount({ ...PANE, surface: 'desktop' })
   for (const k of ['tab-feedback', 'tab-lessons', 'tab-rules', 'tab-principles', 'tab-needs', 'tab-sent', 'tab-settings']) expect(await first.find({ key: k })).toBeDefined()
   await first.press({ key: 'tab-feedback' })
@@ -212,8 +212,8 @@ const ANI_FILES: Record<string, string> = {
     '| F-1 | captured | global | hmi | 메뉴바 문제를 제거 허가로 읽음 — 왼쪽 메뉴바는 고정 | 2026-09-07 |',
     '| F-2 | compiled | global | deploy | 로컬만 보고 배포 URL을 넘김 | 2026-09-05 |',
   ].join('\n'),
-  '.ani/patterns/F-1.md': '---\nid: F-1\nstatus: captured\ndate: 2026-09-07\nproject: hmi2html\ntrigger_quote: "왼쪽에 메뉴바있어야됨"\nkeywords: [hmi]\nrecurrence: 0\n---\n\n## Intent\n\n왼쪽 메뉴바는 고정이다.\n',
-  '.ani/patterns/F-2.md': '---\nid: F-2\nstatus: compiled\ndate: 2026-09-05\nproject: sta_ai_seminar_v2\ntrigger_quote: "배포 링크 404야"\nkeywords: [deploy]\nrecurrence: 0\n---\n',
+  '.ani/patterns/F-1.md': '---\nid: F-1\nstatus: captured\ndate: 2026-09-07\nproject: dashboard\ntrigger_quote: "왼쪽에 메뉴바있어야됨"\nkeywords: [hmi]\nrecurrence: 0\n---\n\n## Intent\n\n왼쪽 메뉴바는 고정이다.\n',
+  '.ani/patterns/F-2.md': '---\nid: F-2\nstatus: compiled\ndate: 2026-09-05\nproject: landing-v2\ntrigger_quote: "배포 링크 404야"\nkeywords: [deploy]\nrecurrence: 0\n---\n',
   '.ani/patterns/S-deploy.md': '---\nid: S-deploy\nstatus: active\ncompiled_from: [F-2]\ndate_compiled: 2026-09-05\nkeywords: [deploy]\nscope: global\nsummary: Use when about to hand the user a deployed URL\n---\n',
 }
 
@@ -241,10 +241,10 @@ test("ani's records from every project are listed here, each tagged with its pro
   await clock.settle()
   const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await pane.press({ key: 'tab-lessons' })
-  // The S is a lesson for every project; hmi2html's F is listed for reference with its project.
+  // The S is a lesson for every project; dashboard's F is listed for reference with its project.
   expect(await hasSvg(pane, /Use when about to hand the user a deployed URL/)).toBe(true)
   await pane.press({ key: 's-ls-other-fold' })
-  expect(await sourceOf(pane, /메뉴바/)).toContain('hmi2html')
+  expect(await sourceOf(pane, /메뉴바/)).toContain('dashboard')
   await pane.press({ key: 'tab-feedback' })
   expect(await pane.find({ key: 's-fb-other' })).toBeDefined()
   expect(await hasSvg(pane, /배포 링크 404야/)).toBe(true)
@@ -285,13 +285,13 @@ test('each card keeps its buttons with it, a clear step from the next card', asy
 
 test("another project's cases are one line each, like lessons: what was said, where, when", async ($, on) => {
   const feedbackLog = [
-    { at: 1_000, text: '아니 배포 링크 달라고', cardId: '', project: 'ThingsLikeClaude/stalab-web', said: '배포 링크 대신 로컬 주소를 넘김', before: '배포해줘 요청 맥락', did: 'localhost 주소를 보냄', judgment: '이 상황에서는 배포 주소가 필요했다' },
+    { at: 1_000, text: '아니 배포 링크 달라고', cardId: '', project: 'acme/storefront', said: '배포 링크 대신 로컬 주소를 넘김', before: '배포해줘 요청 맥락', did: 'localhost 주소를 보냄', judgment: '이 상황에서는 배포 주소가 필요했다' },
   ]
   engine(on, { feedbackLog })
   const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await pane.press({ key: 'tab-feedback' })
   const src = await sourceOf(pane, /배포 링크 대신 로컬 주소/)
-  expect(src).toContain('stalab-web')
+  expect(src).toContain('storefront')
   // The case's detail stays in the store for Jev and Claude; the list shows none of it.
   expect(src).not.toContain('localhost 주소를 보냄')
   expect(src).not.toContain('배포해줘 요청 맥락')

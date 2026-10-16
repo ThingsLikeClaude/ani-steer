@@ -55,8 +55,8 @@ test('list card: a long project name ends in … before the pill, and the title 
 })
 
 test('case and list cards name their font once, not on every text: half of what is carried to the screen', () => {
-  const cs = caseCardSvg(554, [{ dot: '#8a8a8a', said: '배포 링크 달라고', when: 'hmi2html · 9월 7일', before: '배포 링크 줘', did: '로컬 주소를 줌', judgment: '배포 주소를 줘야 했다' }])
-  const ls = listCardSvg(554, [{ dot: '#8a8a8a', title: LONG, scope: 'hmi2html', pill: { text: '다른 프로젝트', color: '#f5873a' } }])
+  const cs = caseCardSvg(554, [{ dot: '#8a8a8a', said: '배포 링크 달라고', when: 'dashboard · 9월 7일', before: '배포 링크 줘', did: '로컬 주소를 줌', judgment: '배포 주소를 줘야 했다' }])
+  const ls = listCardSvg(554, [{ dot: '#8a8a8a', title: LONG, scope: 'dashboard', pill: { text: '다른 프로젝트', color: '#f5873a' } }])
   for (const sv of [cs, ls]) {
     expect(sv.source.match(/font-family/g)?.length).toBe(1)
     expect(sv.source).toContain('<style>text{font-family:')
