@@ -1112,7 +1112,7 @@ async function readHistory($: EngineInterface, tried: Set<number>, range?: Histo
   /** Reads one transcript; the number of cases it found. */
   async function readOne(f: { path: string; name: string; size: number }): Promise<number> {
     const dir = f.path.replace(/\\/g, '/').split('/').slice(-2, -1)[0] ?? ''
-    await show({ file: dir.replace(/^[A-Za-z]--/, ''), mb: Math.round(f.size / 100_000) / 10, step: '읽는 중' }, f.size >= 1_000_000)
+    await show({ file: dir.replace(/^([A-Za-z]-)?-/, ''), mb: Math.round(f.size / 100_000) / 10, step: '읽는 중' }, f.size >= 1_000_000)
     const reader = pastPromptReader(since, until)
     let n = 0
     for await (const line of transcriptLines($, f.path, f.size)) {
@@ -1280,7 +1280,7 @@ async function extractRequirements($: EngineInterface, prompt: string, now: numb
       '(a tool or model, file or folder, UI place or component, a value, a name, a format).',
       'Skip general working attitudes that would apply to any request (quality, tidiness, "apply feedback", "fix it again", "be careful").',
       'Skip one-off instructions for this turn only, and anything already in the existing list.',
-      'Good: "이미지 생성은 Codex CLI의 gpt-6-astra로", "ani 상태는 프롬프트 창 아래에", "src/generated는 수정 금지".',
+      'Good: "테스트는 vitest로 실행", "ani 상태는 프롬프트 창 아래에", "src/generated는 수정 금지".',
       'Bad: "피드백 반영해서 다시 수정", "깔끔하게 표현", "군더더기 빼기".',
       'Reply with JSON only: {"requirements": ["..."]}, Korean, each ≤ 40자, at most 2. Empty list is the usual answer.',
     ].join(' '),
@@ -2192,7 +2192,7 @@ export const register: Register = on => {
       const m = text.match(/^근원\s*욕구\s*[:：]\s*(.+)$/s)
       if (m) await writeNeed($, m[1].trim().slice(0, 200))
     }
-    if (/(ani|애니|패널|사이드\s*패널).{0,12}(열어|띄워|보여|켜)/i.test(text)) await $.ui.open({ id: PANE, title: TITLE })
+    if (/(^|[^a-z])(ani|애니)\s*(사이드\s*)?(패널\s*)?(좀\s*)?(열어|띄워|보여|켜)/i.test(text)) await $.ui.open({ id: PANE, title: TITLE })
     {
       const own = isScriptedSession || !isPerson ? '' : personText(text)
       const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
@@ -2203,23 +2203,6 @@ export const register: Register = on => {
     if (recentPrompts.length > 6) recentPrompts.shift()
     $.clock.after(0, () => importAni($))
     $.clock.after(0, () => settleReqs($))
-    // A one-time import (e.g. lessons rebuilt from an earlier conversation):
-    // its lessons go live, the ones they replace are archived, its cases join the log.
-    {
-      const raw = await $.fs.read(`${home}/.ani/jev-steer-import.json`).catch(() => '')
-      const imp = raw ? (JSON.parse(String(raw)) as { id: string; cards: Card[]; cases: Feedback[] }) : null
-      const done = ((await $.store.get('imports')) as string[] | undefined) ?? []
-      if (imp && !done.includes(imp.id)) {
-        const own = await ownCards($)
-        const have = new Set(own.map(c => c.id))
-        const cards = [...own.map(c => (c.source === 'jev' && !have.has(c.id) ? c : c.source === 'jev' && !imp.cards.some(x => x.id === c.id) ? { ...c, isArchived: true } : c)), ...imp.cards.filter(c => !have.has(c.id))]
-        await save($, 'cards', cards)
-        const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
-        const known = new Set(fb.map(f => f.at))
-        await saveCases($, [...fb, ...imp.cases.filter(f => !known.has(f.at))])
-        await save($, 'imports', [...done, imp.id])
-      }
-    }
     // Cases written under the 40자 limit are walked back once more, at full length.
     if (!(await $.store.get('caseV2'))) {
       await save($, 'caseV2', true)
@@ -2354,8 +2337,8 @@ export const register: Register = on => {
         const card = askCardSvg(full - 40, {
           question: 'Jev 키가 있어야 ani가 교훈을 골라 붙일 수 있어요',
           lesson: '키 없이는 교정 기록·교훈 판단·승격이 모두 멈춰 있어요',
-          intent: 'typesafe.ai 에서 키를 발급받아 숨김 입력창에 붙여넣어요',
-          why: '키는 채팅에 남지 않고 ~/.claude/settings.json 에만 저장돼요',
+          intent: 'typesafe.ai 또는 openrouter.ai 키를 숨김 입력창에 붙여넣어요',
+          why: '키는 채팅에 남지 않고 Claude 설정 파일(settings.json)에만 저장돼요',
           color,
         })
         return (
@@ -3075,7 +3058,7 @@ export const register: Register = on => {
           {tab === 'rules' && promoView()}
 
           {tab === 'rules' && reqs.length === 0 && (
-            <Box paddingY={2}><Text dimColor wrap="wrap">아직 없어요. "이미지는 Astra로"처럼 대상이 분명한 지시를 말하면 여기에 저장돼요.</Text></Box>
+            <Box paddingY={2}><Text dimColor wrap="wrap">아직 없어요. "테스트는 vitest로"처럼 대상이 분명한 지시를 말하면 여기에 저장돼요.</Text></Box>
           )}
           {tab === 'rules' && ruleCards.length > 0 && [
             labelRow('s-rules', '교훈에서 올라온 규칙', ruleCards.length),
