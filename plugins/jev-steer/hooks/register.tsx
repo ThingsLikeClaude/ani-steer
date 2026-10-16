@@ -641,6 +641,7 @@ async function placeCase($: EngineInterface, at: number) {
     const now = ((await $.store.get('candidates')) as Candidate[] | undefined) ?? []
     await save($, 'candidates', now.map(c => (c.id === hit.id ? { ...c, cases: [...c.cases, at], ...(isElsewhere ? { scope: 'global' as const } : {}) } : c)))
     await setFeedback($, at, { candidateId: hit.id })
+    await acceptCandidate($, hit.id)
     return
   }
   const other = waiting[best.i] as Feedback
@@ -659,9 +660,11 @@ async function placeCase($: EngineInterface, at: number) {
   await saveCases($, latest.map(f => (f.at === at || f.at === other.at ? { ...f, candidateId: id } : f)))
   // The lesson text, drafted from both cases by the small model; worded again at a later start when it fails.
   const t = await wordCases($, [other, me])
-  if (!t) return
-  const now = ((await $.store.get('candidates')) as Candidate[] | undefined) ?? []
-  await save($, 'candidates', now.map(c => (c.id === id ? { ...c, ...t } : c)))
+  if (t) {
+    const now = ((await $.store.get('candidates')) as Candidate[] | undefined) ?? []
+    await save($, 'candidates', now.map(c => (c.id === id ? { ...c, ...t } : c)))
+  }
+  await acceptCandidate($, id)
 }
 
 /**
@@ -700,7 +703,7 @@ const isStrung = (c: Card) => (c.lesson?.split(' / ').length ?? 0) >= 2 && !c.in
 let isRewording = false
 
 /**
- * Candidates offered without wording are worded, and lessons saved as their
+ * Candidates still waiting become lessons, and lessons saved as their
  * cases' judgments strung together are worded again from those cases. The
  * person's choices stay: the same cases, the same lesson or rule, its scope.
  */
@@ -709,12 +712,8 @@ async function rewordLessons($: EngineInterface) {
   isRewording = true
   try {
     const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
-    for (const c of (((await $.store.get('candidates')) as Candidate[] | undefined) ?? []).filter(x => !x.lesson && !x.isDeclined)) {
-      const t = await wordCases($, fb.filter(f => c.cases.includes(f.at)))
-      if (!t) continue
-      const now = ((await $.store.get('candidates')) as Candidate[] | undefined) ?? []
-      await save($, 'candidates', now.map(x => (x.id === c.id ? { ...x, ...t } : x)))
-    }
+    // Candidates still waiting on the person, from before the AI decided: lessons now. A pair the person declined stays a pair.
+    for (const c of (((await $.store.get('candidates')) as Candidate[] | undefined) ?? []).filter(x => !x.isDeclined)) await acceptCandidate($, c.id)
     for (const c of (await ownCards($)).filter(isStrung)) {
       const t = await wordCases($, fb.filter(f => f.cardId === c.id))
       if (t) await editCard($, c.id, t)
@@ -724,7 +723,11 @@ async function rewordLessons($: EngineInterface) {
   }
 }
 
-/** The person said yes: the cases become one lesson, counted once per case. */
+/**
+ * The cases become one lesson, counted once per case. Up to the lesson layer
+ * the AI decides: a candidate becomes a lesson as soon as it is made, marked
+ * isAuto, and replaces an older lesson it contradicts.
+ */
 async function acceptCandidate($: EngineInterface, id: string) {
   const cands = ((await $.store.get('candidates')) as Candidate[] | undefined) ?? []
   const c = cands.find(x => x.id === id)
@@ -749,17 +752,39 @@ async function acceptCandidate($: EngineInterface, id: string) {
     why: c.why ?? worded?.why,
     lesson: c.lesson ?? worded?.lesson ?? cases.find(f => f.judgment)?.judgment,
     short: c.short ?? worded?.short,
+    isAuto: true,
   }
   await save($, 'cards', capArchive([...(await ownCards($)), card]))
   await saveCases($, fb.map(f => (c.cases.includes(f.at) ? { ...f, cardId: card.id, candidateId: undefined } : f)))
   await save($, 'candidates', cands.filter(x => x.id !== id))
   if (!card.short) $.clock.after(0, () => shorten($))
+  await replaceConflicts($, card)
 }
 
-/** Not yet: the two cases go back to waiting, and this pair is not offered again. */
-async function declineCandidate($: EngineInterface, id: string) {
-  const cands = ((await $.store.get('candidates')) as Candidate[] | undefined) ?? []
-  await save($, 'candidates', cands.map(c => (c.id === id ? { ...c, isDeclined: true } : c)))
+/**
+ * The lesson layer changes often: an older lesson that asks the opposite of a
+ * new one in the same situation is archived, marked replacedBy. Rules are the
+ * person's and are never replaced.
+ */
+async function replaceConflicts($: EngineInterface, card: Card) {
+  if (!card.lesson) return
+  const near = (await ownCards($)).filter(c => c.id !== card.id && c.lesson && !c.isRule && !c.isArchived && (c.scope === 'global' || card.scope === 'global' || sameProject(c.project, card.project)))
+  const others = nearest(`${card.lesson} ${card.why ?? ''}`, near, c => `${c.lesson} ${c.why ?? ''}`, 8)
+  if (!others.length) return
+  const answers = await askJev(
+    $,
+    { new_lesson: describe(card) },
+    Object.fromEntries(others.map((c, i) => [`x${i}`, {
+      type: 'noul',
+      instructions: `Does the new lesson tell the assistant to do the opposite of this lesson in the same situation, so both cannot be followed: "${describe(c)}"`,
+      criteria: { true: 'they conflict; one has to go', false: 'both can hold' },
+    }])),
+  )
+  if (!answers) return
+  const gone = new Set(others.filter((_, i) => noul(answers, `x${i}`) >= 0.7).map(c => c.id))
+  if (!gone.size) return
+  await save($, 'cards', (await ownCards($)).map(c => (gone.has(c.id) ? { ...c, isArchived: true, replacedBy: card.id } : c)))
+  if ((await read($, display)).toast) $.ui.toast(`ani · 새 교훈과 맞지 않는 교훈 ${gone.size}개를 새 교훈으로 바꿨어요`, { timeoutMs: 5000 })
 }
 
 /**
@@ -1307,7 +1332,8 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
     // Only principles and the confirmed need ride every request.
     const candidates = [
       ...pickCandidates(prompt, allCards.filter(c => c.isRule), project, { isEvery: true, max: MAX_RULE_CANDIDATES }),
-      ...pickCandidates(prompt, allCards.filter(c => !c.isRule), project),
+      // A lesson the AI made and nobody confirmed is kept and corrected, not attached.
+      ...pickCandidates(prompt, allCards.filter(c => !c.isRule && !c.isAuto), project),
     ]
     const attachedBefore = mode === 'draft' ? [] : allCards.filter(c => prevAttached.includes(c.id))
     if (mode !== 'commit') await update($, view, v => ({ ...v, weighing: candidates.map(c => c.id) }))
@@ -1375,7 +1401,7 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
     if (said && noul(answers, 'is_correction') >= 0.6) {
       const card = await remember($, said, answers, candidates, started)
       if (card) recorded = { cardId: card.id, kind: card.kind, scope: card.scope, until: started }
-      if (shown.toast) $.ui.toast(card ? `ani · 같은 판단 ${card.count}번째 — 교훈을 다듬을게요` : `ani · 사례로 기록했어요 · 같은 판단이 한 번 더 나오면 교훈 후보가 돼요`, { timeoutMs: 4000 })
+      if (shown.toast) $.ui.toast(card ? `ani · 같은 판단 ${card.count}번째 — 교훈을 다듬을게요` : `ani · 사례로 기록했어요 · 같은 판단이 한 번 더 나오면 교훈이 돼요`, { timeoutMs: 4000 })
     }
 
     if (said && noul(answers, 'is_correction') >= 0.6) {
@@ -2310,8 +2336,6 @@ export const register: Register = on => {
       // Another project's lesson attached here is promoted in its own project, not from here.
       const promos = mineOf(own).filter(c => (c.scope === 'global' || sameProject(c.project, project)) && !c.isMuted && !c.isRule && !c.isPromotionDeclined && (c.count ?? 1) >= PROMOTE_AT)
       const promo = promos[0]
-      const cands = (((await $.store.get('candidates')) as Candidate[] | undefined) ?? []).filter(c => !c.isDeclined)
-      const cand = cands[0]
       const full = Math.max(280, Math.round(e.props.bodyColumns * 7.6))
       const lead: Lead = { ...st.lead, quote: undefined }
       const invCols = st.inventory.length * 2 + 6
@@ -2378,33 +2402,6 @@ export const register: Register = on => {
           </Box>
         )
       }
-      if (cand) {
-        const color = STATE_COLOR.weigh
-        const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
-        const js = fb.filter(f => cand.cases.includes(f.at)).map(f => f.judgment).filter(Boolean) as string[]
-        const card = askCardSvg(full - 40, {
-          question: '같은 판단이 2번 나왔어요. 교훈으로 만들까요?',
-          counter: cands.length > 1 ? `${cands.length}개 중 1` : undefined,
-          lesson: cand.lesson ?? js[0] ?? '교훈 문장을 정리하는 중',
-          intent: cand.intent,
-          why: cand.why ?? js[1],
-          color,
-        })
-        return (
-          <Box flexDirection="column" width={e.props.bodyColumns} gap={1}>
-            <Box key="cand" flexDirection="column" borderStyle="round" borderColor={color} paddingX={2} paddingY={1} gap={1}>
-              <Svg source={card.source} width={card.width} height={card.height} alt={`교훈으로 만들까요? ${cand.lesson ?? js.join('. ')}`} />
-              <Box flexDirection="row" alignItems="center" gap={1}>
-                {[
-                  <Button key="c-yes" variant="primary" hotkey="1" label="교훈으로 만들기" onPress={() => acceptCandidate($, cand.id)} />,
-                  <Button key="c-no" variant="secondary" hotkey="2" label="아직은 사례로" onPress={() => declineCandidate($, cand.id)} />,
-                ]}
-              </Box>
-            </Box>
-            {line}
-          </Box>
-        )
-      }
       if (!promo) return line
       const color = STATE_COLOR.ask
       const card = askCardSvg(full - 40, {
@@ -2421,7 +2418,7 @@ export const register: Register = on => {
             <Svg source={card.source} width={card.width} height={card.height} alt={`규칙으로 올릴까요? ${promo.lesson ?? promo.text}`} />
             <Box flexDirection="row" alignItems="center" gap={1}>
               {[
-                <Button key="q-yes" variant="primary" hotkey="1" label="규칙으로 올리기" onPress={async () => { await editCard($, promo.id, { isRule: true }); $.clock.after(0, () => findPrinciple($, promo.id)) }} />,
+                <Button key="q-yes" variant="primary" hotkey="1" label="규칙으로 올리기" onPress={async () => { await editCard($, promo.id, { isRule: true, isAuto: false }); $.clock.after(0, () => findPrinciple($, promo.id)) }} />,
                 <Button key="q-no" variant="secondary" hotkey="2" label="아직은 교훈으로" onPress={() => editCard($, promo.id, { isPromotionDeclined: true })} />,
               ]}
             </Box>
@@ -2649,7 +2646,7 @@ export const register: Register = on => {
         title: c.lesson ?? c.text,
         scope: scopeName(c),
         isMuted: c.isMuted,
-        pill: weighing.has(c.id) ? { text: '판단 중', color: STATE_COLOR.weigh } : isOn ? { text: '반영 중', color: STATE_COLOR.hit } : { text: `${c.count ?? 1}회` },
+        pill: weighing.has(c.id) ? { text: '판단 중', color: STATE_COLOR.weigh } : isOn ? { text: '반영 중', color: STATE_COLOR.hit } : { text: c.isAuto && !c.isRule ? `AI 등록 · 안 붙음 · ${c.count ?? 1}회` : `${c.count ?? 1}회` },
         shimmer: weighing.has(c.id) ? 'weigh' : isOn && fresh(c) ? 'fresh' : undefined,
         sub: isOn || isManaging ? subOf(c) : undefined,
       })
@@ -2924,7 +2921,7 @@ export const register: Register = on => {
         const views = list.slice(0, limit).map(f => {
           const c = own.find(x => x.id === f.cardId)
           const cd = cands.find(x => x.id === f.candidateId)
-          return { f, v: { dot: c ? KIND_COLOR[c.kind] : '#8a8a8a', said: f.said ?? f.text, raw: f.text, when: ago(f.at), before: f.before, did: f.did, after: f.after, understood: f.understood, meant: f.meant, judgment: f.judgment, lesson: c?.lesson ?? (cd ? `후보 · ${cd.lesson ?? '정리하는 중'}` : f.judgment ? '판단 1개 · 같은 판단이 한 번 더 나오면 교훈 후보' : undefined) } }
+          return { f, v: { dot: c ? KIND_COLOR[c.kind] : '#8a8a8a', said: f.said ?? f.text, raw: f.text, when: ago(f.at), before: f.before, did: f.did, after: f.after, understood: f.understood, meant: f.meant, judgment: f.judgment, lesson: c?.lesson ?? (cd ? `교훈으로 정리하는 중${cd.lesson ? ` · ${cd.lesson}` : ''}` : f.judgment ? '판단 1개 · 같은 판단이 한 번 더 나오면 교훈' : undefined) } }
         })
         // A case is several thousand characters drawn: thirty in one drawing passed the engine's limit.
         const parts = bySize(views, x => drawnOnce(`case|${paneW}|${JSON.stringify(x.v)}`, () => caseCardSvg(paneW, [x.v])))
@@ -2953,7 +2950,7 @@ export const register: Register = on => {
         const isRecentDone = hist?.status === 'done' && !isOld && hist.range !== 'all'
         const from = hist && hist.since > 0 ? `${dateOf(hist.since)}부터` : '처음부터'
         const text = !hist
-          ? `ani가 기록하기 전의 대화는 아직 보지 않았어요. 지난 ${HISTORY_DAYS}일 대화에서 교정을 찾아 사례로 정리하고, 같은 습관끼리 교훈 후보로 묶어요. 교정 하나에 Jev와 Haiku를 두세 번 써요.`
+          ? `ani가 기록하기 전의 대화는 아직 보지 않았어요. 지난 ${HISTORY_DAYS}일 대화에서 교정을 찾아 사례로 정리하고, 같은 습관끼리 교훈으로 묶어요. 교정 하나에 Jev와 Haiku를 두세 번 써요.`
           : isLive
             ? histLive
               ? `지난 대화를 읽는 중 · 기록 ${histLive.filesDone}/${histLive.files} · 요청 ${histLive.prompts}개에서 교정 ${histLive.found}개 · 정리 ${hist.enriched}개\n${nowText}`
@@ -2986,7 +2983,7 @@ export const register: Register = on => {
         ...histView(),
         ...(feedbackLog.length
           ? [labelRow('s-fb', '사례', feedbackLog.length), ...(isOpen('s-fb') ? [caseCard('card-fb', feedbackLog), ...moreButton('fb', feedbackLog.length)] : [])]
-          : [emptyNote('fb-empty', `${otherCases.length ? '이 프로젝트의 사례는 ' : ''}아직 없어요. "아니 그게 아니라…"처럼 교정하면 사례로 쌓이고, 사례마다 판단 하나를 남겨요. 같은 판단이 2번 나오면 교훈 후보가 돼요.`)]),
+          : [emptyNote('fb-empty', `${otherCases.length ? '이 프로젝트의 사례는 ' : ''}아직 없어요. "아니 그게 아니라…"처럼 교정하면 사례로 쌓이고, 사례마다 판단 하나를 남겨요. 같은 판단이 2번 나오면 AI가 교훈으로 등록해요. AI가 등록한 교훈은 요청에 붙지 않고, 규칙으로 올리면 붙어요.`)]),
         // Every other project's cases, one line each like a lesson: what was said, where, when.
         // The full case (before, did, after, judgment) stays in the store for Jev and Claude.
         ...(otherCases.length
@@ -3012,32 +3009,6 @@ export const register: Register = on => {
           : []),
         ...reqOthers(),
       ]
-      const candView = () =>
-        openCands.length
-          ? [
-              labelRow('s-cand', '교훈 후보 · 같은 판단이 2번 이상', openCands.length),
-              ...(isOpen('s-cand')
-                ? [
-                    ...openCands.slice(0, limit).map(c => {
-                      const cs = allCases.filter(f => c.cases.includes(f.at))
-                      const names = [...new Set(cs.map(f => projectName(f.project)))]
-                      return itemOf(`cand-b-${c.id}`,
-                        cardOf(`cand-${c.id}`, [{
-                          dot: STATE_COLOR.weigh,
-                          title: c.lesson ?? cs.find(f => f.judgment)?.judgment ?? '교훈 문장을 정리하는 중',
-                          scope: names.length > 1 ? `${names[0]} 외 ${names.length - 1}곳` : names[0],
-                          pill: { text: `사례 ${cs.length}`, color: STATE_COLOR.weigh },
-                          sub: cs.slice(0, 3).map(f => ({ label: '사례', value: f.said ?? f.text })),
-                        }], STATE_COLOR.weigh), [
-                          <Button key={`ca-${c.id}`} variant="primary" label="교훈으로" onPress={() => acceptCandidate($, c.id)} />,
-                          <Button key={`cd-${c.id}`} variant="secondary" label="아님" onPress={() => declineCandidate($, c.id)} />,
-                        ])
-                    }),
-                    ...moreButton('cand', openCands.length),
-                  ]
-                : []),
-            ]
-          : []
       // Lessons corrected PROMOTE_AT times or more, every project: each waits for 규칙으로.
       const promoView = () =>
         promoCards.length
@@ -3046,7 +3017,7 @@ export const register: Register = on => {
               ...(isOpen('s-promo')
                 ? promoCards.map(c =>
                     itemOf(`promo-b-${c.id}`, cardOf(`promo-${c.id}`, [{ ...cardRow(c, false), scope: appliesTo(c, project) ? scopeName(c) : projectName(c.project), pill: { text: `교정 ${c.count ?? 1}번`, color: STATE_COLOR.ask }, sub: subOf(c) }], STATE_COLOR.ask), [
-                      <Button key={`pr-${c.id}`} variant="primary" label="규칙으로" onPress={async () => { await editCard($, c.id, { isRule: true }); $.clock.after(0, () => findPrinciple($, c.id)) }} />,
+                      <Button key={`pr-${c.id}`} variant="primary" label="규칙으로" onPress={async () => { await editCard($, c.id, { isRule: true, isAuto: false }); $.clock.after(0, () => findPrinciple($, c.id)) }} />,
                       <Button key={`pn-${c.id}`} variant="secondary" label="아직 교훈으로" onPress={() => editCard($, c.id, { isPromotionDeclined: true })} />,
                     ]),
                   )
@@ -3054,7 +3025,6 @@ export const register: Register = on => {
             ]
           : []
       const lessonCards = [
-        ...candView(),
         ...(pending.length
           ? [
               labelRow('s-maybe', '답 필요', pending.length),

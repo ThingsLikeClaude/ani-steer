@@ -146,7 +146,7 @@ test('desktop panel: every ladder tab always shows; instructions live under feed
   await done.unmount()
 })
 
-test('desktop: a pressed lesson card leaves the band on that press, with no remount', async ($, on) => {
+test('a pair of cases is never put to the person: up to the lesson layer the AI decides', async ($, on) => {
   engine(on, {
     candidates: [{ id: 'C-1', cases: [1, 2], kind: 'intent', scope: 'personal-project', lesson: '배경만 바꾸라면 배경만 바꾼다', short: '배경만 바꾼다' }],
     feedbackLog: [
@@ -155,10 +155,12 @@ test('desktop: a pressed lesson card leaves the band on that press, with no remo
     ],
   })
   const band = await $.ui.mount({ plugin: 'jev-steer', surface: 'desktop', component: 'AbovePrompt', props: ABOVE })
-  expect(await band.find({ key: 'c-yes' })).toBeDefined()
-  await band.press({ key: 'c-yes' })
   expect(await band.find({ key: 'c-yes' })).toBeUndefined()
   await band.unmount()
+  const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await pane.press({ key: 'tab-lessons' })
+  expect(await pane.find({ key: 's-cand' })).toBeUndefined()
+  await pane.unmount()
 })
 test('promoting a lesson to a rule clears the card at once (store writes redraw)', async ($, on) => {
   engine(on, { cards: [card({ count: 3, lesson: '위치를 지정받으면 그 자리에 정확히 둔다' })] })
