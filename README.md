@@ -230,6 +230,9 @@ sequenceDiagram
 
 **2. Jev 키를 넣습니다.** [typesafe.ai](https://typesafe.ai) 키나 [openrouter.ai](https://openrouter.ai) 키 중 하나면 됩니다.
 
+> [!NOTE]
+> **이미 Jev를 쓰고 있다면 이 단계는 건너뛰세요.** 키가 `TYPESAFE_API_KEY`나 `OPENROUTER_API_KEY` 환경변수(또는 `settings.json`의 `env`)에 있으면 ani가 그대로 읽습니다. macOS에서 키를 `~/.zshrc`에만 넣었다면 터미널에서 `claude`로 여세요.
+
 키가 없으면 첫 실행 때 프롬프트 위에 안내 카드가 뜹니다. **`키 설정하기`** 를 누르거나 `/jev-steer:ani-key`를 실행하면 가려진 입력창이 열리고, 붙여 넣은 키는 Claude 설정 파일(`~/.claude/settings.json`, `CLAUDE_CONFIG_DIR`을 쓰면 그 폴더)의 `env.TYPESAFE_API_KEY` 또는 `env.OPENROUTER_API_KEY`에 저장됩니다. 두 키가 모두 있으면 요청마다 하는 판정은 TypeSafe로, 지난 대화 찾기 같은 백그라운드 작업은 OpenRouter로 보냅니다.
 
 **3. `/reload-plugins` 하거나 새 세션을 엽니다.** 패널의 Jev 연결 점이 초록색이면 준비 끝입니다.
