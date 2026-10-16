@@ -64,13 +64,15 @@ test('ani INDEX rows: only active or provisional S/K rows', async () => {
 test('project slug from the origin remote, else the folder name', async () => {
   expect(await slugOf('git@github.com:ThingsLikeClaude/ani.git\n', '/x/ani')).toBe('ThingsLikeClaude/ani')
   expect(await slugOf('', '/Users/me/work/site')).toBe('site')
+  // A Windows folder without a remote is its last name, never the full path with the person's user folder in it.
+  expect(await slugOf('', 'C:\\Users\\me\\work\\site')).toBe('site')
 })
 
 test('requirements must name a concrete target; generic working rules are dropped', () => {
   for (const t of ['사용자 피드백이 있으면 이전 결과물에 반영해 다시 수정할 것', '설명은 깔끔하게 표현하기', "'해당되는 ~' 같은 군더더기 표현 빼기"]) {
     expect(isConcreteRequirement(t)).toBe(false)
   }
-  for (const t of ['이미지 작업은 코덱스 CLI(Astra)를 사용해 진행할 것', 'ani 상태는 프롬프트 창 아래에', 'src/generated는 수정 금지']) {
+  for (const t of ['테스트는 vitest로 실행할 것', 'ani 상태는 프롬프트 창 아래에', 'src/generated는 수정 금지']) {
     expect(isConcreteRequirement(t)).toBe(true)
   }
 })
@@ -96,7 +98,7 @@ test("another project's item rides here only once attached; not-here sticks", as
 
 test('project names read short; one folder written two ways is one folder', async () => {
   expect(projectName('ThingsLikeClaude/ani')).toBe('ani')
-  expect(projectName('D:\\10_AREAS\\2nd_Brain')).toBe('2nd_Brain')
+  expect(projectName('D:\\notes\\vault')).toBe('vault')
   expect(projectName(undefined)).toBe('출처 모름')
   expect(isSamePath('C:\\Users\\me', '/c/Users/me/')).toBe(true)
   expect(isSamePath('C:\\Users\\me\\site', 'C:\\Users\\me')).toBe(false)
@@ -108,7 +110,7 @@ const F_CAPTURED = [
   'id: F-20260907-5j87qto0',
   'status: captured',
   'date: 2026-09-07',
-  'project: hmi2html',
+  'project: dashboard',
   'trigger_quote: "왼쪽에 메뉴바있어야됨. 그건 고정임"',
   'keywords: [hmi, Navigation, left-menu]',
   'recurrence: 1',
@@ -116,7 +118,7 @@ const F_CAPTURED = [
   '',
   '## Intent',
   '',
-  'hmi2html 에서 **왼쪽 메뉴바는 고정 요구사항**이다.',
+  'dashboard 에서 **왼쪽 메뉴바는 고정 요구사항**이다.',
   '',
   '## Misreading',
   '',
@@ -142,7 +144,7 @@ const S_SKILL = [
 
 test('ani patterns: frontmatter, folded summary and sections are read', async () => {
   const f = parseAniPattern(F_CAPTURED)
-  expect(f?.project).toBe('hmi2html')
+  expect(f?.project).toBe('dashboard')
   expect(f?.quote).toBe('왼쪽에 메뉴바있어야됨. 그건 고정임')
   expect(f?.keywords).toEqual(['hmi', 'navigation', 'left-menu'])
   expect(f?.recurrence).toBe(1)
@@ -156,12 +158,12 @@ test('ani patterns: frontmatter, folded summary and sections are read', async ()
 test('an F is the lesson of its own project; an S is a lesson for every project', async () => {
   const f = aniCard(parseAniPattern(F_CAPTURED)!, '메뉴바 문제를 제거 허가로 읽음')
   expect(f.scope).toBe('personal-project')
-  expect(f.project).toBe('hmi2html')
+  expect(f.project).toBe('dashboard')
   expect(f.lesson).toBe('메뉴바 문제를 제거 허가로 읽음')
-  expect(f.intent).toBe('hmi2html 에서 왼쪽 메뉴바는 고정 요구사항이다.')
+  expect(f.intent).toBe('dashboard 에서 왼쪽 메뉴바는 고정 요구사항이다.')
   expect(f.count).toBe(2)
-  expect(appliesTo(f, 'D:\\00_PROJECTS\\hmi2html')).toBe(true)
-  expect(appliesTo(f, 'ThingsLikeClaude/sta_ai_seminar_v2')).toBe(false)
+  expect(appliesTo(f, 'D:\\work\\dashboard')).toBe(true)
+  expect(appliesTo(f, 'acme/landing-v2')).toBe(false)
   const s = aniCard(parseAniPattern(S_SKILL)!)
   expect(s.scope).toBe('global')
   expect(s.count).toBe(2)
@@ -169,8 +171,8 @@ test('an F is the lesson of its own project; an S is a lesson for every project'
 })
 
 test('one project recorded as owner/repo, folder name or Windows path is one project', async () => {
-  expect(sameProject('ThingsLikeClaude/sta_ai_seminar_form', 'sta_ai_seminar_form')).toBe(true)
-  expect(sameProject('D:\\00_PROJECTS\\sta_ai_seminar_v2', 'ThingsLikeClaude/sta_ai_seminar_v2')).toBe(true)
+  expect(sameProject('acme/landing-form', 'landing-form')).toBe(true)
+  expect(sameProject('D:\\work\\landing-v2', 'acme/landing-v2')).toBe(true)
   expect(sameProject('me/site', 'me/other')).toBe(false)
   expect(sameProject(undefined, 'me/site')).toBe(false)
 })
