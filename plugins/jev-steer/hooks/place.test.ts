@@ -59,6 +59,8 @@ function world(on: Parameters<TestBody>[1], entries: Record<string, unknown>, ke
       const l = lessons[Number(k.slice(1))] ?? ''
       if (k.startsWith('g')) return /답한다|보인다|28px/.test(l) ? 0.9 : 0.1
       if (k.startsWith('w')) return /모달|타이틀바/.test(l) ? 0.2 : 0.9
+      // A new lesson against an older one: they conflict.
+      if (k.startsWith('x')) return 0.9
       return 0.05
     }
     const answers = Object.fromEntries(Object.keys(body.questions).map(k => [k, { noul: noulOf(k) }]))
@@ -98,4 +100,22 @@ test('background judging goes to OpenRouter first, billed there, with both keys 
   expect(scopeOf(w.store, 'J-habit')?.scope).toBe('global')
   expect(w.urls.length).toBeGreaterThan(0)
   expect(w.urls.every(u => u === 'https://openrouter.ai/api/v1/systemone')).toBe(true)
+})
+
+test('a lesson the AI made replaces an older one it contradicts; a rule is never replaced', async ($, on) => {
+  const OLD = card({ id: 'J-old', scope: 'global', lesson: '수정 요청은 전체를 다시 만든다' })
+  const RULE = card({ id: 'J-rule', scope: 'global', isRule: true, lesson: '수정 요청은 처음부터 다시 만든다' })
+  const w = world(on, {
+    cards: [OLD, RULE],
+    candidates: [{ id: 'C-1', cases: [11, 12], kind: 'intent', scope: 'global', project: 'site', lesson: '수정 요청은 지적된 부분만 고친다' }],
+    feedbackLog: [{ at: 12, text: '아니 거기만', cardId: '', project: 'site', judgment: '지적된 부분만', candidateId: 'C-1' }, { at: 11, text: '전체 말고', cardId: '', project: 'site', judgment: '부분만', candidateId: 'C-1' }],
+  })
+  await $.session.start({ cwd: '/home/me/site', surface: null, isInteractive: false })
+  await w.clock.settle()
+  const cards = w.store.get('cards') as Card[]
+  const made = cards.find(c => c.lesson === '수정 요청은 지적된 부분만 고친다')
+  expect(made?.isAuto).toBe(true)
+  expect(cards.find(c => c.id === 'J-old')).toMatchObject({ isArchived: true, replacedBy: made?.id })
+  expect(cards.find(c => c.id === 'J-rule')?.isArchived).toBeUndefined()
+  expect(w.store.get('candidates')).toEqual([])
 })

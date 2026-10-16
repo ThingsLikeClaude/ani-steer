@@ -194,3 +194,17 @@ test('with one key, every call goes where that key reaches', async ($, on) => {
   await $.prompt.submit({ text: '다크모드 카드 배경 좀 어둡게 해줘' } as never)
   expect(w.sent[0]).toEqual(OPENROUTER)
 })
+
+test("a lesson the AI registered is not attached, even when Jev says it applies", async ($, on) => {
+  mock.store(on, { cards: [{ ...lesson, isAuto: true }] })
+  mock.clock(on)
+  mock.env(on, { TYPESAFE_API_KEY: 'test-key', HOME: '/tmp' })
+  jev(on, { is_correction: { noul: 0.05 }, has_requirement: { noul: 0.1 }, c0_same: { noul: 0.9 }, c0_satisfy: { noul: 0.9 }, c0_flip: { noul: 0.05 } })
+  let context: readonly string[] | undefined
+  on('prompt.submit', ($, e) => {
+    context = e.context
+    return { text: e.text } as never
+  })
+  await $.prompt.submit({ text: '다크모드 카드 배경 좀 어둡게 해줘' } as never)
+  expect((context ?? []).join('\n')).not.toContain('밝기 요청은 바꿀 속성부터 확인')
+})
