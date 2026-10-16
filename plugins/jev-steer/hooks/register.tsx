@@ -37,7 +37,7 @@ import {
 } from './core'
 import { contextOf, isPersonOrigin, isScriptedEntry, lineSplitter, pastPromptReader, personText } from './history'
 import type { PastPrompt } from './history'
-import { KIND_COLOR, STATE_COLOR, bandSvg, bannerSvg, cardSvg, headingSvg, leadStripSvg, paneHeaderSvg, ruleSvg, rowSvg, sectionSvg, tableHeadSvg, titleRowSvg, detailSvg, textWidth, caseCardSvg, askCardSvg, nowCardSvg, listCardSvg, capLabelSvg, type CardRow, type Glow, type Pulse, type KindCount } from './ui'
+import { KIND_COLOR, STATE_COLOR, bandSvg, bannerSvg, cardSvg, headingSvg, leadStripSvg, paneHeaderSvg, ruleSvg, rowSvg, sectionSvg, tableHeadSvg, titleRowSvg, detailSvg, textWidth, caseCardSvg, askCardSvg, nowCardSvg, listCardSvg, capLabelSvg, type CardRow, type CaseView, type Glow, type Pulse, type KindCount } from './ui'
 
 // ── constants and state ─────────────────────────────────────────────────
 
@@ -1872,7 +1872,7 @@ async function statusModel($: EngineInterface): Promise<{ lead: Lead; inventory:
           : { label: `방금 보낸 요청에 ${parts}를 붙였어요`, color: STATE_COLOR.hit }
         : { label: '방금 보낸 요청엔 붙인 게 없어요', isQuiet: true }
   const text = lead.quote ? `${lead.label} "${lead.quote}"` : lead.label
-  return { lead, inventory, line: `ani  ${text}  ·  ${inventory}`, alt: `ani: ${text}. ${inventory}` }
+  return { lead, inventory, line: `ani  ${inventory}  ·  ${text}`, alt: `ani: ${text}. ${inventory}` }
 }
 
 /**
@@ -2481,10 +2481,13 @@ export const register: Register = on => {
           ]
         : [{ label: '원문', value: c.text }]
 
-    if (e.surface === 'desktop') {
-      // Quiet list, three tabs. One thing per tab; hairlines between rows;
-      // color only where something rides the current request.
-      const { Box, Text, Button, Select, Svg, Client, Code } = $.ui.resolve(e)
+    {
+      // Quiet list, one ladder of tabs. One thing per tab; hairlines between rows;
+      // color only where something rides the current request. Desktop draws each
+      // block as a type-set image; the terminal says the same blocks in text, with
+      // the same tabs and buttons, so neither surface has less than the other.
+      const isDesk = e.surface === 'desktop'
+      const { Box, Text, Button, Svg, Client, Code } = $.ui.resolve(e)
       const cols = await read($, paneCols)
       const paneW = cols > 0 ? Math.max(320, Math.min(1400, Math.round(cols * PX_PER_CELL) - 8)) : Math.max(320, Math.min(680, Math.round((e.viewport?.columns ?? 90) * 6.6) - 40))
       const tab = await read($, paneTab)
@@ -2514,7 +2517,58 @@ export const register: Register = on => {
               : { state: 'idle', title: '이번 요청엔 붙인 게 없어요', sub: '해당되는 교훈 · 규칙이 없었어요' }
       const nowCard = nowCardSvg(paneW, nowState)
       const rule = ruleSvg(paneW)
-      const hair = (k: string) => <Svg key={k} source={rule.source} width={rule.width} height={rule.height} alt="구분선" />
+      // Terminal: one line of rule, clipped at the pane's edge.
+      const hair = (k: string) => (isDesk ? <Svg key={k} source={rule.source} width={rule.width} height={rule.height} alt="구분선" /> : <Box key={k} height={1} overflow="hidden"><Text dimColor wrap="wrap">{'─'.repeat(240)}</Text></Box>)
+      // Terminal rows: the title on a line of its own, the rest beneath it, each
+      // line indented under the title, so a narrow pane wraps words, not letters.
+      const termMeta = (bits: ({ text: string; color?: string } | null | undefined | false)[]) => {
+        const shown = bits.filter((b): b is { text: string; color?: string } => Boolean(b && b.text))
+        return shown.length ? (
+          <Box flexDirection="row" flexWrap="wrap" paddingLeft={2}>
+            {shown.flatMap((b, i) => [
+              ...(i ? [<Text key={`s${i}`} dimColor>{' · '}</Text>] : []),
+              <Text key={`m${i}`} color={b.color} dimColor={!b.color} wrap="wrap">{b.text}</Text>,
+            ])}
+          </Box>
+        ) : null
+      }
+      const termLine = (k: string, label: string, value: string, isStrong = false) => (
+        <Box key={k} flexDirection="row" gap={1} paddingLeft={2}>
+          <Box flexShrink={0}><Text dimColor>{label}</Text></Box>
+          <Box flexShrink={1} minWidth={0}><Text bold={isStrong} wrap="wrap">{value}</Text></Box>
+        </Box>
+      )
+      const termCard = (key: string, rows: CardRow[], tone?: string) => (
+        <Box key={key} flexDirection="column" gap={1}>
+          {rows.map((r, i) => (
+            <Box key={`${key}-${i}`} flexDirection="column">
+              <Box flexDirection="row" gap={1}>
+                <Box flexShrink={0}><Text color={r.tone ?? tone ?? r.dot} dimColor={r.isMuted}>{r.tone ?? tone ? '▍' : '•'}</Text></Box>
+                <Box flexShrink={1} minWidth={0}><Text bold={!r.isMuted} dimColor={r.isMuted} wrap="wrap">{r.title}</Text></Box>
+              </Box>
+              {termMeta([r.badge && { text: r.badge.text, color: r.badge.color }, r.scope ? { text: r.scope } : null, r.pill ? { text: r.pill.text, color: r.pill.color } : null])}
+              {(r.sub ?? []).map((s, j) => termLine(`${key}-${i}-s${j}`, s.label, s.value))}
+            </Box>
+          ))}
+        </Box>
+      )
+      const termCase = (key: string, c: CaseView) => (
+        <Box key={key} flexDirection="column">
+          <Box flexDirection="row" gap={1}>
+            <Box flexShrink={0}><Text color={c.dot}>▍</Text></Box>
+            <Box flexShrink={1} minWidth={0}><Text bold wrap="wrap">{c.said}</Text></Box>
+          </Box>
+          {termMeta([{ text: c.when }])}
+          {c.before ? termLine(`${key}-b`, '요청  ', c.before) : null}
+          {c.did ? termLine(`${key}-d`, 'Claude', c.did) : null}
+          {c.raw && c.raw !== c.said ? termLine(`${key}-r`, '피드백', c.raw) : null}
+          {(c.after ?? []).map((a, j) => termLine(`${key}-a${j}`, '다음  ', a))}
+          {c.understood ? termLine(`${key}-u`, '이해한 것', c.understood) : null}
+          {c.meant ? termLine(`${key}-m`, '실제 의도', c.meant) : null}
+          {c.judgment ? termLine(`${key}-j`, '판단', c.judgment, true) : null}
+          {c.lesson ? termLine(`${key}-l`, '교훈', c.lesson) : null}
+        </Box>
+      )
       const setTab = (t: Tab) => () => update($, paneTab, () => t)
       const dateOf = (ts: number) => { const d = new Date(ts); return `${d.getMonth() + 1}월 ${d.getDate()}일` }
       // A table: one image per row draws the text and the cells at fixed x,
@@ -2635,10 +2689,10 @@ export const register: Register = on => {
       })
       const labelRow = (key: string, text: string, count: number, startsFolded = false) => {
         // A section title, sized above the rows it holds.
-        const lb = sectionSvg(Math.ceil(textWidth(text) * (17 / 11) + 10 + textWidth(`${count}`) * (14 / 11) + 4), text, `${count}`)
+        const lb = isDesk ? sectionSvg(Math.ceil(textWidth(text) * (17 / 11) + 10 + textWidth(`${count}`) * (14 / 11) + 4), text, `${count}`) : null
         return (
-          <Box key={key} flexDirection="row" alignItems="center" gap={2} marginTop={1}>
-            <Svg source={lb.source} width={lb.width} height={lb.height} alt={`${text} ${count}`} />
+          <Box key={key} flexDirection="row" alignItems="center" flexWrap="wrap" gap={2} marginTop={1}>
+            {lb ? <Svg source={lb.source} width={lb.width} height={lb.height} alt={`${text} ${count}`} /> : <Text bold wrap="wrap">{`${text} · ${count}`}</Text>}
             <Button key={`${key}-fold`} variant="secondary" dimColor label={(startsFolded ? !isOpen(key) : isOpen(key)) ? '접기' : '열기'} onPress={fold(key)} />
           </Box>
         )
@@ -2647,6 +2701,7 @@ export const register: Register = on => {
       const svgOr = (key: string, sv: Drawn & { width: number }, alt: string) =>
         fitsEngine(sv) ? <Svg key={key} source={sv.source} width={sv.width} height={sv.height} alt={alt} /> : <Text key={key} wrap="wrap">{alt}</Text>
       const cardOf = (key: string, rows: CardRow[], tone?: string) => {
+        if (!isDesk) return termCard(key, rows, tone)
         const parts = rows.length > 1 ? bySize(rows, r => listCardSvg(paneW, [r], tone)) : [rows]
         const draw = (k: string, rs: CardRow[]) => svgOr(k, listCardSvg(paneW, rs, tone), rs.map(r => r.title).join('. '))
         if (parts.length === 1) return draw(key, rows)
@@ -2655,9 +2710,9 @@ export const register: Register = on => {
       // One card with its buttons, kept together: the buttons sit just under their own card and
       // the next card starts a clear step below, so no button reads as the next card's.
       const itemOf = (key: string, card: JSX.Element, buttons: JSX.Element[]) => (
-        <Box key={key} flexDirection="column" marginTop={ITEM_GAP}>
+        <Box key={key} flexDirection="column" marginTop={isDesk ? ITEM_GAP : 1}>
           {card}
-          <Box flexDirection="row" gap={1} marginTop={1}>{buttons}</Box>
+          {isDesk ? <Box flexDirection="row" gap={1} marginTop={1}>{buttons}</Box> : <Box flexDirection="row" flexWrap="wrap" columnGap={1} paddingLeft={2}>{buttons}</Box>}
         </Box>
       )
       const manageRow = (c: Card, isOn: boolean) =>
@@ -2728,6 +2783,7 @@ export const register: Register = on => {
         { key: 'needs', label: '근원 욕구', n: needs.filter(n => n.status === 'confirmed').length },
       ]
       const capOnly = (key: string, text: string, count: string) => {
+        if (!isDesk) return <Box key={key} flexDirection="row" flexWrap="wrap" marginTop={1}><Text bold>{text}</Text>{count ? <Text dimColor>{`  ${count}`}</Text> : null}</Box>
         const lb = capLabelSvg(text, count)
         return <Box key={key} marginTop={2} marginBottom={1}><Svg source={lb.source} width={lb.width} height={lb.height} alt={`${text} ${count}`} /></Box>
       }
@@ -2740,7 +2796,7 @@ export const register: Register = on => {
                 { dot: '#8a8a8a', title: out.prompt, pill: out.text ? { text: `교훈 ${out.lessonIds.length} · 규칙 ${out.reqIds.length}`, color: STATE_COLOR.hit } : { text: out.isLate ? '시간 초과' : '붙인 것 없음' } },
               ]),
               out.text ? capOnly('sent-c', 'Claude에게 함께 간 내용', `${out.ms}ms`) : null,
-              out.text ? <Code key="sent-code" source={out.text} wrap="wrap" /> : null,
+              out.text ? (isDesk ? <Code key="sent-code" source={out.text} wrap="wrap" /> : <Box key="sent-code" paddingLeft={2}><Text dimColor wrap="wrap">{out.text}</Text></Box>) : null,
               ...(sentLog.filter(x => x.text).length
                 ? [
                     capOnly('sent-log', '최근에 붙여 보낸 기록', `${sentLog.filter(x => x.text).length}`),
@@ -2879,6 +2935,8 @@ export const register: Register = on => {
         cardOf('set-card', [
           { dot: pulse.state === 'live' ? STATE_COLOR.hit : '#8a8a8a', title: `Jev 연결${via ? ` (${via})` : ''} · ${pulse.text}`, pill: { text: pulse.state === 'live' ? '정상' : '확인 필요', color: pulse.state === 'live' ? STATE_COLOR.hit : STATE_COLOR.ask } },
           { dot: '#8a8a8a', title: '프롬프트 위 상태 줄', pill: shown.band ? { text: '켜짐', color: STATE_COLOR.hit } : { text: '꺼짐' } },
+          // The terminal's status lives on the hint line under the prompt.
+          ...(isDesk ? [] : [{ dot: '#8a8a8a', title: '프롬프트 아래 상태 줄', pill: shown.chip ? { text: '켜짐', color: STATE_COLOR.hit } : { text: '꺼짐' } }]),
           { dot: '#8a8a8a', title: 'ani 패널 자동으로 열기 · 언제든 /ani', pill: shown.pane ? { text: '켜짐', color: STATE_COLOR.hit } : { text: '꺼짐' } },
           { dot: '#8a8a8a', title: '토스트 알림', pill: shown.toast ? { text: '켜짐', color: STATE_COLOR.hit } : { text: '꺼짐' } },
           { dot: '#8a8a8a', title: labels.length ? `판단 정확도 · 답한 ${labels.length}건 중 ${right}건 맞음` : '판단 정확도 · 아직 기록 없음', pill: { text: accuracy } },
@@ -2886,7 +2944,8 @@ export const register: Register = on => {
         <Box key="set-btns" flexDirection="row" gap={1} marginTop={1}>
           {[
             <Button key="ping" variant="secondary" label="Jev 지금 확인" onPress={() => ping($)} />,
-            <Button key="d-band" variant="secondary" label={`상태 줄 ${shown.band ? '끄기' : '켜기'}`} onPress={() => toggleDisplay($, 'band')} />,
+            <Button key="d-band" variant="secondary" label={`${isDesk ? '' : '위 '}상태 줄 ${shown.band ? '끄기' : '켜기'}`} onPress={() => toggleDisplay($, 'band')} />,
+            ...(isDesk ? [] : [<Button key="d-chip" variant="secondary" label={`아래 상태 줄 ${shown.chip ? '끄기' : '켜기'}`} onPress={() => toggleDisplay($, 'chip')} />]),
             <Button key="d-pane" variant="secondary" label={`자동 열기 ${shown.pane ? '끄기' : '켜기'}`} onPress={() => toggleDisplay($, 'pane')} />,
             <Button key="d-toast" variant="secondary" label={`토스트 ${shown.toast ? '끄기' : '켜기'}`} onPress={() => toggleDisplay($, 'toast')} />,
             ...(unstructured > 0 ? [<Button key="backfill" variant="secondary" label={`정리 안 된 교정 ${unstructured}개 정리`} onPress={() => backfill($)} />] : []),
@@ -2906,6 +2965,7 @@ export const register: Register = on => {
           const cd = cands.find(x => x.id === f.candidateId)
           return { f, v: { dot: c ? KIND_COLOR[c.kind] : '#8a8a8a', said: f.said ?? f.text, raw: f.text, when: ago(f.at), before: f.before, did: f.did, after: f.after, understood: f.understood, meant: f.meant, judgment: f.judgment, lesson: c?.lesson ?? (cd ? `교훈으로 정리하는 중${cd.lesson ? ` · ${cd.lesson}` : ''}` : f.judgment ? '판단 1개 · 같은 판단이 한 번 더 나오면 교훈' : undefined) } }
         })
+        if (!isDesk) return <Box key={key} flexDirection="column" gap={1} marginTop={1}>{views.map((x, i) => termCase(`${key}-${i}`, x.v))}</Box>
         // A case is several thousand characters drawn: thirty in one drawing passed the engine's limit.
         const parts = bySize(views, x => drawnOnce(`case|${paneW}|${JSON.stringify(x.v)}`, () => caseCardSvg(paneW, [x.v])))
         return (
@@ -3035,13 +3095,33 @@ export const register: Register = on => {
       ]
 
       return (
-        <Box flexDirection="column" paddingX={2} paddingY={1}>
-          <Client key="probe" module="./probe.ts" width="100%" />
-          <Svg source={head.source} width={head.width} height={head.height} alt={`ani. ${pulse.text}. ${riding}`} />
-          <Box marginTop={2}>
-            <Svg source={nowCard.source} width={nowCard.width} height={nowCard.height} alt={`지금: ${nowState.title}`} />
-          </Box>
-          <Box flexDirection="row" flexWrap="wrap" alignItems="center" gap={1} marginTop={3} marginBottom={2}>
+        <Box flexDirection="column" paddingX={isDesk ? 2 : 1} paddingY={isDesk ? 1 : 0}>
+          {isDesk ? (
+            [
+              <Client key="probe" module="./probe.ts" width="100%" />,
+              <Svg key="head" source={head.source} width={head.width} height={head.height} alt={`ani. ${pulse.text}. ${riding}`} />,
+              <Box key="now" marginTop={2}>
+                <Svg source={nowCard.source} width={nowCard.width} height={nowCard.height} alt={`지금: ${nowState.title}`} />
+              </Box>,
+            ]
+          ) : (
+            // Two lines, so a short pane at the bottom of a narrow terminal still has room for the list.
+            // Which route Jev takes is under 설정.
+            <Box key="head" flexDirection="column">
+              <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
+                <Text bold>ani</Text>
+                <Text color={pulse.state === 'live' ? STATE_COLOR.hit : STATE_COLOR.ask}>●</Text>
+                <Text dimColor wrap="wrap">{pulse.text}</Text>
+                {riding ? <Text color={STATE_COLOR.hit} wrap="wrap">{`· ${riding}`}</Text> : null}
+              </Box>
+              <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
+                <Text dimColor>지금</Text>
+                <Text bold color={nowState.state === 'hit' ? STATE_COLOR.hit : nowState.state === 'late' ? STATE_COLOR.ask : nowState.state === 'busy' ? STATE_COLOR.weigh : undefined} wrap="wrap">{nowState.title}</Text>
+                {nowState.sub ? <Text dimColor wrap="wrap">{nowState.sub}</Text> : null}
+              </Box>
+            </Box>
+          )}
+          <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={1} rowGap={isDesk ? 1 : 0} marginTop={isDesk ? 3 : 1} marginBottom={isDesk ? 2 : 0}>
             {[
               ...ladder.flatMap((t, i) => [
                 ...(i > 0 ? [<Text key={`arr-${t.key}`} dimColor>→</Text>] : []),
@@ -3069,11 +3149,11 @@ export const register: Register = on => {
               : []),
           ]}
           {(tab === 'lessons' || tab === 'rules' || tab === 'feedback') && (mine.length > 0 || reqs.length > 0 || others.length > 0 || otherReqs.length > 0) && (
-            <Box key="lesson-tools" flexDirection="row" justifyContent="flex-start" marginTop={1}>
+            <Box key="lesson-tools" flexDirection="row" justifyContent="flex-start" marginTop={isDesk ? 1 : 0}>
               <Button key="manage" variant={isManaging ? 'primary' : 'secondary'} dimColor={!isManaging} label="한 번에 관리" onPress={toggleManage} />
             </Box>
           )}
-          {(tab === 'lessons' || tab === 'rules' || tab === 'feedback') && (mine.length > 0 || reqs.length > 0) && <Box key="tools-rule" marginTop={1}>{hair('tools-hair')}</Box>}
+          {isDesk && (tab === 'lessons' || tab === 'rules' || tab === 'feedback') && (mine.length > 0 || reqs.length > 0) && <Box key="tools-rule" marginTop={1}>{hair('tools-hair')}</Box>}
           {tab === 'feedback' && feedbackView()}
           {tab === 'rules' && ruleView()}
           {tab === 'principles' && principlesView()}
@@ -3088,77 +3168,5 @@ export const register: Register = on => {
         </Box>
       )
     }
-
-    // Terminal: same order, text only.
-    const { Box, Text, Button } = $.ui.resolve(e)
-    const heading = (title: string, right?: string) => (
-      <Box flexDirection="row" marginTop={1}>
-        <Text bold>{title}</Text>
-        {right && <Text dimColor>{`  ${right}`}</Text>}
-      </Box>
-    )
-    const row = (c: Card) => (
-      <Box key={`t-${c.id}`} flexDirection="column" marginBottom={1}>
-        <Box flexDirection="row" gap={1}>
-          <Text color={KIND_COLOR[c.kind]} dimColor={c.isMuted}>▍</Text>
-          <Box flexGrow={1} flexShrink={1} minWidth={0}>
-            <Text bold={!c.isMuted} dimColor={c.isMuted} wrap="wrap">
-              {c.lesson ? `다음엔 ${c.lesson}` : c.text}
-            </Text>
-          </Box>
-          {isBorrowed(c) ? (
-            <Box flexShrink={0} flexDirection="row" gap={1}>
-              <Text dimColor>{`${projectName(c.project)}에서`}</Text>
-              <Button key={`dt-${c.id}`} label="여기서 떼기" onPress={() => placeCard($, c.id, false)} />
-            </Box>
-          ) : (
-            <Box flexShrink={0} flexDirection="row" gap={1}>
-              <Button key={`mv-${c.id}`} label={c.scope === 'global' ? '이 프로젝트로' : '전체로'} onPress={() => editCard($, c.id, { scope: c.scope === 'global' ? 'personal-project' : 'global' })} />
-              <Button key={`mu-${c.id}`} label={c.isMuted ? '켜기' : '끄기'} onPress={() => editCard($, c.id, { isMuted: !c.isMuted })} />
-              <Button key={`rm-${c.id}`} label="잊기" onPress={() => editCard($, c.id, null)} />
-            </Box>
-          )}
-        </Box>
-        {rows(c).map(r => (
-          <Text dimColor wrap="wrap">{`   ${r.label}  ${r.value}`}</Text>
-        ))}
-        <Text dimColor>{`   ${meta(c)}`}</Text>
-      </Box>
-    )
-    return (
-      <Box flexDirection="column">
-        <Text bold>ani</Text>
-        <Text dimColor>{`기억 중 ${live.length} · 지금 반영 중 ${nowApplying.length} · 판단 정확도 ${accuracy}`}</Text>
-        {nowApplying.length > 0 && heading('지금 반영 중')}
-        {nowApplying.map(row)}
-        {maybe.length > 0 && heading('해당될 수도 있어요')}
-        {maybe.map((j, i) => (
-          <Box key={`tm-${j.id}`} flexDirection="row" gap={1}>
-            <Box flexGrow={1} flexShrink={1} minWidth={0}>
-              <Text wrap="wrap">{`다음엔 ${j.label}`}</Text>
-            </Box>
-            <Button key={`yes-${i}`} variant="primary" label="적용" onPress={() => label($, j, true)} />
-            <Button key={`no-${i}`} label="상관없음" onPress={() => label($, j, false)} />
-          </Box>
-        ))}
-        {groups.map(g => (
-          <Box key={`tg-${g.key}`} flexDirection="column">
-            {heading(`${g.title} · ${g.cards.length}`)}
-            {g.cards.length === 0 && <Text dimColor>아직 없어요</Text>}
-            {g.cards.map(row)}
-          </Box>
-        ))}
-        {heading(`내 규칙 · ${reqs.length}`)}
-        {reqs.map(r => (
-          <Text dimColor wrap="wrap">{`·  ${r.text}${isBorrowed(r) ? `  (${projectName(r.project)}에서)` : ''}`}</Text>
-        ))}
-        <Box flexDirection="row" marginTop={1} gap={1}>
-          <Text dimColor>표시</Text>
-          <Button key="d-band" label={`프롬프트 위 ${shown.band ? '✓' : '—'}`} onPress={() => toggleDisplay($, 'band')} />
-          <Button key="d-chip" label={`프롬프트 아래 상태 ${shown.chip ? '✓' : '—'}`} onPress={() => toggleDisplay($, 'chip')} />
-          <Button key="d-toast" label={`토스트 ${shown.toast ? '✓' : '—'}`} onPress={() => toggleDisplay($, 'toast')} />
-        </Box>
-      </Box>
-    )
   })
 }

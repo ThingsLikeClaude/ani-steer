@@ -36,7 +36,8 @@ test('terminal: status sits under the prompt on the hint line, after the engine 
     return <Text>{(e.props as { hint: string }).hint}</Text>
   })
   const ui = await $.ui.mount({ plugin: 'jev-steer', surface: 'terminal', component: 'PromptHint', props: { hint: '? for shortcuts', isDraft: false, isWorking: false } as never })
-  expect(await ui.find({ type: 'Text', text: /\? for shortcuts {2}· {2}ani {2}요청을 보내면 해당되는 교훈 · 규칙을 골라 함께 붙여요 {2}· {2}교훈 0 · 규칙 0/ })).toBeDefined()
+  // Counts first: a narrow terminal cuts the sentence, never the counts.
+  expect(await ui.find({ type: 'Text', text: /\? for shortcuts {2}· {2}ani {2}교훈 0 · 규칙 0 {2}· {2}요청을 보내면 해당되는 교훈 · 규칙을 골라 함께 붙여요/ })).toBeDefined()
   await ui.unmount()
 })
 
@@ -75,11 +76,19 @@ test('desktop band is one type-set block, not loose text', async ($, on) => {
 
 test('a lesson reads large with intent and cause beneath it', async ($, on) => {
   engine(on, { cards: [card({ intent: '카드 배경만 어둡게', why: '어둡게를 글자 흐리게로 읽음', lesson: '밝기 요청은 바꿀 속성부터 확인' })] })
+  // The terminal reads the same tabs in text: the lesson on a line of its own,
+  // what was wanted and why it went wrong beneath it while managing.
   const term = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await term.find({ type: 'Text', text: /다음엔 밝기 요청은 바꿀 속성부터 확인/ })).toBeDefined()
-  expect(await term.find({ type: 'Text', text: /의도 {2}카드 배경만 어둡게/ })).toBeDefined()
-  expect(await term.find({ type: 'Text', text: /이유 {2}어둡게를 글자 흐리게로 읽음/ })).toBeDefined()
+  expect(await term.find({ key: 'tab-lessons' })).toBeDefined()
+  expect(await term.find({ type: 'Text', text: /^밝기 요청은 바꿀 속성부터 확인$/ })).toBeDefined()
+  await term.press({ key: 'manage' })
   await term.unmount()
+  const managing = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await managing.find({ type: 'Text', text: /^원했던 것$/ })).toBeDefined()
+  expect(await managing.find({ type: 'Text', text: /^카드 배경만 어둡게$/ })).toBeDefined()
+  expect(await managing.find({ type: 'Text', text: /^틀린 이유$/ })).toBeDefined()
+  expect(await managing.find({ type: 'Text', text: /^어둡게를 글자 흐리게로 읽음$/ })).toBeDefined()
+  await managing.unmount()
   const desk = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect(await desk.find({ type: 'Svg' })).toBeDefined()
   await desk.unmount()
@@ -88,13 +97,22 @@ test('a lesson reads large with intent and cause beneath it', async ($, on) => {
 test('the panel groups lessons by scope with their counts, no capacity, and controls each one', async ($, on) => {
   engine(on, { cards: [card({ id: 'J-1' }), card({ id: 'J-2', scope: 'global' })] })
   const term = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await term.find({ type: 'Text', text: /이 프로젝트에만 · 1$/ })).toBeDefined()
-  expect(await term.find({ type: 'Text', text: /모든 프로젝트에 · 1$/ })).toBeDefined()
-  await term.press({ key: 'mv-J-1' })
-  expect(await term.find({ type: 'Text', text: /모든 프로젝트에 · 2$/ })).toBeDefined()
-  await term.press({ key: 'rm-J-2' })
-  expect(await term.find({ type: 'Text', text: /모든 프로젝트에 · 1$/ })).toBeDefined()
+  expect(await term.find({ type: 'Text', text: /^기억 중인 교훈 · 2$/ })).toBeDefined()
+  expect(await term.find({ type: 'Text', text: /^이 프로젝트$/ })).toBeDefined()
+  expect(await term.find({ type: 'Text', text: /모든 프로젝트$/ })).toBeDefined()
+  // Controls come with 한 번에 관리, as on the desktop; no row carries them by default.
+  expect(await term.find({ key: 'to-gl-J-1' })).toBeUndefined()
+  await term.press({ key: 'manage' })
   await term.unmount()
+  const managing = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await managing.press({ key: 'to-gl-J-1' })
+  expect(await managing.find({ type: 'Text', text: /^이 프로젝트$/ })).toBeUndefined()
+  await managing.press({ key: 'rm-J-2' })
+  await managing.press({ key: 'manage' })
+  await managing.unmount()
+  const left = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await left.find({ type: 'Text', text: /^기억 중인 교훈 · 1$/ })).toBeDefined()
+  await left.unmount()
 
   const desk = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect(await desk.find({ key: 'sc-J-1' })).toBeUndefined()
@@ -251,8 +269,12 @@ test("ani's records from every project are listed here, each tagged with its pro
   await pane.unmount()
   // Forgotten here, it is not brought back by the next request.
   const term = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  await term.press({ key: 'rm-S-deploy' })
+  await term.press({ key: 'tab-lessons' })
+  await term.press({ key: 'manage' })
   await term.unmount()
+  const managing = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await managing.press({ key: 'rm-S-deploy' })
+  await managing.unmount()
   await $.prompt.submit({ text: '두 번째 요청' } as never)
   await clock.settle()
   const again = await $.ui.mount({ ...PANE, surface: 'terminal' })
