@@ -1844,7 +1844,8 @@ type Lead = { label: string; quote?: string; color?: string; isQuiet?: boolean }
 async function statusModel($: EngineInterface): Promise<{ lead: Lead; inventory: string; line: string; alt: string }> {
   const v = await read($, view)
   const pinnedIds = await read($, pinned)
-  const live = mineOf(await ownCards($)).filter(c => !c.isMuted).length
+  // Counted as the tabs count them: a rule is not also a lesson.
+  const live = mineOf(await ownCards($)).filter(c => !c.isMuted && !c.isRule).length
   const rules = mineOf(await ownCards($)).filter(c => c.isRule && !c.isMuted).length
   const out = await read($, sent)
   const onIds = [...new Set([...(out?.lessonIds ?? []), ...pinnedIds])]

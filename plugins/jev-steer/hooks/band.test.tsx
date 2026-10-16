@@ -41,6 +41,17 @@ test('terminal: status sits under the prompt on the hint line, after the engine 
   await ui.unmount()
 })
 
+test('terminal: the status line counts a rule as a rule, not also as a lesson', async ($, on) => {
+  mock.store(on, { cards: [card({ id: 'J-1' }), card({ id: 'R-1', isRule: true })] })
+  on('ui.render', { component: 'PromptHint' }, ($, e) => {
+    const { Text } = $.ui.resolve(e)
+    return <Text>{(e.props as { hint: string }).hint}</Text>
+  })
+  const ui = await $.ui.mount({ plugin: 'jev-steer', surface: 'terminal', component: 'PromptHint', props: { hint: '', isDraft: false, isWorking: false } as never })
+  expect(await ui.find({ type: 'Text', text: /ani {2}교훈 1 · 규칙 1/ })).toBeDefined()
+  await ui.unmount()
+})
+
 test('terminal band stays out of the way when there is nothing to answer', async ($, on) => {
   engine(on)
   const band = await $.ui.mount({ plugin: 'jev-steer', surface: 'terminal', component: 'AbovePrompt', props: ABOVE })
