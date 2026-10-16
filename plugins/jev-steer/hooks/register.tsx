@@ -46,8 +46,12 @@ const TITLE = 'ani · 피드백'
 const KINDS: Kind[] = ['intent', 'effort', 'missed', 'autonomy', 'buried']
 const SUBMIT_WAIT_MS = 1200
 const ARCHIVE_MAX = 200
-/** Cases kept: enough for every correction of the past weeks, well under the store's 4 MiB. */
-const FEEDBACK_MAX = 1000
+/**
+ * Cases kept. The store holds everything in 4 MiB of JSON, so the cases get
+ * CASES_BYTES of it, counted as UTF-8 (the most it could be counted as).
+ */
+const FEEDBACK_MAX = 2000
+const CASES_BYTES = 3 * 1024 * 1024
 const REATTACH_EVERY = 6
 const MAX_ATTACHED_LESSONS = 2
 /** Rules Jev judged to bear on a request, attached to it at most. */
@@ -90,6 +94,9 @@ type HistNow = { file: string; mb: number; step: string; startedAt: number; file
 const histNow = atom({ plugin: 'jev-steer', key: 'histNow' } as const, null as HistNow | null)
 /** How often a run writes its progress to the store: every write rewrites the whole store file. */
 const HISTORY_FLUSH = { files: 25, ms: 15_000 }
+/** Unjudged cases a run lets pile up before judging them. */
+const JUDGE_EVERY = 40
+type HistoryMark = { mtime: number; names: string[] }
 /**
  * The engine refuses the whole pane, and draws none of it, when one Svg's
  * source is longer than 131072 characters or it is taller than 4096 pixels.
@@ -263,7 +270,7 @@ async function bringInAni($: EngineInterface) {
     cases.push(aniCase(p, at, skills.get(p.id) ?? '', summaries[p.id]))
   }
   if (cards.length) await save($, 'cards', [...own, ...cards])
-  if (cases.length) await save($, 'feedbackLog', [...fb, ...cases].sort((a, b) => b.at - a.at).slice(0, FEEDBACK_MAX))
+  if (cases.length) await saveCases($, [...fb, ...cases])
   await save($, 'aniImported', [...done, ...patterns.map(p => p.id)])
 }
 
@@ -280,7 +287,7 @@ async function keepPersonWords($: EngineInterface) {
     const t = personText(f.text)
     return t ? [t === f.text ? f : { ...f, text: t }] : []
   })
-  await save($, 'feedbackLog', kept)
+  await saveCases($, kept)
   const own = await ownCards($)
   const words = (x: string) => personText(x) || x
   await save($, 'cards', own.map(c => (c.source === 'jev' ? { ...c, text: words(c.text), examples: c.examples?.map(words) } : c)))
@@ -521,7 +528,7 @@ async function remember($: EngineInterface, prompt: string, answers: Answers, ca
   const answer = lastAnswer
   const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
   const logIt = async (cardId: string) => {
-    await save($, 'feedbackLog', [{ at: now, text: prompt, cardId, project }, ...fb].slice(0, FEEDBACK_MAX))
+    await saveCases($, [{ at: now, text: prompt, cardId, project }, ...fb])
     $.clock.after(0, () => enrichFeedback($, now, prompt))
   }
 
@@ -554,7 +561,7 @@ async function remember($: EngineInterface, prompt: string, answers: Answers, ca
 
   // Not the same mistake as a lesson: it stays a case with one judgment. Two
   // judgments that say the same thing become a lesson candidate (placeCase).
-  await save($, 'feedbackLog', [{ at: now, text: prompt, cardId: '', project, kind: kindOf(answers), scope: scopeOf(answers) }, ...fb].slice(0, FEEDBACK_MAX))
+  await saveCases($, [{ at: now, text: prompt, cardId: '', project, kind: kindOf(answers), scope: scopeOf(answers) }, ...fb])
   $.clock.after(0, () => enrichFeedback($, now, prompt))
   return null
 }
@@ -649,7 +656,7 @@ async function placeCase($: EngineInterface, at: number) {
   const cs = ((await $.store.get('candidates')) as Candidate[] | undefined) ?? []
   await save($, 'candidates', [...cs, cand])
   const latest = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
-  await save($, 'feedbackLog', latest.map(f => (f.at === at || f.at === other.at ? { ...f, candidateId: id } : f)))
+  await saveCases($, latest.map(f => (f.at === at || f.at === other.at ? { ...f, candidateId: id } : f)))
   // The lesson text, drafted from both cases by the small model; worded again at a later start when it fails.
   const t = await wordCases($, [other, me])
   if (!t) return
@@ -744,7 +751,7 @@ async function acceptCandidate($: EngineInterface, id: string) {
     short: c.short ?? worded?.short,
   }
   await save($, 'cards', capArchive([...(await ownCards($)), card]))
-  await save($, 'feedbackLog', fb.map(f => (c.cases.includes(f.at) ? { ...f, cardId: card.id, candidateId: undefined } : f)))
+  await saveCases($, fb.map(f => (c.cases.includes(f.at) ? { ...f, cardId: card.id, candidateId: undefined } : f)))
   await save($, 'candidates', cands.filter(x => x.id !== id))
   if (!card.short) $.clock.after(0, () => shorten($))
 }
@@ -800,9 +807,40 @@ async function structure($: EngineInterface, cardId: string, intentPrompt: strin
 
 const SHORT_MAX = 24
 
+function utf8Length(s: string): number {
+  let n = 0
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i)
+    if (c >= 0xd800 && c < 0xdc00) i++
+    n += c < 0x80 ? 1 : c < 0x800 ? 2 : c >= 0xd800 && c < 0xdc00 ? 4 : 3
+  }
+  return n
+}
+
+/**
+ * Every write of the cases. A case judged and given its habit no longer needs
+ * the conversation it was read with (only judging reads it), so it is dropped:
+ * a case is then about 1.4 KB instead of 3.5. Newest first, at most
+ * FEEDBACK_MAX, and the oldest go while they would pass CASES_BYTES: a store
+ * over 4 MiB refuses every write, the lessons' too.
+ */
+export function keptCases(cases: readonly Feedback[], budget = CASES_BYTES): Feedback[] {
+  const kept = [...cases]
+    .sort((a, b) => b.at - a.at)
+    .slice(0, FEEDBACK_MAX)
+    .map(f => (f.context && f.judgment && f.pattern ? { ...f, context: undefined } : f))
+  let total = utf8Length(JSON.stringify(kept))
+  while (total > budget && kept.length) total -= utf8Length(JSON.stringify(kept.pop())) + 1
+  return kept
+}
+
+async function saveCases($: EngineInterface, cases: Feedback[]) {
+  await save($, 'feedbackLog', keptCases(cases))
+}
+
 async function setFeedback($: EngineInterface, at: number, change: Partial<Feedback>) {
   const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
-  await save($, 'feedbackLog', fb.map(f => (f.at === at ? { ...f, ...change } : f)))
+  await saveCases($, fb.map(f => (f.at === at ? { ...f, ...change } : f)))
 }
 
 /**
@@ -925,8 +963,10 @@ async function mineHistory($: EngineInterface, range?: HistoryRange) {
   if (isMining || isHistoryLive((await $.store.get('history')) as History | undefined, await $.clock.now())) return
   isMining = true
   try {
-    await readHistory($, range)
-    await judgeHistory($)
+    // A case the small model could not word is tried once a run, not at every pile-up.
+    const tried = new Set<number>()
+    await readHistory($, tried, range)
+    await judgeHistory($, tried)
     await regroupCases($)
     await setHistory($, { status: 'done' })
   } catch (err) {
@@ -961,7 +1001,7 @@ const itemOf = (p: PastPrompt) => ({
  * their own sessions is asked about: not the engine's or the app's turns, and
  * not sessions another program started, whose prompts an agent wrote.
  */
-async function readHistory($: EngineInterface, range?: HistoryRange) {
+async function readHistory($: EngineInterface, tried: Set<number>, range?: HistoryRange) {
   const now = await $.clock.now()
   const prev = (await $.store.get('history')) as History | undefined
   // No range: carry on with the run that stopped.
@@ -971,17 +1011,21 @@ async function readHistory($: EngineInterface, range?: HistoryRange) {
   const recentDone = prev && prev.status === 'done' && (prev.v ?? 1) >= HISTORY_V && prev.range !== 'all'
   const since = isResuming && prev ? prev.since : range === 'all' ? 0 : now - HISTORY_DAYS * 86_400_000
   const until = isResuming && prev ? prev.until : range === 'all' && recentDone && prev ? prev.since : liveStart
-  // A transcript is known by its file name, the session's id: the list of those read stays small.
   const files = await transcriptFiles($, since)
   if (!files.length) throw new Error('대화 기록 폴더를 찾지 못했어요')
-  if (!isResuming) await save($, 'historyFiles', [])
-  const done = new Set(isResuming ? (((await $.store.get('historyFiles')) as string[] | undefined) ?? []) : [])
+  // Files are read oldest first, so where the run is is one position: the last
+  // file's time and the names read at that time. A list of every name read
+  // (an earlier version's, 45 bytes a file) is still honoured until the run ends.
+  const legacy = new Set(isResuming ? (((await $.store.get('historyFiles')) as string[] | undefined) ?? []) : [])
+  if (!isResuming) await $.store.delete('historyFiles')
+  let mark: HistoryMark = (isResuming ? ((await $.store.get('historyMark')) as HistoryMark | undefined) : undefined) ?? { mtime: -1, names: [] }
+  const isDone = (f: { name: string; mtime: number }) => f.mtime < mark.mtime || (f.mtime === mark.mtime && mark.names.includes(f.name)) || legacy.has(f.name)
   await setHistory($, {
     status: 'running',
     since,
     until,
     files: files.length,
-    filesDone: files.filter(f => done.has(f.name)).length,
+    filesDone: files.filter(isDone).length,
     error: undefined,
     v: HISTORY_V,
     range: isResuming ? prev?.range ?? 'recent' : range ?? 'recent',
@@ -1006,24 +1050,42 @@ async function readHistory($: EngineInterface, range?: HistoryRange) {
     await update($, histNow, () => run)
   }
   const flush = async () => {
-    await save($, 'historyFiles', [...done])
+    await save($, 'historyMark', mark)
     await setHistory($, { filesDone: run.filesDone, prompts: run.prompts, found: run.found })
     flushed = { files: run.ofRun, at: await $.clock.now() }
   }
+  // Cases found wait for judging with their whole conversation (3.5 KB each): judged as they pile up, not after thousands of files.
+  let unjudged = 0
   try {
     for (const f of files) {
-      if (done.has(f.name)) continue
-      await readOne(f)
-      done.add(f.name)
+      const wasDone = isDone(f)
+      // Every file before this one is read, and so is this one once its turn ends.
+      const after = (): HistoryMark => (f.mtime === mark.mtime ? { mtime: f.mtime, names: [...mark.names, f.name] } : { mtime: f.mtime, names: [f.name] })
+      if (wasDone) {
+        mark = after()
+        continue
+      }
+      unjudged += await readOne(f)
+      mark = after()
       await show({ filesDone: run.filesDone + 1, ofRun: run.ofRun + 1 })
       if (run.ofRun - flushed.files >= HISTORY_FLUSH.files || (await $.clock.now()) - flushed.at >= HISTORY_FLUSH.ms) await flush()
+      if (unjudged >= JUDGE_EVERY) {
+        await judgeHistory($, tried)
+        unjudged = 0
+      }
+    }
+    // Read to the end: the old list of names is covered by the position.
+    if (legacy.size) {
+      legacy.clear()
+      await $.store.delete('historyFiles')
     }
   } finally {
     await flush()
     await update($, histNow, () => null)
   }
 
-  async function readOne(f: { path: string; name: string; size: number }) {
+  /** Reads one transcript; the number of cases it found. */
+  async function readOne(f: { path: string; name: string; size: number }): Promise<number> {
     const dir = f.path.replace(/\\/g, '/').split('/').slice(-2, -1)[0] ?? ''
     await show({ file: dir.replace(/^[A-Za-z]--/, ''), mb: Math.round(f.size / 100_000) / 10, step: '읽는 중' }, f.size >= 1_000_000)
     const reader = pastPromptReader(since, until)
@@ -1035,12 +1097,15 @@ async function readHistory($: EngineInterface, range?: HistoryRange) {
       // A long transcript is read in the session's own process: let it breathe.
       if (++n % 2000 === 0) await $.clock.sleep(0)
     }
-    if (reader.over() === 'agent') return show({ skipped: run.skipped + 1 })
+    if (reader.over() === 'agent') {
+      await show({ skipped: run.skipped + 1 })
+      return 0
+    }
     const prompts = reader.prompts().filter(p => !asked.has(p.uuid))
     for (const p of prompts) asked.add(p.uuid)
     const byAt = new Map((((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []).map(x => [x.at, x]))
     // A case an earlier run found gets the conversation around it, and is judged again with it.
-    for (const p of prompts.filter(x => byAt.get(x.at)?.fromHistory && !byAt.get(x.at)?.context)) await setFeedback($, p.at, caseContext(p))
+    for (const p of prompts.filter(x => byAt.get(x.at)?.fromHistory && !byAt.get(x.at)?.context && !byAt.get(x.at)?.judgment)) await setFeedback($, p.at, caseContext(p))
     const fresh = prompts.filter(p => !byAt.has(p.at))
     let found = 0
     for (let i = 0; i < fresh.length; i += HISTORY_BATCH) {
@@ -1066,10 +1131,11 @@ async function readHistory($: EngineInterface, range?: HistoryRange) {
       const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
       const have = new Set(fb.map(x => x.at))
       const add = cases.filter(c => !have.has(c.at))
-      await save($, 'feedbackLog', [...fb, ...add].sort((a, b) => b.at - a.at).slice(0, FEEDBACK_MAX))
+      await saveCases($, [...fb, ...add])
       found += add.length
     }
     await show({ prompts: run.prompts + fresh.length, found: run.found + found })
+    return found
   }
 }
 
@@ -1078,8 +1144,7 @@ async function readHistory($: EngineInterface, range?: HistoryRange) {
  * oldest first: new ones, and earlier ones that now have their conversation
  * and no habit yet, so they are paired by it.
  */
-async function judgeHistory($: EngineInterface) {
-  const tried = new Set<number>()
+async function judgeHistory($: EngineInterface, tried = new Set<number>()) {
   for (;;) {
     const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
     const isWaiting = (f: Feedback) => !f.cardId && !f.candidateId
@@ -2125,7 +2190,7 @@ export const register: Register = on => {
         await save($, 'cards', cards)
         const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
         const known = new Set(fb.map(f => f.at))
-        await save($, 'feedbackLog', [...fb, ...imp.cases.filter(f => !known.has(f.at))].sort((a, b) => b.at - a.at).slice(0, FEEDBACK_MAX))
+        await saveCases($, [...fb, ...imp.cases.filter(f => !known.has(f.at))])
         await save($, 'imports', [...done, imp.id])
       }
     }
