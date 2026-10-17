@@ -146,7 +146,7 @@ test('the panel groups lessons by scope with their counts, no capacity, and cont
 test('desktop panel: every ladder tab always shows; instructions live under feedback', async ($, on) => {
   engine(on, { cards: [card({ lesson: '밝기 요청은 바꿀 속성부터 확인' })], requirements: [{ id: 'R-1', text: '테스트는 vitest로', ts: 1, active: 1, project: 'unknown' }] })
   const first = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  for (const k of ['tab-feedback', 'tab-lessons', 'tab-rules', 'tab-principles', 'tab-needs', 'tab-sent', 'tab-settings']) expect(await first.find({ key: k })).toBeDefined()
+  for (const k of ['tab-feedback', 'tab-lessons', 'tab-rules', 'tab-principles', 'tab-goals', 'tab-needs', 'tab-sent', 'tab-settings']) expect(await first.find({ key: k })).toBeDefined()
   await first.press({ key: 'tab-feedback' })
   await first.unmount()
   const rulesTab = await $.ui.mount({ ...PANE, surface: 'desktop' })
