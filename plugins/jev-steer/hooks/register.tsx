@@ -53,7 +53,6 @@ const ARCHIVE_MAX = 200
 const FEEDBACK_MAX = 2000
 const CASES_BYTES = 3 * 1024 * 1024
 const REATTACH_EVERY = 6
-const MAX_ATTACHED_LESSONS = 2
 /** Rules Jev judged to bear on a request, attached to it at most. */
 const MAX_ATTACHED_RULES = 3
 /** A lesson the same correction has hit this often is offered as a rule. */
@@ -1330,13 +1329,10 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
   const said = mode === 'draft' || isScriptedSession || !isPerson ? '' : personText(prompt)
   try {
     const allCards = await loadCards($)
-    // Jev weighs rules as it weighs lessons: every rule in scope, lessons sharing a word with the request.
-    // Only principles and the confirmed need ride every request.
-    const candidates = [
-      ...pickCandidates(prompt, allCards.filter(c => c.isRule), project, { isEvery: true, max: MAX_RULE_CANDIDATES }),
-      // A lesson the AI made and nobody confirmed is kept and corrected, not attached.
-      ...pickCandidates(prompt, allCards.filter(c => !c.isRule && !c.isAuto), project),
-    ]
+    // Attaching starts at the rule layer: Jev weighs every rule in scope. Lessons
+    // change often and are kept and corrected, never attached. Principles, the
+    // confirmed goal and the confirmed needs ride every request.
+    const candidates = pickCandidates(prompt, allCards.filter(c => c.isRule), project, { isEvery: true, max: MAX_RULE_CANDIDATES })
     const attachedBefore = mode === 'draft' ? [] : allCards.filter(c => prevAttached.includes(c.id))
     if (mode !== 'commit') await update($, view, v => ({ ...v, weighing: candidates.map(c => c.id) }))
     const reqs = (await loadReqs($)).filter(r => r.active >= 0.4 && appliesTo(r, project))
@@ -1770,11 +1766,10 @@ async function keepPreviewPrinciple($: EngineInterface, i: number) {
   await save($, 'preview', { ...pv, principles: pv.principles.filter((_, k) => k !== i) })
 }
 
-/** What rides a request: the rules and the lessons Jev judged to apply, the strongest first, each capped. */
+/** What rides a request: the rules Jev judged to apply, the strongest first, capped. Lessons never ride. */
 function appliedIds(judgments: readonly Judgment[], candidates: readonly Card[]): string[] {
   const isRule = new Set(candidates.filter(c => c.isRule).map(c => c.id))
-  const on = judgments.filter(j => j.verdict === 'apply').sort((x, y) => y.same - x.same)
-  return [...on.filter(j => isRule.has(j.id)).slice(0, MAX_ATTACHED_RULES), ...on.filter(j => !isRule.has(j.id)).slice(0, MAX_ATTACHED_LESSONS)].map(j => j.id)
+  return judgments.filter(j => j.verdict === 'apply' && isRule.has(j.id)).sort((x, y) => y.same - x.same).slice(0, MAX_ATTACHED_RULES).map(j => j.id)
 }
 
 async function attachment($: EngineInterface, r: Result): Promise<{ text: string; lessonIds: string[]; reqIds: string[] } | null> {
@@ -1795,15 +1790,14 @@ async function attachment($: EngineInterface, r: Result): Promise<{ text: string
   const lastAt = ((await $.store.get('lastAttached')) as Record<string, number> | undefined) ?? {}
   const isFresh = (id: string) => !(lastAt[id] && lastAt[id] > compactSeq && seq - lastAt[id] < REATTACH_EVERY)
   const ruleLines = lessons.filter(c => c.isRule && isFresh(c.id))
-  const lessonLines = lessons.filter(c => !c.isRule && isFresh(c.id))
   const freshPrinciples = principles.filter(p => isFresh(p.id))
   const freshGoal = goal && isFresh(goal.id) ? goal : undefined
   const freshNeeds = needs.filter(n => isFresh(n.id))
   const freshReqs = reqs.filter(x => isFresh(x.id))
   await save($, 'sendSeq', seq)
-  const sentIds = [...ruleLines, ...lessonLines].map(c => c.id).concat(freshPrinciples.map(p => p.id), freshReqs.map(x => x.id), freshGoal ? [freshGoal.id] : [], freshNeeds.map(n => n.id))
+  const sentIds = ruleLines.map(c => c.id).concat(freshPrinciples.map(p => p.id), freshReqs.map(x => x.id), freshGoal ? [freshGoal.id] : [], freshNeeds.map(n => n.id))
   await save($, 'lastAttached', { ...lastAt, ...Object.fromEntries(sentIds.map(id => [id, seq])) })
-  if (!ruleLines.length && !lessonLines.length && !freshPrinciples.length && !freshGoal && !freshNeeds.length && !freshReqs.length) {
+  if (!ruleLines.length && !freshPrinciples.length && !freshGoal && !freshNeeds.length && !freshReqs.length) {
     // All still in context from earlier requests: nothing new to add, but they still ride.
     return { text: '', lessonIds: lessons.map(c => c.id), reqIds: reqs.map(x => x.id) }
   }
@@ -1813,7 +1807,6 @@ async function attachment($: EngineInterface, r: Result): Promise<{ text: string
     ...(freshGoal ? [`What this user is after when working with an AI: ${freshGoal.text}`] : []),
     ...(freshPrinciples.length ? ['Principles (always):', ...freshPrinciples.map(p => `- ${p.text}`)] : []),
     ...(ruleLines.length ? ['Rules:', ...ruleLines.map(lessonLine)] : []),
-    ...(lessonLines.length ? ['Lessons:', ...lessonLines.map(lessonLine)] : []),
     ...(freshReqs.length ? ['Requirements still in force:', ...freshReqs.map(x => `- ${x.text}`)] : []),
   ].join('\n')
   return { text, lessonIds: lessons.map(c => c.id), reqIds: reqs.map(x => x.id) }
@@ -1954,12 +1947,12 @@ async function statusModel($: EngineInterface): Promise<{ lead: Lead; inventory:
   const draftOn = v.isDraft ? mineOf(await ownCards($)).filter(c => v.applied.includes(c.id)) : []
   const lead: Lead = v.isDraft && !v.isBusy
     ? draftOn.length
-      ? { label: `보내면 교훈 ${draftOn.length}개를 붙여요`, quote: draftOn[0].short ?? draftOn[0].lesson, color: STATE_COLOR.ask }
-      : { label: '보내면 붙일 교훈 없음', isQuiet: true }
+      ? { label: `보내면 규칙 ${draftOn.length}개를 붙여요`, quote: draftOn[0].short ?? draftOn[0].lesson, color: STATE_COLOR.ask }
+      : { label: '보내면 붙일 규칙 없음', isQuiet: true }
     : v.isBusy
-    ? { label: '방금 보낸 요청에 붙일 교훈 · 규칙을 고르는 중…', isQuiet: true }
+    ? { label: '방금 보낸 요청에 붙일 규칙을 고르는 중…', isQuiet: true }
     : recentPrompts.length === 0
-      ? { label: '요청을 보내면 해당되는 교훈 · 규칙을 골라 함께 붙여요', isQuiet: true }
+      ? { label: '요청을 보내면 해당되는 규칙을 골라 함께 붙여요', isQuiet: true }
       : out?.isLate && !parts
         ? { label: 'Jev가 늦어 방금 보낸 요청엔 아무것도 붙이지 못했어요', isQuiet: true }
         : parts
@@ -2325,7 +2318,7 @@ export const register: Register = on => {
     if (record.lessonIds.length && (await read($, display)).toast) {
       const first = (await ownCards($)).find(c => c.id === record.lessonIds[0])
       $.ui.toast(record.text
-        ? `ani · 교훈 ${record.lessonIds.length}개를 붙여 보냈어요: ${first?.short ?? first?.lesson ?? ''}`
+        ? `ani · 규칙 ${record.lessonIds.length}개를 붙여 보냈어요: ${first?.short ?? first?.lesson ?? ''}`
         : `ani · 교훈 ${record.lessonIds.length}개는 이미 대화에 있어 다시 붙이지 않았어요`, { timeoutMs: 4000 })
     }
     const log = ((await $.store.get('sentLog')) as (typeof record)[] | undefined) ?? []
@@ -2355,15 +2348,15 @@ export const register: Register = on => {
     return r
   })
 
-  // A lesson the person chose to apply joins the request still running (its
-  // remaining model calls), then drops at the end of the turn.
+  // A rule the person chose to apply joins the request still running (its
+  // remaining model calls), then drops at the end of the turn. Lessons never ride.
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
     const ids = await read($, pinned)
     if (!ids.length) return composed
-    const cards = (await ownCards($)).filter(c => ids.includes(c.id) && !c.isMuted)
+    const cards = (await ownCards($)).filter(c => ids.includes(c.id) && c.isRule && !c.isMuted)
     if (!cards.length) return composed
-    const text = ['[ani] The user confirmed these lessons apply to the current request. Follow them:', ...cards.map(lessonLine)].join('\n')
+    const text = ['[ani] The user confirmed these rules apply to the current request. Follow them:', ...cards.map(lessonLine)].join('\n')
     return { sections: [...composed.sections, { id: 'jev-steer:pinned', text, scope: 'session' as const }] }
   })
 
@@ -2431,7 +2424,7 @@ export const register: Register = on => {
       if (!(await read($, hasKey)) && !(await read($, keyLater))) {
         const color = STATE_COLOR.ask
         const card = askCardSvg(full - 40, {
-          question: 'Jev 키가 있어야 ani가 교훈을 골라 붙일 수 있어요',
+          question: 'Jev 키가 있어야 ani가 규칙을 골라 붙일 수 있어요',
           lesson: '키 없이는 교정 기록·교훈 판단·승격이 모두 멈춰 있어요',
           intent: 'typesafe.ai 또는 openrouter.ai 키를 숨김 입력창에 붙여넣어요',
           why: '키는 채팅에 남지 않고 Claude 설정 파일(settings.json)에만 저장돼요',
@@ -2596,21 +2589,21 @@ export const register: Register = on => {
       const head = paneHeaderSvg(paneW, pulse, riding)
       const sentNow = await read($, sent)
       const nowState: { state: 'busy' | 'hit' | 'idle' | 'late'; title: string; sub?: string } = v.isBusy
-        ? { state: 'busy', title: 'Jev가 이번 요청에 붙일 교훈을 고르는 중', sub: `교훈 ${live.length}개 · 규칙 ${reqs.length}개 중에서` }
+        ? { state: 'busy', title: 'Jev가 이번 요청에 붙일 규칙을 고르는 중', sub: `규칙 ${live.filter(c => c.isRule).length}개 · 지시 ${reqs.length}개 중에서` }
         : v.isDraft
           ? (() => {
               const draftCards = mine.filter(c => v.applied.includes(c.id))
               return draftCards.length
-                ? { state: 'busy' as const, title: `보내면 교훈 ${draftCards.length}개를 붙여요`, sub: draftCards.map(c => c.short ?? c.lesson ?? c.text).join(' · ') }
-                : { state: 'idle' as const, title: '보내면 붙일 교훈이 없어요', sub: '쓰는 중인 요청을 Jev가 미리 봤어요' }
+                ? { state: 'busy' as const, title: `보내면 규칙 ${draftCards.length}개를 붙여요`, sub: draftCards.map(c => c.short ?? c.lesson ?? c.text).join(' · ') }
+                : { state: 'idle' as const, title: '보내면 붙일 규칙이 없어요', sub: '쓰는 중인 요청을 Jev가 미리 봤어요' }
             })()
         : !sentNow
-          ? { state: 'idle', title: '요청을 기다리는 중', sub: '보내면 해당되는 교훈 · 규칙을 골라 함께 붙여요' }
+          ? { state: 'idle', title: '요청을 기다리는 중', sub: '보내면 해당되는 규칙을 골라 함께 붙여요' }
           : sentNow.isLate
             ? { state: 'late', title: 'Jev가 늦어 아무것도 붙이지 못했어요', sub: '판단은 다음 요청부터 반영돼요' }
             : sentNow.text
-              ? { state: 'hit', title: `교훈 ${sentNow.lessonIds.length}개 · 규칙 ${sentNow.reqIds.length}개를 붙였어요`, sub: `"${sentNow.prompt.slice(0, 40)}${sentNow.prompt.length > 40 ? '…' : ''}"` }
-              : { state: 'idle', title: '이번 요청엔 붙인 게 없어요', sub: '해당되는 교훈 · 규칙이 없었어요' }
+              ? { state: 'hit', title: `규칙 ${sentNow.lessonIds.length}개 · 지시 ${sentNow.reqIds.length}개를 붙였어요`, sub: `"${sentNow.prompt.slice(0, 40)}${sentNow.prompt.length > 40 ? '…' : ''}"` }
+              : { state: 'idle', title: '이번 요청엔 붙인 게 없어요', sub: '해당되는 규칙이 없었어요' }
       const nowCard = nowCardSvg(paneW, nowState)
       const rule = ruleSvg(paneW)
       // Terminal: one line of rule, clipped at the pane's edge.
@@ -2779,7 +2772,7 @@ export const register: Register = on => {
         title: c.lesson ?? c.text,
         scope: scopeName(c),
         isMuted: c.isMuted,
-        pill: weighing.has(c.id) ? { text: '판단 중', color: STATE_COLOR.weigh } : isOn ? { text: '반영 중', color: STATE_COLOR.hit } : { text: c.isAuto && !c.isRule ? `AI 등록 · 안 붙음 · ${c.count ?? 1}회` : `${c.count ?? 1}회` },
+        pill: weighing.has(c.id) ? { text: '판단 중', color: STATE_COLOR.weigh } : isOn ? { text: '반영 중', color: STATE_COLOR.hit } : { text: c.isRule ? `${c.count ?? 1}회` : `안 붙음 · ${c.count ?? 1}회` },
         shimmer: weighing.has(c.id) ? 'weigh' : isOn && fresh(c) ? 'fresh' : undefined,
         sub: isOn || isManaging ? subOf(c) : undefined,
       })
@@ -2913,7 +2906,7 @@ export const register: Register = on => {
                 : []),
               ...(v.judgments.length
                 ? [
-                    capOnly('sent-j', 'Jev가 판단한 교훈 · 규칙', `${v.judgments.length}`),
+                    capOnly('sent-j', 'Jev가 판단한 규칙', `${v.judgments.length}`),
                     cardOf('sent-jc', v.judgments.map(j => {
                       const c = mine.find(x => x.id === j.id)
                       const isOut = out.lessonIds.includes(j.id)
@@ -3212,6 +3205,7 @@ export const register: Register = on => {
             ]
           : []
       const lessonCards = [
+        ...(mine.some(c => !c.isRule) ? [emptyNote('lessons-note', `교훈은 요청에 붙지 않아요. 자주 바뀌는 층이라 AI가 쌓고 고쳐요. 같은 교정이 ${PROMOTE_AT}번 쌓여 규칙으로 올리면 그때부터 붙어요.`)] : []),
         ...(pending.length
           ? [
               labelRow('s-maybe', '답 필요', pending.length),

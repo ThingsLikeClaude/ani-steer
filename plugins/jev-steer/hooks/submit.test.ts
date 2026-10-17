@@ -5,14 +5,16 @@ const lesson = {
   id: 'J-1', ts: 1, text: '아니 배경만 바꾸라고', kind: 'intent', scope: 'personal-project', project: 'unknown', source: 'jev',
   keywords: ['배경', '어둡게'], count: 1, intent: '카드 배경만 어둡게', why: '어둡게를 글자 흐리게로 읽음', lesson: '밝기 요청은 바꿀 속성부터 확인',
 }
+/** The same card promoted: attaching starts at the rule layer. */
+const asRule = { ...lesson, isRule: true, count: 3 }
 
 function jev(on: Parameters<Parameters<typeof test>[1]>[1], answers: Record<string, unknown>) {
   on('http.fetch', () => ({ value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ answers }) } }) as never)
   on('ui.toast', () => ({ value: undefined }) as never)
 }
 
-test('a lesson Jev judges to apply rides with the prompt, before Claude answers', async ($, on) => {
-  mock.store(on, { cards: [lesson] })
+test('a rule Jev judges to apply rides with the prompt, before Claude answers', async ($, on) => {
+  mock.store(on, { cards: [asRule] })
   mock.clock(on)
   mock.env(on, { TYPESAFE_API_KEY: 'test-key', HOME: '/tmp' })
   jev(on, { is_correction: { noul: 0.05 }, has_requirement: { noul: 0.1 }, c0_same: { noul: 0.9 }, c0_satisfy: { noul: 0.9 }, c0_flip: { noul: 0.05 } })
@@ -152,7 +154,7 @@ test('a rule that does not bear on the request stays home', async ($, on) => {
 /** Jev answering at whichever service is asked; each call's service, key and model recorded. */
 function routed(on: Parameters<TestBody>[1], env: Record<string, string>, refuse: (url: string) => number = () => 0) {
   const sent: { url: string; auth: string; model: string }[] = []
-  mock.store(on, { cards: [lesson] })
+  mock.store(on, { cards: [asRule] })
   mock.clock(on)
   mock.env(on, { HOME: '/tmp', ...env })
   on('http.fetch', ($, e) => {
@@ -195,11 +197,17 @@ test('with one key, every call goes where that key reaches', async ($, on) => {
   expect(w.sent[0]).toEqual(OPENROUTER)
 })
 
-test("a lesson the AI registered is not attached, even when Jev says it applies", async ($, on) => {
-  mock.store(on, { cards: [{ ...lesson, isAuto: true }] })
+test("no lesson rides, the person's or the AI's, even when Jev would say it applies; Jev is not even asked", async ($, on) => {
+  mock.store(on, { cards: [lesson, { ...lesson, id: 'J-2', isAuto: true }] })
   mock.clock(on)
   mock.env(on, { TYPESAFE_API_KEY: 'test-key', HOME: '/tmp' })
-  jev(on, { is_correction: { noul: 0.05 }, has_requirement: { noul: 0.1 }, c0_same: { noul: 0.9 }, c0_satisfy: { noul: 0.9 }, c0_flip: { noul: 0.05 } })
+  on('ui.toast', () => ({ value: undefined }) as never)
+  let asked = ''
+  on('http.fetch', ($, e) => {
+    asked += String((e as { init?: { body?: string } }).init?.body ?? '')
+    const answers = { is_correction: { noul: 0.05 }, has_requirement: { noul: 0.1 }, c0_same: { noul: 0.9 }, c0_satisfy: { noul: 0.9 }, c0_flip: { noul: 0.05 } }
+    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ answers }) } } as never
+  })
   let context: readonly string[] | undefined
   on('prompt.submit', ($, e) => {
     context = e.context
@@ -207,4 +215,6 @@ test("a lesson the AI registered is not attached, even when Jev says it applies"
   })
   await $.prompt.submit({ text: '다크모드 카드 배경 좀 어둡게 해줘' } as never)
   expect((context ?? []).join('\n')).not.toContain('밝기 요청은 바꿀 속성부터 확인')
+  expect((context ?? []).join('\n')).not.toContain('Lessons:')
+  expect(asked).not.toContain('밝기 요청은 바꿀 속성부터 확인')
 })

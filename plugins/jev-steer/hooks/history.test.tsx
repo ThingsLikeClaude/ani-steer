@@ -209,7 +209,7 @@ test('past conversations become cases, and the same mistake in two projects one 
   expect((await pane.find({ key: 'tab-lessons' }))?.text).toMatch(/교훈 1$/)
   await pane.press({ key: 'tab-lessons' })
   expect(await pane.find({ key: 's-cand' })).toBeUndefined()
-  expect(await sourceOf(pane, /주소를 넘길 땐 배포된 주소인지 확인/)).toContain('AI 등록 · 안 붙음')
+  expect(await sourceOf(pane, /주소를 넘길 땐 배포된 주소인지 확인/)).toContain('안 붙음')
   await pane.unmount()
 })
 

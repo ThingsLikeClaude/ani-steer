@@ -37,7 +37,7 @@ test('terminal: status sits under the prompt on the hint line, after the engine 
   })
   const ui = await $.ui.mount({ plugin: 'jev-steer', surface: 'terminal', component: 'PromptHint', props: { hint: '? for shortcuts', isDraft: false, isWorking: false } as never })
   // Counts first: a narrow terminal cuts the sentence, never the counts.
-  expect(await ui.find({ type: 'Text', text: /\? for shortcuts {2}· {2}ani {2}교훈 0 · 규칙 0 {2}· {2}요청을 보내면 해당되는 교훈 · 규칙을 골라 함께 붙여요/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /\? for shortcuts {2}· {2}ani {2}교훈 0 · 규칙 0 {2}· {2}요청을 보내면 해당되는 규칙을 골라 함께 붙여요/ })).toBeDefined()
   await ui.unmount()
 })
 

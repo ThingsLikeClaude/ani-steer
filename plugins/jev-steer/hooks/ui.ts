@@ -464,7 +464,7 @@ export function paneHeaderSvg(width: number, pulse: Pulse, riding: string): { so
   parts.push(
     `<text x="${nameX}" y="${top + 31}" font-family="${FONT}" font-size="38" font-weight="800" letter-spacing="-0.8" class="t1">ani</text>`,
     `<text x="${nameX + 2}" y="${top + markH - 1}" font-family="${FONT}" font-size="11.5" font-weight="600" letter-spacing="1.4" class="t3">AGENT NEGATIVE INDEX</text>`,
-    `<text x="0" y="${h - 6}" font-family="${FONT}" font-size="15" font-weight="500" class="t2">${escapeXml(riding || '이번 요청에 붙인 교훈 · 규칙 없음')}</text>`,
+    `<text x="0" y="${h - 6}" font-family="${FONT}" font-size="15" font-weight="500" class="t2">${escapeXml(riding || '이번 요청에 붙인 규칙 없음')}</text>`,
   )
   const pw = textWidth(pulse.text) * (12.5 / 11)
   parts.push(
