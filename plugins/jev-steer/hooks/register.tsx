@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Candidate, Card, Display, Need, Preview, Principle, Feedback, Judgment, Kind, Label, Requirement, Scope, Sent, View } from '../types'
+import type { Candidate, Card, Display, Goal, Need, Preview, Principle, Feedback, Judgment, Kind, Label, Requirement, Scope, Sent, View } from '../types'
 import {
   jevBody,
   jevRoutesOf,
@@ -75,7 +75,7 @@ const openSections = atom({ plugin: 'jev-steer', key: 'openSections' } as const,
 const ackedLead = atom({ plugin: 'jev-steer', key: 'ackedLead' } as const, '')
 type Beat = { ok: boolean | null; ms: number; at: number; detail?: string }
 const beat = atom({ plugin: 'jev-steer', key: 'beat' } as const, { ok: null, ms: 0, at: 0 } as Beat)
-type Tab = 'feedback' | 'lessons' | 'rules' | 'principles' | 'needs' | 'sent' | 'settings'
+type Tab = 'feedback' | 'lessons' | 'rules' | 'principles' | 'goals' | 'needs' | 'sent' | 'settings'
 const paneTab = atom({ plugin: 'jev-steer', key: 'paneTab' } as const, 'lessons' as Tab)
 const paneCols = atom({ plugin: 'jev-steer', key: 'paneCols' } as const, 0)
 const sent = atom({ plugin: 'jev-steer', key: 'sent' } as const, null as Sent | null)
@@ -149,6 +149,8 @@ export function bySize<T>(items: readonly T[], measure: (x: T) => Drawn, budget 
 
 /** Rows between one card-with-buttons and the next: twice the gap between a card and its own buttons. */
 const ITEM_GAP = 2
+/** How many rules (or lessons) a principle preview reads, the most repeated first. */
+const PREVIEW_SOURCES = 40
 /** How many rows a long list in the panel shows before "더 보기": every drawn case is carried to the screen on each redraw. */
 const listLimit = atom({ plugin: 'jev-steer', key: 'listLimit' } as const, 10)
 /** Rows one "더 보기" adds. */
@@ -1405,11 +1407,12 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
     }
 
     if (said && noul(answers, 'is_correction') >= 0.6) {
-      const ns = await loadNeeds($)
-      const need = ns.find(n => n.status === 'confirmed')
-      if (need) {
-        const fitAns = await askJev($, { correction: said.slice(0, 1500) }, { fit: { type: 'noul', instructions: `Is this correction consistent with what the user says they want underneath: "${need.text}"`, criteria: { true: 'consistent', false: 'points somewhere else' } } }, { isQuick: true })
-        if (fitAns && noul(fitAns, 'fit') < 0.3) await save($, 'needs', ns.map(n => (n.id === need.id ? { ...n, misfit: (n.misfit ?? 0) + 1 } : n)))
+      // A correction that points away from the goal counts against it; a value beneath it is not judged by one correction.
+      const gs = await loadGoals($)
+      const goal = gs.find(g => g.status === 'confirmed')
+      if (goal) {
+        const fitAns = await askJev($, { correction: said.slice(0, 1500) }, { fit: { type: 'noul', instructions: `Is this correction consistent with what the user is after when working with an AI: "${goal.text}"`, criteria: { true: 'consistent', false: 'points somewhere else' } } }, { isQuick: true })
+        if (fitAns && noul(fitAns, 'fit') < 0.3) await save($, 'goals', gs.map(g => (g.id === goal.id ? { ...g, misfit: (g.misfit ?? 0) + 1 } : g)))
       }
     }
     const judgments = judge(candidates, answers).filter(j => j.id !== recorded?.cardId)
@@ -1539,80 +1542,194 @@ async function findPrinciple($: EngineInterface, ruleId: string) {
 async function setPrinciple($: EngineInterface, id: string, status: Principle['status']) {
   const ps = await loadPrinciples($)
   await save($, 'principles', ps.map(p => (p.id === id ? { ...p, status } : p)))
-  if (status === 'active') $.clock.after(0, () => proposeNeeds($))
+  if (status === 'active') $.clock.after(0, () => proposeGoals($))
+}
+
+async function loadGoals($: EngineInterface): Promise<Goal[]> {
+  return ((await $.store.get('goals')) as Goal[] | undefined) ?? []
+}
+
+/** How many principles a goal must serve to stand above them all: four in five, never fewer than two. */
+function goalBar(principles: number): number {
+  return Math.max(2, Math.ceil(principles * 0.8))
+}
+
+/** The last time goal or need candidates were written: what was tried and what Jev kept. */
+type LadderRun = { at: number; status: 'running' | 'done' | 'error'; tried: number; kept: number; error?: string }
+const parseList = (text: string) => {
+  try {
+    return (JSON.parse(text.match(/\[[\s\S]*\]/)?.[0] ?? '') as { text?: string }[]).map(x => (x.text ?? '').trim()).filter(Boolean)
+  } catch {
+    return []
+  }
 }
 
 /**
- * Two or more principles and no need on the table: read 2–3 hypotheses of what
- * they share, each with the principles it rests on. None goes to Claude until
+ * The goal above the principles: Haiku writes two or three states the person
+ * wants from working with an AI, then Jev asks of every principle whether
+ * following it brings that state closer. Only a candidate that most principles
+ * serve, and that is not one of them said again, is kept. Nothing rides until
  * the person confirms one.
  */
-async function proposeNeeds($: EngineInterface) {
+async function proposeGoals($: EngineInterface, isAsked = false) {
   const ps = (await loadPrinciples($)).filter(p => p.status === 'active')
-  const ns = await loadNeeds($)
-  if (ps.length < 2 || ns.some(n => n.status !== 'discarded')) return
+  const gs = await loadGoals($)
+  if (ps.length < 2) return
+  if (!isAsked && gs.some(g => g.status !== 'discarded')) return
+  const at = await $.clock.now()
+  await save($, 'goalRun', { at, status: 'running', tried: 0, kept: 0 } satisfies LadderRun)
   const r = await $.model.complete({
     model: 'haiku',
     maxTokens: 400,
     timeoutMs: 20000,
     system:
-      '한 사용자가 AI 에이전트에게 반복해서 요구해 온 원칙 목록이 주어집니다. 이 원칙들 밑에 깔린 사용자의 근원 욕구를 가설로 2~3개 쓰세요. ' +
-      '각각 사용자의 1인칭 한국어 한 문장(30자 이내, 말줄임표 금지), 그리고 근거가 된 원칙 번호. 서로 다른 해석이 되게. ' +
-      'JSON만 답하세요: [{"text": "...", "from": [1, 2]}]',
+      '한 사용자가 AI 에이전트에게 반복해서 요구해 온 원칙 목록이 주어집니다. 이 원칙들이 모두 수단이 되는, 한 단계 위의 목표를 2~3개 쓰세요. ' +
+      '목표는 이 사람이 AI와 일할 때 얻고 싶은 상태입니다. 원칙 하나를 바꿔 말하지 말고, "AI가 ~하지 않았으면" 대신 "내가 ~하고 싶다/~였으면 좋겠다"로. ' +
+      '각각 1인칭 한국어 한 문장(45자 이내, 말줄임표 금지). 서로 다른 목표가 되게. JSON만 답하세요: [{"text": "..."}]',
     prompt: ps.map((p, i) => `${i + 1}. ${p.text}`).join('\n'),
   })
-  if (!r.isAnswered) return
-  try {
-    const list = JSON.parse(r.text.match(/\[[\s\S]*\]/)?.[0] ?? '') as { text?: string; from?: number[] }[]
-    const now = await $.clock.now()
-    const fresh: Need[] = list.filter(x => x.text).slice(0, 3).map((x, i) => ({
-      id: `N-${now}-${i}`,
-      text: x.text as string,
-      from: (x.from ?? []).map(n => ps[n - 1]?.id).filter(Boolean) as string[],
-      status: 'hypothesis',
-      ts: now,
-    }))
-    await save($, 'needs', [...ns, ...fresh])
-  } catch {
-    // no hypotheses this time
-  }
+  const texts = r.isAnswered ? parseList(r.text).slice(0, 3) : []
+  if (!texts.length) return save($, 'goalRun', { at, status: 'error', tried: 0, kept: 0, error: r.isAnswered ? 'Haiku 답을 읽지 못했어요' : `Haiku 응답 없음 (${r.reason})` } satisfies LadderRun)
+  const q: Record<string, unknown> = {}
+  texts.forEach((t, i) => {
+    ps.forEach((p, j) => (q[`g${i}_p${j}`] = { type: 'noul', instructions: `Following this principle brings the user closer to the goal "${t}": "${p.text}"`, criteria: { true: 'it serves the goal', false: 'unrelated or against it' } }))
+    q[`g${i}_same`] = { type: 'noul', instructions: `Is the goal "${t}" only one of the principles said again in other words, rather than something they all serve?`, criteria: { true: 'a restatement of one principle', false: 'a goal above them' } }
+  })
+  const a = await askJev($, { principles: ps.map(p => p.text) }, q)
+  if (!a) return save($, 'goalRun', { at, status: 'error', tried: texts.length, kept: 0, error: 'Jev에 연결하지 못했어요' } satisfies LadderRun)
+  const bar = goalBar(ps.length)
+  const kept: Goal[] = texts
+    .map((t, i) => ({ t, serves: ps.filter((_, j) => noul(a, `g${i}_p${j}`) >= 0.5), same: noul(a, `g${i}_same`) }))
+    .filter(x => x.serves.length >= bar && x.same < 0.5)
+    .sort((x, y) => y.serves.length - x.serves.length)
+    .map((x, i) => ({ id: `G-${at}-${i}`, text: x.t, from: x.serves.map(p => p.id), covers: x.serves.length, of: ps.length, status: 'hypothesis', ts: at }))
+  // A new run replaces the open candidates; a confirmed goal stays until the person picks another.
+  await save($, 'goals', [...gs.filter(g => g.status !== 'hypothesis'), ...kept])
+  await save($, 'goalRun', { at, status: 'done', tried: texts.length, kept: kept.length } satisfies LadderRun)
 }
 
-/** Confirm one hypothesis (the others are set aside), or discard one. */
-async function setNeed($: EngineInterface, id: string, status: Need['status']) {
-  const ns = await loadNeeds($)
-  await save($, 'needs', ns.map(n => (n.id === id ? { ...n, status, misfit: 0 } : status === 'confirmed' && n.status === 'hypothesis' ? { ...n, status: 'discarded' } : n)))
+/** One goal at a time: confirming one sets the others aside, and then the needs beneath it are read. */
+async function setGoal($: EngineInterface, id: string, status: Goal['status']) {
+  const gs = await loadGoals($)
+  await save($, 'goals', gs.map(g => (g.id === id ? { ...g, status, misfit: 0 } : status === 'confirmed' && g.status !== 'discarded' ? { ...g, status: 'discarded' as const } : g)))
+  if (status === 'confirmed') $.clock.after(0, () => proposeNeeds($))
 }
 
-/** The person's own words, kept as they are: "근원 욕구: …" in a prompt. */
-async function writeNeed($: EngineInterface, text: string) {
-  const ns = await loadNeeds($)
-  const now = await $.clock.now()
-  await save($, 'needs', [...ns.map(n => (n.status === 'discarded' ? n : { ...n, status: 'discarded' as const })), { id: `N-${now}`, text, from: [], status: 'confirmed', misfit: 0, ts: now }])
+/** The confirmed need the person calls the largest; before that mark existed, the newest confirmed one. */
+function mainNeedOf(ns: readonly Need[]): Need | undefined {
+  const conf = ns.filter(n => n.status === 'confirmed')
+  return conf.find(n => n.isMain) ?? [...conf].sort((a, b) => b.ts - a.ts)[0]
 }
-
 
 /**
- * Run the upper ladder on the lessons as they stand, without the counts it
- * normally waits for: Haiku groups lessons that share a reason into principle
- * drafts, Jev checks each lesson belongs to its group, then Haiku reads need
- * hypotheses from the drafts. Shown as a preview; nothing is confirmed.
+ * Below the goal: why it matters to this person. Corrections cannot show a
+ * value, so Haiku only proposes, on different axes, and Jev drops any that is
+ * the goal said again. The person picks, or writes their own.
+ */
+async function proposeNeeds($: EngineInterface, isAsked = false) {
+  const goal = (await loadGoals($)).find(g => g.status === 'confirmed')
+  const ns = await loadNeeds($)
+  if (!goal) return
+  if (!isAsked && ns.some(n => n.status === 'hypothesis')) return
+  const at = await $.clock.now()
+  await save($, 'needRun', { at, status: 'running', tried: 0, kept: 0 } satisfies LadderRun)
+  const held = ns.filter(n => n.status === 'confirmed').map(n => n.text)
+  const r = await $.model.complete({
+    model: 'haiku',
+    maxTokens: 400,
+    timeoutMs: 20000,
+    system:
+      '한 사람이 AI와 일할 때 바라는 목표가 주어집니다. 그 목표가 이 사람에게 왜 중요한지, 한 단계 더 아래의 가치를 서로 다른 축에서 3개 쓰세요 ' +
+      '(예: 시간과 주도권, 유능함과 성취, 인정과 관계 가운데 서로 다른 것). AI의 행동이 아니라 이 사람이 삶에서 바라는 것으로. ' +
+      '각각 1인칭 한국어 한 문장(40자 이내, 말줄임표 금지). 이미 확정된 것과 겹치지 않게. JSON만 답하세요: [{"text": "..."}]',
+    prompt: `목표: ${goal.text}${held.length ? `\n이미 확정된 근원 욕구:\n${held.map(t => `- ${t}`).join('\n')}` : ''}`,
+  })
+  const texts = (r.isAnswered ? parseList(r.text) : []).filter(t => !held.includes(t)).slice(0, 3)
+  if (!texts.length) return save($, 'needRun', { at, status: 'error', tried: 0, kept: 0, error: r.isAnswered ? 'Haiku 답을 읽지 못했어요' : `Haiku 응답 없음 (${r.reason})` } satisfies LadderRun)
+  const q: Record<string, unknown> = {}
+  texts.forEach((t, i) => (q[`n${i}_same`] = { type: 'noul', instructions: `Is "${t}" only the goal "${goal.text}" said again, rather than a reason the goal matters to this person?`, criteria: { true: 'the goal said again', false: 'a value beneath it' } }))
+  const a = await askJev($, { goal: goal.text }, q)
+  const kept: Need[] = texts
+    .filter((_, i) => !a || noul(a, `n${i}_same`) < 0.5)
+    .map((t, i) => ({ id: `N-${at}-${i}`, text: t, from: [goal.id], status: 'hypothesis', ts: at }))
+  await save($, 'needs', [...ns.filter(n => n.status !== 'hypothesis'), ...kept])
+  await save($, 'needRun', { at, status: 'done', tried: texts.length, kept: kept.length } satisfies LadderRun)
+}
+
+/**
+ * Which principles and goal serve a confirmed need, as Jev reads it. Shown under
+ * the need, so the person sees how far down it reaches.
+ */
+async function linkNeed($: EngineInterface, id: string) {
+  const need = (await loadNeeds($)).find(n => n.id === id)
+  if (!need) return
+  const ps = (await loadPrinciples($)).filter(p => p.status === 'active')
+  const goal = (await loadGoals($)).find(g => g.status === 'confirmed')
+  const ups = [...(goal ? [{ id: goal.id, text: goal.text }] : []), ...ps.map(p => ({ id: p.id, text: p.text }))]
+  if (!ups.length) return
+  const q = Object.fromEntries(ups.map((u, i) => [`u${i}`, { type: 'noul', instructions: `Does this serve what the person wants underneath, "${need.text}": "${u.text}"`, criteria: { true: 'it serves that want', false: 'unrelated' } }]))
+  const a = await askJev($, { want: need.text }, q)
+  if (!a) return
+  const from = ups.filter((_, i) => noul(a, `u${i}`) >= 0.6).map(u => u.id)
+  const ns = await loadNeeds($)
+  await save($, 'needs', ns.map(n => (n.id === id ? { ...n, from } : n)))
+}
+
+/** Confirm a need (several can hold; the first is the largest until the person says otherwise), or set one aside. */
+async function setNeed($: EngineInterface, id: string, status: Need['status']) {
+  const ns = await loadNeeds($)
+  const hasMain = ns.some(n => n.status === 'confirmed' && n.isMain && n.id !== id)
+  let next = ns.map(n => (n.id === id ? { ...n, status, isMain: status === 'confirmed' ? !hasMain : false } : n))
+  // Setting the largest aside hands the mark to the newest that is left.
+  if (!next.some(n => n.status === 'confirmed' && n.isMain)) {
+    const heir = [...next].filter(n => n.status === 'confirmed').sort((a, b) => b.ts - a.ts)[0]
+    if (heir) next = next.map(n => (n.id === heir.id ? { ...n, isMain: true } : n))
+  }
+  await save($, 'needs', next)
+  if (status === 'confirmed') $.clock.after(0, () => linkNeed($, id))
+}
+
+/** Mark one confirmed need as the largest. */
+async function setMainNeed($: EngineInterface, id: string) {
+  const ns = await loadNeeds($)
+  await save($, 'needs', ns.map(n => (n.status === 'confirmed' ? { ...n, isMain: n.id === id } : n)))
+}
+
+/** The person's own words, kept as they are and added to the others: "근원 욕구: …" in a prompt. */
+async function writeNeed($: EngineInterface, text: string) {
+  const ns = await loadNeeds($)
+  if (ns.some(n => n.status === 'confirmed' && n.text === text)) return
+  const now = await $.clock.now()
+  const hasMain = Boolean(mainNeedOf(ns))
+  await save($, 'needs', [...ns, { id: `N-${now}`, text, from: [], status: 'confirmed', isMain: !hasMain, ts: now }])
+  $.clock.after(0, () => linkNeed($, `N-${now}`))
+}
+
+/**
+ * Principles as the ladder makes them, from the rules, without the counts it
+ * normally waits for: Haiku groups rules that share a reason into principle
+ * drafts and Jev checks each rule belongs to its group. Lessons stand in only
+ * while fewer than two rules exist. Shown as a preview; nothing is confirmed.
  */
 async function previewLadder($: EngineInterface) {
   const set = async (p: Partial<Preview>) => {
-    const cur = ((await $.store.get('preview')) as Preview | undefined) ?? { at: 0, status: 'running', principles: [], needs: [] }
+    const cur = ((await $.store.get('preview')) as Preview | undefined) ?? { at: 0, status: 'running', principles: [] }
     await save($, 'preview', { ...cur, ...p })
   }
-  const lessons = mineOf(await ownCards($)).filter(c => c.lesson && !c.isMuted).slice(0, 24)
-  await save($, 'preview', { at: await $.clock.now(), status: 'running', step: `교훈 ${lessons.length}개를 이유별로 묶는 중`, principles: [], needs: [] })
-  if (lessons.length < 2) return set({ status: 'error', error: '교훈이 2개 이상 있어야 해요' })
+  const live = mineOf(await ownCards($)).filter(c => c.lesson && !c.isMuted)
+  const rules = live.filter(c => c.isRule).sort((a, b) => (b.count ?? 1) - (a.count ?? 1))
+  const isRules = rules.length >= 2
+  const lessons = (isRules ? rules : live).slice(0, PREVIEW_SOURCES)
+  const what = isRules ? '규칙' : '교훈'
+  await save($, 'preview', { at: await $.clock.now(), status: 'running', step: `${what} ${lessons.length}개를 이유별로 묶는 중`, principles: [] })
+  if (lessons.length < 2) return set({ status: 'error', error: '규칙이나 교훈이 2개 이상 있어야 해요' })
   const g = await $.model.complete({
     model: 'haiku',
     maxTokens: 900,
     timeoutMs: 30000,
     system:
-      '한 사용자가 AI 에이전트를 교정하며 쌓은 교훈 목록이 주어집니다. 같은 근본 이유를 공유하는 교훈끼리 2~4개 묶음으로 나누고, 묶음마다 원칙 하나를 쓰세요. ' +
-      '원칙은 한국어 한 문장(40자 이내, 말줄임표 금지), 특정 화면·도구 이름 대신 행동의 이유가 드러나게. 묶음마다 교훈 2개 이상. 어디에도 맞지 않는 교훈은 빼도 됩니다. ' +
+      `한 사용자가 AI 에이전트를 교정하며 쌓은 ${what} 목록이 주어집니다. 같은 근본 이유를 공유하는 것끼리 2~4개 묶음으로 나누고, 묶음마다 원칙 하나를 쓰세요. ` +
+      `원칙은 한국어 한 문장(40자 이내, 말줄임표 금지), 특정 화면·도구 이름 대신 행동의 이유가 드러나게. 묶음마다 ${what} 2개 이상. 어디에도 맞지 않는 것은 빼도 됩니다. ` +
       'JSON만 답하세요: [{"principle": "...", "lessons": [1, 4, 7]}]',
     prompt: lessons.map((c, i) => `${i + 1}. ${c.lesson}${c.why ? ` (틀린 이유: ${c.why})` : ''}`).join('\n'),
   })
@@ -1640,26 +1757,7 @@ async function previewLadder($: EngineInterface) {
       return { text: gr.principle, from: kept.map(x => lessons[x.n - 1].id), fit: kept.length ? kept.reduce((t, x) => t + x.v, 0) / kept.length : 0 }
     })
     .filter(p => p.from.length >= 2)
-  await set({ principles, step: `원칙 초안 ${principles.length}개 · 근원 욕구 가설을 쓰는 중` })
-  if (principles.length < 1) return set({ status: 'done', step: undefined })
-  const n = await $.model.complete({
-    model: 'haiku',
-    maxTokens: 400,
-    timeoutMs: 20000,
-    system:
-      '한 사용자가 AI 에이전트에게 반복해서 요구해 온 원칙 목록이 주어집니다. 이 원칙들 밑에 깔린 사용자의 근원 욕구를 가설로 2~3개 쓰세요. ' +
-      '각각 사용자의 1인칭 한국어 한 문장(30자 이내, 말줄임표 금지), 그리고 근거가 된 원칙 번호. 서로 다른 해석이 되게. JSON만 답하세요: [{"text": "...", "from": [1, 2]}]',
-    prompt: principles.map((p, i) => `${i + 1}. ${p.text}`).join('\n'),
-  })
-  let needs: Preview['needs'] = []
-  if (n.isAnswered) {
-    try {
-      needs = (JSON.parse(n.text.match(/\[[\s\S]*\]/)?.[0] ?? '') as { text?: string; from?: number[] }[]).filter(x => x.text).slice(0, 3).map(x => ({ text: x.text as string, from: x.from ?? [] }))
-    } catch {
-      // principles alone
-    }
-  }
-  await set({ status: 'done', step: undefined, needs })
+  await set({ principles, status: 'done', step: undefined })
 }
 
 /** Keep one previewed principle as a real one. */
@@ -1672,15 +1770,6 @@ async function keepPreviewPrinciple($: EngineInterface, i: number) {
   await save($, 'preview', { ...pv, principles: pv.principles.filter((_, k) => k !== i) })
 }
 
-/** Confirm one previewed need, in the words shown. */
-async function keepPreviewNeed($: EngineInterface, i: number) {
-  const pv = (await $.store.get('preview')) as Preview | undefined
-  const nd = pv?.needs[i]
-  if (!pv || !nd) return
-  await writeNeed($, nd.text)
-  await save($, 'preview', { ...pv, needs: [] })
-}
-
 /** What rides a request: the rules and the lessons Jev judged to apply, the strongest first, each capped. */
 function appliedIds(judgments: readonly Judgment[], candidates: readonly Card[]): string[] {
   const isRule = new Set(candidates.filter(c => c.isRule).map(c => c.id))
@@ -1691,9 +1780,13 @@ function appliedIds(judgments: readonly Judgment[], candidates: readonly Card[])
 async function attachment($: EngineInterface, r: Result): Promise<{ text: string; lessonIds: string[]; reqIds: string[] } | null> {
   const lessons = appliedIds(r.judgments, r.candidates).map(id => r.candidates.find(c => c.id === id)).filter((c): c is Card => !!c)
   const reqs = (await loadReqs($)).filter(x => r.reqIds.includes(x.id) && isConcreteRequirement(x.text))
-  const need = (await loadNeeds($)).find(n => n.status === 'confirmed')
+  const goal = (await loadGoals($)).find(g => g.status === 'confirmed')
+  // The largest need first, then the others the person confirmed.
+  const allNeeds = await loadNeeds($)
+  const main = mainNeedOf(allNeeds)
+  const needs = [...(main ? [main] : []), ...allNeeds.filter(n => n.status === 'confirmed' && n.id !== main?.id).sort((a, b) => b.ts - a.ts)]
   const principles = (await loadPrinciples($)).filter(p => p.status === 'active')
-  if (!lessons.length && !reqs.length && !need && !principles.length) return null
+  if (!lessons.length && !reqs.length && !goal && !needs.length && !principles.length) return null
   // Whatever went out in the last few requests is still in the conversation the
   // model reads: saying it again only piles up copies and over-weights it. Repeat
   // only after REATTACH_EVERY requests, or once a compaction has dropped it.
@@ -1704,18 +1797,20 @@ async function attachment($: EngineInterface, r: Result): Promise<{ text: string
   const ruleLines = lessons.filter(c => c.isRule && isFresh(c.id))
   const lessonLines = lessons.filter(c => !c.isRule && isFresh(c.id))
   const freshPrinciples = principles.filter(p => isFresh(p.id))
-  const freshNeed = need && isFresh(need.id) ? need : undefined
+  const freshGoal = goal && isFresh(goal.id) ? goal : undefined
+  const freshNeeds = needs.filter(n => isFresh(n.id))
   const freshReqs = reqs.filter(x => isFresh(x.id))
   await save($, 'sendSeq', seq)
-  const sentIds = [...ruleLines, ...lessonLines].map(c => c.id).concat(freshPrinciples.map(p => p.id), freshReqs.map(x => x.id), freshNeed ? [freshNeed.id] : [])
+  const sentIds = [...ruleLines, ...lessonLines].map(c => c.id).concat(freshPrinciples.map(p => p.id), freshReqs.map(x => x.id), freshGoal ? [freshGoal.id] : [], freshNeeds.map(n => n.id))
   await save($, 'lastAttached', { ...lastAt, ...Object.fromEntries(sentIds.map(id => [id, seq])) })
-  if (!ruleLines.length && !lessonLines.length && !freshPrinciples.length && !freshNeed && !freshReqs.length) {
+  if (!ruleLines.length && !lessonLines.length && !freshPrinciples.length && !freshGoal && !freshNeeds.length && !freshReqs.length) {
     // All still in context from earlier requests: nothing new to add, but they still ride.
     return { text: '', lessonIds: lessons.map(c => c.id), reqIds: reqs.map(x => x.id) }
   }
   const text = [
     '[ani] From this user\'s own past corrections and standing requirements, judged to bear on this request. Follow them:',
-    ...(freshNeed ? [`What this user wants underneath (their own words): ${freshNeed.text}`] : []),
+    ...(freshNeeds.length ? [`Why it matters to them (their own words${freshNeeds[0].id === main?.id ? ', the largest first' : ''}): ${freshNeeds.map(n => n.text).join(' / ')}`] : []),
+    ...(freshGoal ? [`What this user is after when working with an AI: ${freshGoal.text}`] : []),
     ...(freshPrinciples.length ? ['Principles (always):', ...freshPrinciples.map(p => `- ${p.text}`)] : []),
     ...(ruleLines.length ? ['Rules:', ...ruleLines.map(lessonLine)] : []),
     ...(lessonLines.length ? ['Lessons:', ...lessonLines.map(lessonLine)] : []),
@@ -2358,18 +2453,18 @@ export const register: Register = on => {
         )
       }
       const pCand = (await loadPrinciples($)).find(p => p.status === 'candidate')
-      const misfitNeed = (await loadNeeds($)).find(n => n.status === 'confirmed' && (n.misfit ?? 0) >= 3)
+      const misfitNeed = (await loadGoals($)).find(g => g.status === 'confirmed' && (g.misfit ?? 0) >= 3)
       if (pCand || misfitNeed) {
         const color = STATE_COLOR.hit
         const rules = own.filter(c => pCand?.from.includes(c.id))
         const card = askCardSvg(full - 40, pCand
           ? { question: `규칙 ${pCand.from.length}개가 같은 이유를 가져요. 원칙으로 묶을까요?`, lesson: pCand.text, intent: rules[0] ? ruleText(rules[0]) : undefined, why: rules[1] ? ruleText(rules[1]) : undefined, color }
-          : { question: `최근 교정 ${misfitNeed!.misfit}개가 근원 욕구와 맞지 않아요. 다시 볼까요?`, lesson: misfitNeed!.text, color })
+          : { question: `최근 교정 ${misfitNeed!.misfit}개가 상위 목표와 맞지 않아요. 다시 볼까요?`, lesson: misfitNeed!.text, color })
         const id = pCand?.id ?? misfitNeed!.id
         return (
           <Box flexDirection="column" width={e.props.bodyColumns} gap={1}>
             <Box key="layer" flexDirection="column" borderStyle="round" borderColor={color} paddingX={2} paddingY={1} gap={1}>
-              <Svg source={card.source} width={card.width} height={card.height} alt={pCand ? `원칙으로 묶을까요? ${pCand.text}` : `근원 욕구를 다시 볼까요? ${misfitNeed!.text}`} />
+              <Svg source={card.source} width={card.width} height={card.height} alt={pCand ? `원칙으로 묶을까요? ${pCand.text}` : `상위 목표를 다시 볼까요? ${misfitNeed!.text}`} />
               <Box flexDirection="row" alignItems="center" gap={1}>
                 {pCand
                   ? [
@@ -2377,8 +2472,8 @@ export const register: Register = on => {
                       <Button key="p-no" variant="secondary" hotkey="2" label="아직은 규칙으로" onPress={() => setPrinciple($, id, 'declined')} />,
                     ]
                   : [
-                      <Button key="n-yes" variant="primary" hotkey="1" label="다시 보기" onPress={async () => { await setNeed($, id, 'hypothesis'); await update($, paneTab, () => 'needs' as Tab); await $.ui.open({ id: PANE, title: TITLE, focus: true }) }} />,
-                      <Button key="n-no" variant="secondary" hotkey="2" label="그대로 두기" onPress={() => setNeed($, id, 'confirmed')} />,
+                      <Button key="n-yes" variant="primary" hotkey="1" label="다시 보기" onPress={async () => { await setGoal($, id, 'hypothesis'); await update($, paneTab, () => 'goals' as Tab); await $.ui.open({ id: PANE, title: TITLE, focus: true }) }} />,
+                      <Button key="n-no" variant="secondary" hotkey="2" label="그대로 두기" onPress={() => setGoal($, id, 'confirmed')} />,
                     ]}
               </Box>
             </Box>
@@ -2763,6 +2858,9 @@ export const register: Register = on => {
       const sentLog = (((await $.store.get('sentLog')) as Sent[] | undefined) ?? [])
       const principles = await loadPrinciples($)
       const needs = await loadNeeds($)
+      const goals = await loadGoals($)
+      const goalRun = (await $.store.get('goalRun')) as LadderRun | undefined
+      const needRun = (await $.store.get('needRun')) as LadderRun | undefined
       const cands = ((await $.store.get('candidates')) as Candidate[] | undefined) ?? []
       const allCases = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
       const limit = await read($, listLimit)
@@ -2781,7 +2879,8 @@ export const register: Register = on => {
         { key: 'lessons', label: '교훈', n: mine.filter(c => !c.isRule && !c.isMuted).length, more: openCands.length },
         { key: 'rules', label: '규칙', n: mine.filter(c => c.isRule).length, more: promoCards.length },
         { key: 'principles', label: '원칙', n: principles.filter(p => p.status === 'active').length },
-        { key: 'needs', label: '근원 욕구', n: needs.filter(n => n.status === 'confirmed').length },
+        { key: 'goals', label: '상위 목표', n: goals.filter(g => g.status === 'confirmed').length, more: goals.filter(g => g.status === 'hypothesis').length },
+        { key: 'needs', label: '근원 욕구', n: needs.filter(n => n.status === 'confirmed').length, more: needs.filter(n => n.status === 'hypothesis').length },
       ]
       const capOnly = (key: string, text: string, count: string) => {
         if (!isDesk) return <Box key={key} flexDirection="row" flexWrap="wrap" marginTop={1}><Text bold>{text}</Text>{count ? <Text dimColor>{`  ${count}`}</Text> : null}</Box>
@@ -2824,54 +2923,41 @@ export const register: Register = on => {
                 : []),
             ]
       const ruleView = () => [
-        ...(ruleCards.length ? [] : [emptyNote('rules-empty', `아직 없어요. 같은 교정이 ${PROMOTE_AT}번 쌓인 교훈은 규칙으로 올릴지 물어봐요. 규칙은 요청마다 Jev가 관련 있는지 보고 최대 ${MAX_ATTACHED_RULES}개까지 붙여요. 항상 붙는 건 원칙과 근원 욕구뿐이에요.`)]),
+        ...(ruleCards.length ? [] : [emptyNote('rules-empty', `아직 없어요. 같은 교정이 ${PROMOTE_AT}번 쌓인 교훈은 규칙으로 올릴지 물어봐요. 규칙은 요청마다 Jev가 관련 있는지 보고 최대 ${MAX_ATTACHED_RULES}개까지 붙여요. 항상 붙는 건 원칙, 확정된 상위 목표와 근원 욕구뿐이에요.`)]),
         ...ruleOthers(),
       ]
       const preview = (await $.store.get('preview')) as Preview | undefined
-      const previewBlock = (which: 'principles' | 'needs') => {
+      const ruleCount = mine.filter(c => c.isRule && !c.isMuted && c.lesson).length
+      const previewBlock = () => {
         const isRunning = preview?.status === 'running'
         const btn = (
-          <Box key={`pv-btn-${which}`} flexDirection="row" marginTop={1}>
+          <Box key="pv-btn" flexDirection="row" marginTop={1}>
             <Button key="pv-run" variant="secondary" label="지금 데이터로 미리 보기" onPress={() => { if (!isRunning) $.clock.after(0, () => previewLadder($)) }} />
           </Box>
         )
         const note = (k: string, t: string) => <Box key={k} paddingY={1}><Text dimColor wrap="wrap">{t}</Text></Box>
-        if (!preview) return [btn, note('pv-hint', `지금 쌓인 교훈 ${mine.filter(c => c.lesson).length}개로 원칙과 근원 욕구를 미리 만들어 봐요. 확정하기 전에는 Claude에게 가지 않아요.`)]
+        const source = ruleCount >= 2 ? `규칙 ${ruleCount}개` : `교훈 ${mine.filter(c => c.lesson).length}개`
+        if (!preview) return [btn, note('pv-hint', `${source}로 원칙을 미리 묶어 봐요. 확정하기 전에는 Claude에게 가지 않아요.`)]
         if (isRunning) return [btn, note('pv-run-note', `미리 보는 중 · ${preview.step ?? ''}`)]
         if (preview.status === 'error') return [btn, note('pv-err', `미리 보기 실패 · ${preview.error ?? ''}`)]
         const ps = preview.principles
-        const body =
-          which === 'principles'
-            ? ps.length
-              ? [
-                  labelRow('s-pv-pr', '미리 본 원칙', ps.length),
-                  ...ps.map((p, i) => (
-                    <Box key={`pvp-${i}`} flexDirection="column" marginTop={ITEM_GAP}>
-                      {cardOf(`pvpc-${i}`, [{ dot: '#8a8a8a', title: p.text, pill: { text: `미리 보기 · ${Math.round(p.fit * 100)}%`, color: STATE_COLOR.weigh }, sub: own.filter(c => p.from.includes(c.id)).map(c => ({ label: '교훈', value: c.lesson ?? c.text })) }])}
-                      <Box flexDirection="row" marginTop={1}>{[<Button key={`pvk-${i}`} variant="secondary" label="원칙으로 확정" onPress={() => keepPreviewPrinciple($, i)} />]}</Box>
-                    </Box>
-                  )),
-                ]
-              : [note('pv-none', '같은 이유로 묶이는 교훈 묶음을 찾지 못했어요.')]
-            : preview.needs.length
-              ? [
-                  labelRow('s-pv-nd', '미리 본 근원 욕구', preview.needs.length),
-                  ...preview.needs.map((nd, i) => (
-                    <Box key={`pvn-${i}`} flexDirection="column" marginTop={ITEM_GAP}>
-                      {cardOf(`pvnc-${i}`, [{ dot: '#8a8a8a', title: nd.text, pill: { text: '가설', color: STATE_COLOR.weigh }, sub: nd.from.map(k => ps[k - 1]).filter(Boolean).map(p => ({ label: '원칙', value: p.text })) }])}
-                      <Box flexDirection="row" marginTop={1}>{[<Button key={`pvnk-${i}`} variant="secondary" label="이걸로 확정" onPress={() => keepPreviewNeed($, i)} />]}</Box>
-                    </Box>
-                  )),
-                  note('pv-nd-hint', '셋 다 아니면 요청에 "근원 욕구: (내 말)"이라고 쓰세요. 그 문장 그대로 확정돼요.'),
-                ]
-              : [note('pv-nd-none', '원칙 초안이 있어야 근원 욕구 가설을 쓸 수 있어요.')]
+        const body = ps.length
+          ? [
+              labelRow('s-pv-pr', '미리 본 원칙', ps.length),
+              ...ps.map((p, i) =>
+                itemOf(`pvp-${i}`, cardOf(`pvpc-${i}`, [{ dot: '#8a8a8a', title: p.text, pill: { text: `미리 보기 · ${Math.round(p.fit * 100)}%`, color: STATE_COLOR.weigh }, sub: own.filter(c => p.from.includes(c.id)).map(c => ({ label: c.isRule ? '규칙' : '교훈', value: c.lesson ?? c.text })) }]), [
+                  <Button key={`pvk-${i}`} variant="secondary" label="원칙으로 확정" onPress={() => keepPreviewPrinciple($, i)} />,
+                ]),
+              ),
+            ]
+          : [note('pv-none', '같은 이유로 묶이는 묶음을 찾지 못했어요.')]
         return [btn, note('pv-when', `${ago(preview.at)} 미리 봄 · 확정하기 전에는 Claude에게 가지 않아요`), ...body]
       }
       const principlesView = () => {
         const shownPs = principles.filter(p => p.status !== 'declined')
-        if (!shownPs.length) return [emptyNote('pr-empty', '아직 없어요. 같은 이유를 가진 규칙이 2개 이상 모이면 원칙 후보를 보여드려요. 원칙은 모든 프로젝트에 항상 적용돼요.'), ...previewBlock('principles')]
+        if (!shownPs.length) return [emptyNote('pr-empty', '아직 없어요. 같은 이유를 가진 규칙이 2개 이상 모이면 원칙 후보를 보여드려요. 원칙은 모든 프로젝트에 항상 적용돼요.'), ...previewBlock()]
         return [
-          ...previewBlock('principles'),
+          ...previewBlock(),
           labelRow('s-pr', '원칙', shownPs.length),
           ...(isOpen('s-pr')
             ? shownPs.map(p => (
@@ -2897,38 +2983,95 @@ export const register: Register = on => {
             : []),
         ]
       }
-      const needsView = () => {
-        const live = needs.filter(n => n.status !== 'discarded')
-        const conf = live.find(n => n.status === 'confirmed')
-        const hyps = live.filter(n => n.status === 'hypothesis')
-        const pText = (ids: string[]) => principles.filter(p => ids.includes(p.id)).map(p => ({ label: '원칙', value: p.text }))
-        if (!live.length)
-          return [emptyNote('nd-empty', '아직 없어요. 원칙이 2개 이상 쌓이면 그 밑에 깔린 이유를 가설로 2~3개 보여드려요. 고른 문장만 확정되고, 요청에 "근원 욕구: (내 말)"이라고 쓰면 그 문장 그대로 확정돼요.'), ...previewBlock('needs')]
+      const activePs = principles.filter(p => p.status === 'active')
+      const pText = (ids: string[]) => [
+        ...goals.filter(g => ids.includes(g.id)).map(g => ({ label: '상위 목표', value: g.text })),
+        ...principles.filter(p => ids.includes(p.id)).map(p => ({ label: '원칙', value: p.text })),
+      ]
+      const runNote = (key: string, run: LadderRun | undefined, what: string) =>
+        !run
+          ? []
+          : run.status === 'running'
+            ? [emptyNote(`${key}-run`, `${what} 후보를 만드는 중`)]
+            : run.status === 'error'
+              ? [emptyNote(`${key}-err`, `후보를 만들지 못했어요 · ${run.error ?? ''}`)]
+              : run.kept === 0
+                ? [emptyNote(`${key}-none`, `후보 ${run.tried}개를 만들었지만 ${key === 'gl' ? `원칙 ${activePs.length}개 중 ${goalBar(activePs.length)}개 이상을 아우르는 것이 없었어요` : '모두 상위 목표를 바꿔 말한 것이었어요'}. 다시 만들어 보세요.`)]
+                : []
+      // The goal: what every principle serves when working with an AI. Read from the principles, rides every request once confirmed.
+      const goalsView = () => {
+        const conf = goals.find(g => g.status === 'confirmed')
+        const hyps = goals.filter(g => g.status === 'hypothesis')
+        const isRunning = goalRun?.status === 'running'
+        const head = emptyNote('gl-what', `상위 목표는 원칙 ${activePs.length}개가 모두 수단이 되는, AI와 일할 때 바라는 상태예요. Jev가 원칙마다 이 목표에 가까워지게 하는지 보고, ${goalBar(activePs.length)}개 이상을 아우르는 후보만 남겨요. 확정하면 요청마다 붙어요.`)
+        if (activePs.length < 2) return [emptyNote('gl-empty', '원칙이 2개 이상 있어야 상위 목표를 만들 수 있어요. 상위 목표는 모든 원칙이 수단이 되는, AI와 일할 때 바라는 상태예요.')]
         return [
-          ...previewBlock('needs'),
+          head,
+          <Box key="gl-btn" flexDirection="row">
+            <Button key="gl-run" variant="secondary" label={`원칙 ${activePs.length}개로 후보 만들기`} onPress={() => { if (!isRunning) $.clock.after(0, () => proposeGoals($, true)) }} />
+          </Box>,
+          ...runNote('gl', goalRun, '상위 목표'),
           ...(conf
             ? [
-                labelRow('s-nd', '확정', 1),
-                cardOf('nd-conf', [{ dot: '#8a8a8a', title: conf.text, pill: (conf.misfit ?? 0) >= 3 ? { text: `안 맞음 ${conf.misfit}`, color: STATE_COLOR.ask } : { text: '항상', color: STATE_COLOR.hit }, sub: pText(conf.from) }]),
+                labelRow('s-gl', '확정', 1),
+                itemOf(`gl-c-${conf.id}`, cardOf(`glc-${conf.id}`, [{ dot: STATE_COLOR.hit, title: conf.text, pill: (conf.misfit ?? 0) >= 3 ? { text: `안 맞음 ${conf.misfit}`, color: STATE_COLOR.ask } : { text: `원칙 ${conf.covers}/${conf.of} · 항상`, color: STATE_COLOR.hit }, sub: pText(conf.from) }]), [
+                  <Button key={`gl-rm-${conf.id}`} variant="secondary" label="풀기" onPress={() => setGoal($, conf.id, 'discarded')} />,
+                ]),
               ]
             : []),
           ...(hyps.length
             ? [
-                labelRow('s-hy', '가설', hyps.length),
-                ...hyps.map(n => (
-                  <Box key={`hy-${n.id}`} flexDirection="column" marginTop={ITEM_GAP}>
-                    {cardOf(`hyc-${n.id}`, [{ dot: '#8a8a8a', title: n.text, pill: { text: '가설', color: STATE_COLOR.weigh }, sub: pText(n.from) }])}
-                    <Box flexDirection="row" gap={1} marginTop={1}>
-                      {[
-                        <Button key={`ny-${n.id}`} variant="primary" label="이걸로 확정" onPress={() => setNeed($, n.id, 'confirmed')} />,
-                        <Button key={`nn-${n.id}`} variant="secondary" label="버리기" onPress={() => setNeed($, n.id, 'discarded')} />,
-                      ]}
-                    </Box>
-                  </Box>
-                )),
-                <Box key="hy-note" paddingY={1}><Text dimColor wrap="wrap">셋 다 아니면 요청에 "근원 욕구: (내 말)"이라고 쓰세요. 그 문장 그대로 확정돼요.</Text></Box>,
+                labelRow('s-gl-hy', '후보', hyps.length),
+                ...hyps.map(g =>
+                  itemOf(`gl-h-${g.id}`, cardOf(`glh-${g.id}`, [{ dot: '#8a8a8a', title: g.text, pill: { text: `원칙 ${g.covers}/${g.of}`, color: STATE_COLOR.weigh }, sub: pText(g.from) }]), [
+                    <Button key={`gy-${g.id}`} variant="primary" label="이걸로 확정" onPress={() => setGoal($, g.id, 'confirmed')} />,
+                    <Button key={`gn-${g.id}`} variant="secondary" label="버리기" onPress={() => setGoal($, g.id, 'discarded')} />,
+                  ]),
+                ),
               ]
             : []),
+        ]
+      }
+      // The needs: why the goal matters to the person. Values, so only the person's pick or words hold; several can.
+      const needsView = () => {
+        const main = mainNeedOf(needs)
+        const conf = [...needs.filter(n => n.status === 'confirmed')].sort((a, b) => Number(b.id === main?.id) - Number(a.id === main?.id) || b.ts - a.ts)
+        const hyps = needs.filter(n => n.status === 'hypothesis')
+        const goal = goals.find(g => g.status === 'confirmed')
+        const isRunning = needRun?.status === 'running'
+        return [
+          emptyNote('nd-what', '근원 욕구는 상위 목표가 왜 중요한지, 그 아래의 가치예요. 교정 기록만으로는 알 수 없어서 직접 고르거나 쓴 말로만 확정돼요. 여러 개를 둘 수 있고, 하나를 가장 큰 것으로 표시해요.'),
+          goal
+            ? (
+                <Box key="nd-btn" flexDirection="row">
+                  <Button key="nd-run" variant="secondary" label="상위 목표로 후보 만들기" onPress={() => { if (!isRunning) $.clock.after(0, () => proposeNeeds($, true)) }} />
+                </Box>
+              )
+            : emptyNote('nd-nogoal', '상위 목표를 먼저 확정하면, 그 목표가 왜 중요한지를 서로 다른 축에서 후보로 보여 드려요.'),
+          ...runNote('nd', needRun, '근원 욕구'),
+          ...(conf.length
+            ? [
+                labelRow('s-nd', '확정', conf.length),
+                ...conf.map(n =>
+                  itemOf(`nd-c-${n.id}`, cardOf(`ndc-${n.id}`, [{ dot: STATE_COLOR.hit, title: n.text, pill: n.id === main?.id ? { text: '가장 큰 것', color: STATE_COLOR.hit } : { text: '확정' }, sub: pText(n.from) }]), [
+                    ...(n.id === main?.id ? [] : [<Button key={`nm-${n.id}`} variant="secondary" label="가장 큰 것으로" onPress={() => setMainNeed($, n.id)} />]),
+                    <Button key={`nr-${n.id}`} variant="secondary" label="풀기" onPress={() => setNeed($, n.id, 'discarded')} />,
+                  ]),
+                ),
+              ]
+            : []),
+          ...(hyps.length
+            ? [
+                labelRow('s-hy', '후보', hyps.length),
+                ...hyps.map(n =>
+                  itemOf(`nd-h-${n.id}`, cardOf(`hyc-${n.id}`, [{ dot: '#8a8a8a', title: n.text, pill: { text: '후보', color: STATE_COLOR.weigh }, sub: pText(n.from) }]), [
+                    <Button key={`ny-${n.id}`} variant="primary" label="이걸로 확정" onPress={() => setNeed($, n.id, 'confirmed')} />,
+                    <Button key={`nn-${n.id}`} variant="secondary" label="버리기" onPress={() => setNeed($, n.id, 'discarded')} />,
+                  ]),
+                ),
+              ]
+            : []),
+          emptyNote('nd-own', '맞는 게 없으면 요청에 "근원 욕구: (내 말)"이라고 쓰세요. 그 문장 그대로 더해져요.'),
         ]
       }
       const settingsView = () => [
@@ -2953,7 +3096,7 @@ export const register: Register = on => {
           ]}
         </Box>,
       ]
-      const emptyNote = (key: string, text: string) => <Box key={key} paddingY={2}><Text dimColor wrap="wrap">{text}</Text></Box>
+      const emptyNote = (key: string, text: string) => <Box key={key} paddingY={isDesk ? 2 : 1}><Text dimColor wrap="wrap">{text}</Text></Box>
       const reqRow = (rq: Requirement): CardRow => ({
         dot: STATE_COLOR.quiet,
         title: rq.text,
@@ -3158,6 +3301,7 @@ export const register: Register = on => {
           {tab === 'feedback' && feedbackView()}
           {tab === 'rules' && ruleView()}
           {tab === 'principles' && principlesView()}
+          {tab === 'goals' && goalsView()}
           {tab === 'needs' && needsView()}
 
           {tab === 'lessons' && mine.length === 0 && (

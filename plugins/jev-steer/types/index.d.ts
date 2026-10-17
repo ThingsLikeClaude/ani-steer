@@ -185,24 +185,50 @@ export type Principle = {
   ts: number
 }
 
-/** The want under the principles. Only the person's confirmed sentence goes to Claude. */
-export type Need = {
+/**
+ * What every principle serves: the state the person wants from working with an
+ * AI, read from the principles and judged by Jev to cover most of them. One at a
+ * time; once confirmed it rides every request.
+ */
+export type Goal = {
   id: string
   text: string
-  /** The principles it was read from. */
+  /** The principles Jev judged it to serve. */
   from: string[]
+  /** How many of the active principles it served, out of how many, when it was read. */
+  covers: number
+  of: number
   status: 'hypothesis' | 'confirmed' | 'discarded'
   /** Corrections since confirming that Jev judged not to fit it. */
   misfit?: number
   ts: number
 }
 
-/** A dry run of the upper ladder on today's lessons. Nothing in it rides a request until confirmed. */
+/**
+ * Why the goal matters to the person: a value, below anything corrections can
+ * show. Several can hold; one is marked the largest. Only the person's own pick
+ * or own words are confirmed.
+ */
+export type Need = {
+  id: string
+  text: string
+  /** The goal and principles it was read from or that serve it. */
+  from: string[]
+  status: 'hypothesis' | 'confirmed' | 'discarded'
+  /** The one the person calls the largest. */
+  isMain?: boolean
+  /** No longer counted: misfits are judged against the goal. */
+  misfit?: number
+  ts: number
+}
+
+/** A dry run of principles from today's rules. Nothing in it rides a request until confirmed. */
 export type Preview = {
   at: number
   status: 'running' | 'done' | 'error'
   step?: string
   error?: string
   principles: { text: string; from: string[]; fit: number }[]
-  needs: { text: string; from: number[] }[]
+  /** From before the goal layer; no longer drawn. */
+  needs?: { text: string; from: number[] }[]
 }
