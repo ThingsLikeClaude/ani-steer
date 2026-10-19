@@ -137,6 +137,33 @@ test('Jev weighs rules too: only those bearing on the request ride, three at mos
   expect(sent).toContain('사용자가 정한 범위를 넘지 않는다')
 })
 
+test('the rules that rode the last request head the rules tab, above every other rule', async ($, on) => {
+  // Many rules; the two that bear on this request are stored last.
+  const others = Array.from({ length: 12 }, (_, i) => rule(i + 1, `배포 규칙 ${i + 1}번: 주소는 직접 열어 본다`))
+  mock.store(on, { cards: [...others, rule(20, '커밋 메시지는 한국어로 쓴다'), rule(21, '커밋 전에 테스트를 돌린다')] })
+  mock.clock(on)
+  mock.env(on, { TYPESAFE_API_KEY: 'test-key', HOME: '/tmp' })
+  on('http.fetch', ($, e) => {
+    const body = JSON.parse(String((e as { init?: { body?: string } }).init?.body)) as { questions: Record<string, { instructions?: string }> }
+    const answers = Object.fromEntries(Object.entries(body.questions).map(([k, q]) => [k, { noul: /_same$/.test(k) ? (q.instructions?.includes('커밋') ? 0.9 : 0.1) : 0.05 }]))
+    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ answers }) } } as never
+  })
+  on('ui.toast', () => ({ value: undefined }) as never)
+  on('prompt.submit', ($, e) => ({ text: e.text }) as never)
+  await $.prompt.submit({ text: '지금까지 바꾼 거 커밋해줘' } as never)
+  const pane = await $.ui.mount({ plugin: 'jev-steer', surface: 'terminal', component: 'Pane', requestId: 'jev-steer', props: {} as never })
+  await pane.press({ key: 'tab-rules' })
+  const shown = (await pane.findAll({ type: 'Text' })).map(t => t.text).join('\n')
+  const at = (s: string) => shown.indexOf(s)
+  expect(at('이번 요청에 붙인 규칙')).toBeGreaterThan(-1)
+  expect(at('커밋 메시지는 한국어로')).toBeGreaterThan(at('이번 요청에 붙인 규칙'))
+  expect(at('커밋 전에 테스트를')).toBeGreaterThan(at('이번 요청에 붙인 규칙'))
+  // Every other rule is listed after both, under its own label.
+  expect(at('그 밖의 규칙')).toBeGreaterThan(Math.max(at('커밋 메시지는 한국어로'), at('커밋 전에 테스트를')))
+  expect(at('배포 규칙 1번')).toBeGreaterThan(at('그 밖의 규칙'))
+  await pane.unmount()
+})
+
 test('a rule that does not bear on the request stays home', async ($, on) => {
   mock.store(on, { cards: [rule(1, '배포 주소는 직접 열어 보고 넘긴다')] })
   mock.clock(on)

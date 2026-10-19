@@ -2585,7 +2585,8 @@ export const register: Register = on => {
       const pulse = pulseOf(await read($, beat), await $.clock.now())
       const via = await read($, jevVia)
       const reqOn = reqs.filter(x => attachedReqIds.includes(x.id)).length
-      const riding = reqOn || nowApplying.length ? `이번 요청에 규칙 ${reqOn} · 교훈 ${nowApplying.length} 반영` : ''
+      const rulesOnCount = mine.filter(c => c.isRule && (sentIds.includes(c.id) || pinnedIds.includes(c.id))).length
+      const riding = reqOn || rulesOnCount ? `이번 요청에 규칙 ${rulesOnCount} · 지시 ${reqOn} 반영` : ''
       const head = paneHeaderSvg(paneW, pulse, riding)
       const sentNow = await read($, sent)
       const nowState: { state: 'busy' | 'hit' | 'idle' | 'late'; title: string; sub?: string } = v.isBusy
@@ -2756,6 +2757,10 @@ export const register: Register = on => {
       const onList = mine.filter(c => nowApplying.includes(c))
       const askIds = new Set(maybe.map(j => j.id))
       const ruleCards = mine.filter(c => c.isRule)
+      // The rules on the last request come first, strongest first: with many rules, what rode is never scrolled for.
+      const rulesNow = ruleCards.filter(c => sentIds.includes(c.id) || pinnedIds.includes(c.id))
+        .sort((a, b) => (sentIds.indexOf(a.id) + 1 || Infinity) - (sentIds.indexOf(b.id) + 1 || Infinity))
+      const restRules = ruleCards.filter(c => !rulesNow.includes(c)).sort((a, b) => Number(Boolean(a.isMuted)) - Number(Boolean(b.isMuted)) || (b.count ?? 1) - (a.count ?? 1) || b.ts - a.ts)
       const restList = [...mine.filter(c => !c.isRule && !nowApplying.includes(c) && !askIds.has(c.id))].sort((a, b) => Number(Boolean(a.isMuted)) - Number(Boolean(b.isMuted)) || (b.count ?? 1) - (a.count ?? 1) || b.ts - a.ts)
 
       // File-tree grammar: a small-caps label and a chevron, then one rounded
@@ -3273,17 +3278,25 @@ export const register: Register = on => {
           {hair('h-top')}
 
           {tab === 'sent' && sentView()}
+          {tab === 'rules' && rulesNow.length > 0 && [
+            labelRow('s-rules-on', '이번 요청에 붙인 규칙', rulesNow.length),
+            ...(isOpen('s-rules-on')
+              ? isManaging
+                ? rulesNow.map(c => manageRow(c, true))
+                : [cardOf('card-rules-on', rulesNow.map(c => ({ ...cardRow(c, true), sub: subOf(c) })), STATE_COLOR.hit)]
+              : []),
+          ]}
           {tab === 'rules' && promoView()}
 
           {tab === 'rules' && reqs.length === 0 && (
             <Box paddingY={2}><Text dimColor wrap="wrap">아직 없어요. "테스트는 vitest로"처럼 대상이 분명한 지시를 말하면 여기에 저장돼요.</Text></Box>
           )}
-          {tab === 'rules' && ruleCards.length > 0 && [
-            labelRow('s-rules', '교훈에서 올라온 규칙', ruleCards.length),
+          {tab === 'rules' && restRules.length > 0 && [
+            labelRow('s-rules', rulesNow.length ? '그 밖의 규칙' : '교훈에서 올라온 규칙', restRules.length),
             ...(isOpen('s-rules')
               ? isManaging
-                ? ruleCards.map(c => manageRow(c, false))
-                : [cardOf('card-rules', ruleCards.map(c => ({ ...cardRow(c, sentIds.includes(c.id)), ...(c.isMuted ? { pill: { text: '꺼둠' } } : {}), sub: subOf(c) })))]
+                ? restRules.map(c => manageRow(c, false))
+                : [cardOf('card-rules', restRules.map(c => ({ ...cardRow(c, false), ...(c.isMuted ? { pill: { text: '꺼둠' } } : {}), sub: subOf(c) })))]
               : []),
           ]}
           {(tab === 'lessons' || tab === 'rules' || tab === 'feedback') && (mine.length > 0 || reqs.length > 0 || others.length > 0 || otherReqs.length > 0) && (
