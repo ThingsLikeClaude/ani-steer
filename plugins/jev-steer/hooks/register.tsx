@@ -307,7 +307,7 @@ async function bringInAni($: EngineInterface) {
   const own = await ownCards($)
   const have = new Set(own.map(c => c.id))
   const cards = patterns.filter(p => !have.has(p.id) && (p.id.startsWith('S-') ? p.status !== 'retired' : p.status !== 'compiled')).map(p => aniCard(p, summaries[p.id]))
-  const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+  const fb = (await loadCases($))
   const known = new Set(fb.map(f => f.at))
   const caseIds = new Set(fb.map(f => f.aniId).filter(Boolean))
   const cases: Feedback[] = []
@@ -329,7 +329,7 @@ async function bringInAni($: EngineInterface) {
  */
 async function keepPersonWords($: EngineInterface) {
   if (await $.store.get('personWordsV1')) return
-  const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+  const fb = (await loadCases($))
   const kept = fb.flatMap(f => {
     if (f.fromHistory || f.aniId) return [f]
     const t = personText(f.text)
@@ -370,7 +370,7 @@ async function koreanizeAni($: EngineInterface) {
       let said = wordsOf(p)
       for (const id of p?.compiledFrom ?? []) if (said.length < 3) said = [...said, ...wordsOf(await patternOf(id))]
       if (!said.length) {
-        const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+        const fb = (await loadCases($))
         said = fb.filter(f => f.cardId === c.id && f.said && !isLatin(f.said)).map(f => f.said as string)
       }
       const t = await ask(
@@ -382,7 +382,7 @@ async function koreanizeAni($: EngineInterface) {
       const short = t.short && [...t.short].length <= SHORT_MAX ? t.short : undefined
       await editCard($, c.id, { intent: t.intent, why: t.why, lesson: t.lesson, short, ...(said[0] ? { text: said[0], examples: said.slice(0, 3) } : {}) })
     }
-    const cases = (((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []).filter(f => f.aniId && [f.judgment, f.understood, f.meant, f.text].some(isLatin)).slice(0, 8)
+    const cases = ((await loadCases($))).filter(f => f.aniId && [f.judgment, f.understood, f.meant, f.text].some(isLatin)).slice(0, 8)
     for (const f of cases) {
       const p = await patternOf(f.aniId as string)
       const said = p?.quote ?? p?.said[0]
@@ -574,7 +574,7 @@ async function remember($: EngineInterface, prompt: string, answers: Answers, ca
   const dup = dupIndex >= 0 ? own.find(c => c.id === candidates[dupIndex]?.id) : undefined
   const intentPrompt = recentPrompts[recentPrompts.length - 2] ?? ''
   const answer = lastAnswer
-  const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+  const fb = (await loadCases($))
   const logIt = async (cardId: string) => {
     await saveCases($, [{ at: now, text: prompt, cardId, project }, ...fb])
     $.clock.after(0, () => enrichFeedback($, now, prompt))
@@ -643,7 +643,7 @@ function nearest<T>(judgment: string, xs: readonly T[], text: (x: T) => string, 
  * as a lesson for every project.
  */
 async function placeCase($: EngineInterface, at: number) {
-  const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+  const fb = (await loadCases($))
   const me = fb.find(f => f.at === at)
   if (!me?.judgment || me.cardId || me.candidateId) return
   const judgment = me.judgment
@@ -704,7 +704,7 @@ async function placeCase($: EngineInterface, at: number) {
   }
   const cs = ((await $.store.get('candidates')) as Candidate[] | undefined) ?? []
   await save($, 'candidates', [...cs, cand])
-  const latest = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+  const latest = (await loadCases($))
   await saveCases($, latest.map(f => (f.at === at || f.at === other.at ? { ...f, candidateId: id } : f)))
   // The lesson text, drafted from both cases by the small model; worded again at a later start when it fails.
   const t = await wordCases($, [other, me])
@@ -759,7 +759,7 @@ async function rewordLessons($: EngineInterface) {
   if (isRewording) return
   isRewording = true
   try {
-    const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+    const fb = (await loadCases($))
     // Candidates still waiting on the person, from before the AI decided: lessons now. A pair the person declined stays a pair.
     for (const c of (((await $.store.get('candidates')) as Candidate[] | undefined) ?? []).filter(x => !x.isDeclined)) await acceptCandidate($, c.id)
     for (const c of (await ownCards($)).filter(isStrung)) {
@@ -780,7 +780,7 @@ async function acceptCandidate($: EngineInterface, id: string) {
   const cands = ((await $.store.get('candidates')) as Candidate[] | undefined) ?? []
   const c = cands.find(x => x.id === id)
   if (!c) return
-  const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+  const fb = (await loadCases($))
   const cases = fb.filter(f => c.cases.includes(f.at))
   const now = await $.clock.now()
   // Not worded when it was offered: worded now; failing that, one case's judgment, never all of them strung together.
@@ -894,8 +894,8 @@ function utf8Length(s: string): number {
  * Every write of the cases. A case judged and given its habit no longer needs
  * the conversation it was read with (only judging reads it), so it is dropped:
  * a case is then about 1.4 KB instead of 3.5. Newest first, at most
- * FEEDBACK_MAX, and the oldest go while they would pass CASES_BYTES: a store
- * over 4 MiB refuses every write, the lessons' too.
+ * FEEDBACK_MAX, and the oldest go while they would pass CASES_BYTES: a file
+ * over 4 MiB cannot be read back.
  */
 export function keptCases(cases: readonly Feedback[], budget = CASES_BYTES): Feedback[] {
   const kept = [...cases]
@@ -907,12 +907,106 @@ export function keptCases(cases: readonly Feedback[], budget = CASES_BYTES): Fee
   return kept
 }
 
+/**
+ * Cases live in a file of their own, not in the store: they were most of what
+ * ani keeps (1.7 of 2.2 MB measured), and every store write rewrites the whole
+ * store. Read into memory and checked against the file's time every few
+ * seconds; another session's new cases are kept when this one writes.
+ * Where the host has no files (tests), they stay in the store as before.
+ */
+const CASES_CHECK_MS = 5_000
+let casesFile = ''
+let casesOnDisk: boolean | null = null
+let casesMemo: Feedback[] | null = null
+let casesMtime = 0
+let casesChecked = 0
+let casesWriting: Promise<unknown> = Promise.resolve()
+let casesBackedUp = 0
+
+async function casesPath($: EngineInterface): Promise<string> {
+  if (casesFile) return casesFile
+  // Asked before the session's start set the home folder, it is read here.
+  const homeDir = home || (await $.env.get('HOME').catch(() => undefined)) || (await $.env.get('USERPROFILE').catch(() => undefined)) || ''
+  casesFile = `${(await $.env.get('CLAUDE_CONFIG_DIR').catch(() => undefined)) ?? `${homeDir}/.claude`}/plugins/data/jev-steer/cases.json`
+  return casesFile
+}
+
+async function readCasesFile($: EngineInterface, path: string): Promise<Feedback[] | null> {
+  for (const p of [path, path.replace(/\.json$/, '.backup.json')]) {
+    const text = await $.fs.read(p).catch(() => null)
+    if (text === null) continue
+    try {
+      const v = JSON.parse(String(text)) as unknown
+      if (Array.isArray(v)) return v as Feedback[]
+    } catch {
+      // a half-written file: the backup stands in
+    }
+  }
+  return null
+}
+
+async function loadCases($: EngineInterface): Promise<Feedback[]> {
+  if (casesOnDisk === null) {
+    // A host without files (tests) keeps them in the store.
+    casesOnDisk = await casesPath($).then(path => $.fs.exists(path)).then(() => true, () => false)
+  }
+  if (!casesOnDisk) return ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+  const path = await casesPath($)
+  const now = await $.clock.now()
+  if (casesMemo && now - casesChecked < CASES_CHECK_MS) return [...casesMemo]
+  casesChecked = now
+  const stat = await $.fs.stat(path).catch(() => null)
+  if (casesMemo && stat && stat.mtimeMs === casesMtime) return [...casesMemo]
+  const fromFile = stat ? await readCasesFile($, path) : null
+  if (fromFile) {
+    casesMemo = fromFile
+    casesMtime = stat?.mtimeMs ?? 0
+  } else if (!casesMemo) {
+    // First run: the cases move out of the store once, then leave it.
+    casesMemo = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+    await writeCasesFile($, casesMemo)
+    if (casesMtime) await $.store.delete('feedbackLog')
+  }
+  return [...casesMemo]
+}
+
+async function writeCasesFile($: EngineInterface, cases: Feedback[]) {
+  const path = await casesPath($)
+  const text = JSON.stringify(cases)
+  await $.fs.write(path, text)
+  const now = await $.clock.now()
+  if (now - casesBackedUp > 10 * 60_000) {
+    casesBackedUp = now
+    await $.fs.write(path.replace(/\.json$/, '.backup.json'), text).catch(() => undefined)
+  }
+  casesMtime = (await $.fs.stat(path).catch(() => null))?.mtimeMs ?? casesMtime
+  casesChecked = now
+}
+
 async function saveCases($: EngineInterface, cases: Feedback[]) {
-  await save($, 'feedbackLog', keptCases(cases))
+  if (casesOnDisk === null) await loadCases($)
+  if (!casesOnDisk) {
+    await save($, 'feedbackLog', keptCases(cases))
+    return
+  }
+  // One write at a time; a case another session added since this one read is kept.
+  const write = casesWriting.then(async () => {
+    const path = await casesPath($)
+    const known = new Set((casesMemo ?? []).map(f => f.at))
+    const stat = await $.fs.stat(path).catch(() => null)
+    const theirs = stat && stat.mtimeMs !== casesMtime ? ((await readCasesFile($, path)) ?? []).filter(f => !known.has(f.at)) : []
+    const ours = new Set(cases.map(f => f.at))
+    const next = keptCases([...cases, ...theirs.filter(f => !ours.has(f.at))])
+    casesMemo = next
+    await writeCasesFile($, next)
+    $.ui.invalidate('ui.render')
+  })
+  casesWriting = write.catch(() => undefined)
+  await write
 }
 
 async function setFeedback($: EngineInterface, at: number, change: Partial<Feedback>) {
-  const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+  const fb = (await loadCases($))
   await saveCases($, fb.map(f => (f.at === at ? { ...f, ...change } : f)))
 }
 
@@ -1079,7 +1173,7 @@ async function readHistory($: EngineInterface, tried: Set<number>, range?: Histo
   const prev = (await $.store.get('history')) as History | undefined
   // No range: carry on with the run that stopped.
   const isResuming = !range && Boolean(prev && prev.status !== 'done')
-  const live = (((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []).filter(f => !f.aniId && !f.fromHistory).map(f => f.at)
+  const live = ((await loadCases($))).filter(f => !f.aniId && !f.fromHistory).map(f => f.at)
   const liveStart = live.length ? Math.min(...live) : now
   const recentDone = prev && prev.status === 'done' && (prev.v ?? 1) >= HISTORY_V && prev.range !== 'all'
   const since = isResuming && prev ? prev.since : range === 'all' ? 0 : now - HISTORY_DAYS * 86_400_000
@@ -1176,7 +1270,7 @@ async function readHistory($: EngineInterface, tried: Set<number>, range?: Histo
     }
     const prompts = reader.prompts().filter(p => !asked.has(p.uuid))
     for (const p of prompts) asked.add(p.uuid)
-    const byAt = new Map((((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []).map(x => [x.at, x]))
+    const byAt = new Map(((await loadCases($))).map(x => [x.at, x]))
     // A case an earlier run found gets the conversation around it, and is judged again with it.
     for (const p of prompts.filter(x => byAt.get(x.at)?.fromHistory && !byAt.get(x.at)?.context && !byAt.get(x.at)?.judgment)) await setFeedback($, p.at, caseContext(p))
     const fresh = prompts.filter(p => !byAt.has(p.at))
@@ -1201,7 +1295,7 @@ async function readHistory($: EngineInterface, tried: Set<number>, range?: Histo
       if (!hits.length) continue
       const cases: Feedback[] = []
       for (const p of hits) cases.push({ at: p.at, text: p.text, cardId: '', project: await projectOf($, p.cwd, slugs), fromHistory: true, ...caseContext(p) })
-      const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+      const fb = (await loadCases($))
       const have = new Set(fb.map(x => x.at))
       const add = cases.filter(c => !have.has(c.at))
       await saveCases($, [...fb, ...add])
@@ -1219,7 +1313,7 @@ async function readHistory($: EngineInterface, tried: Set<number>, range?: Histo
  */
 async function judgeHistory($: EngineInterface, tried = new Set<number>()) {
   for (;;) {
-    const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+    const fb = (await loadCases($))
     const isWaiting = (f: Feedback) => !f.cardId && !f.candidateId
     const next = fb.filter(f => f.fromHistory && !tried.has(f.at) && (!f.judgment || (!f.pattern && f.context && isWaiting(f)))).sort((a, b) => a.at - b.at)[0]
     if (!next) return
@@ -1245,7 +1339,7 @@ async function regroupCases($: EngineInterface) {
   try {
     const tried = new Set<number>()
     for (;;) {
-      const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+      const fb = (await loadCases($))
       const next = fb.filter(f => f.judgment && !f.pattern && !f.cardId && !f.candidateId && !f.aniId && !tried.has(f.at)).sort((a, b) => a.at - b.at)[0]
       if (!next) return
       tried.add(next.at)
@@ -1865,7 +1959,7 @@ async function afterSend($: EngineInterface, text: string, isPerson: boolean, tE
   {
     // The words that followed the last case, read as it stood before this request (which may itself become one).
     const own = isScriptedSession || !isPerson ? '' : personText(text)
-    const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+    const fb = (await loadCases($))
     const last = fb.find(f => f.at < tEntry)
     if (own && last && !last.fromHistory && !last.aniId && last.text !== own && (last.after?.length ?? 0) < 2) await setFeedback($, last.at, { after: [...(last.after ?? []), excerpt(own, 80)] })
   }
@@ -1875,7 +1969,7 @@ async function afterSend($: EngineInterface, text: string, isPerson: boolean, tE
   if (!(await $.store.get('caseV2'))) {
     await save($, 'caseV2', true)
     $.clock.after(0, async () => {
-      const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+      const fb = (await loadCases($))
       for (const f of fb.filter(x => !x.fromHistory && !x.aniId).slice(0, 12)) await enrichFeedback($, f.at, f.text)
     })
   }
@@ -2388,7 +2482,7 @@ export const register: Register = on => {
     $.clock.after(0, () => settleReqs($))
     // Feedback logged before the walk-back existed gets its context now.
     $.clock.after(0, async () => {
-      const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+      const fb = (await loadCases($))
       // Cases from past conversations or ani's files carry their own context.
       for (const f of fb.filter(x => !x.judgment && !x.fromHistory && !x.aniId).slice(0, 10)) await enrichFeedback($, f.at, f.text)
     })
@@ -2402,6 +2496,9 @@ export const register: Register = on => {
     const tEntry = await $.clock.now()
     // A scheduled task, a background notice or another session is not the person speaking.
     const isPerson = isPersonOrigin(e.origin as { kind: string; asUser?: boolean } | undefined)
+    // What an app, a script or the engine sent (a commit-message helper's role prompt,
+    // a task notice, a linked session's note) is not judged: no Jev call, nothing rides it.
+    if (!isPerson || isScriptedSession || !personText(text)) return next(e)
     if (/(^|[^a-z])(ani|애니)\s*(사이드\s*)?(패널\s*)?(좀\s*)?(열어|띄워|보여|켜)/i.test(text)) await $.ui.open({ id: PANE, title: TITLE })
     recentPrompts.push(text)
     if (recentPrompts.length > 6) recentPrompts.shift()
@@ -2964,7 +3061,7 @@ export const register: Register = on => {
       const goalRun = (await $.store.get('goalRun')) as LadderRun | undefined
       const needRun = (await $.store.get('needRun')) as LadderRun | undefined
       const cands = ((await $.store.get('candidates')) as Candidate[] | undefined) ?? []
-      const allCases = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+      const allCases = (await loadCases($))
       const limit = await read($, listLimit)
       const openCands = cands.filter(c => !c.isDeclined).sort((a, b) => b.cases.length - a.cases.length)
       const promoCards = own

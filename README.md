@@ -195,10 +195,10 @@ sequenceDiagram
 </details>
 
 <details>
-<summary><b>🧹 사례가 되지 않는 것</b></summary>
+<summary><b>🧹 사례가 되지 않는 것 · 판정하지 않는 요청</b></summary>
 <br>
 
-사용자가 직접 친 말만 사용자의 말로 기록합니다. 다음은 사례·지시가 되지 않습니다.
+사용자가 직접 친 말만 사용자의 말로 기록합니다. 다음은 사례·지시가 되지 않고, Jev에 묻지도 규칙을 붙이지도 않습니다.
 
 - 앱 알림: `<system-reminder>`, `<ci-monitor-event>`, `<task-notification>`
 - 예약 작업, 다른 에이전트·세션이 보낸 지시 (대화 기록의 `origin`이 `human`이 아닌 것)
@@ -271,11 +271,12 @@ sequenceDiagram
 
 ## 💾 저장
 
-모든 기록은 Claude Code 플러그인 저장소 `$.store`에 JSON으로 저장됩니다.
+💬 사례는 따로 `~/.claude/plugins/data/jev-steer/cases.json`에 둡니다(`CLAUDE_CONFIG_DIR`을 쓰면 그 아래). 기록의 대부분이 사례라서, 저장소에 두면 무엇을 저장하든 큰 파일 전체를 다시 써야 했기 때문입니다. 예전 버전의 사례는 처음 실행할 때 한 번 옮겨집니다.
+
+나머지 기록은 Claude Code 플러그인 저장소 `$.store`에 JSON으로 저장됩니다.
 
 | 키 | 내용 |
 |---|---|
-| `feedbackLog` | 💬 사례 |
 | `cards` | 📝 교훈 · 📏 규칙 |
 | `requirements` | 지시 |
 | `principles` | 🧱 원칙 |
