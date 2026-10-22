@@ -179,10 +179,32 @@ let attachedReqIds: string[] = []
  * card stays on screen until something else redraws it.
  */
 async function save($: EngineInterface, key: string, value: unknown) {
-  hot.set(key, { at: await $.clock.now(), value })
+  hot.set(key, { at: Date.now(), value })
   if (key === 'cards') aniRows = null
   await $.store.set(key, value)
-  $.ui.invalidate('ui.render')
+  if (UNDRAWN_KEYS.has(key)) return
+  // Right after a request goes out its background writes share one redraw; a press redraws at once.
+  if (Date.now() < quietUntil) redrawSoon($)
+  else $.ui.invalidate('ui.render')
+}
+
+/** Until when a request's own background writes are drawn together. */
+let quietUntil = 0
+/** Kept for the request path only: nothing on screen reads them. */
+const UNDRAWN_KEYS = new Set(['sendSeq', 'lastAttached', 'compactSeq'])
+/**
+ * One redraw for the writes of a moment: every write used to redraw the band
+ * and the pane at once, and a request's background writes redrew the pane
+ * several times while the next request was being judged (measured).
+ */
+let redrawPending = false
+function redrawSoon($: EngineInterface) {
+  if (redrawPending) return
+  redrawPending = true
+  $.clock.after(250, () => {
+    redrawPending = false
+    $.ui.invalidate('ui.render')
+  })
 }
 
 /**
@@ -195,12 +217,13 @@ async function save($: EngineInterface, key: string, value: unknown) {
 const HOT_MS = 20_000
 const hot = new Map<string, { at: number; value: unknown }>()
 async function hotGet($: EngineInterface, key: string): Promise<unknown> {
-  const now = await $.clock.now()
+  // The machine's clock, not the host's: one less round trip on the request path.
+  const now = Date.now()
   const h = hot.get(key)
   if (h) {
     if (now - h.at > HOT_MS) {
       h.at = now
-      $.clock.after(0, async () => { hot.set(key, { at: await $.clock.now(), value: await $.store.get(key) }) })
+      $.clock.after(0, async () => { hot.set(key, { at: Date.now(), value: await $.store.get(key) }) })
     }
     return h.value
   }
@@ -1513,10 +1536,10 @@ async function recordAnswers($: EngineInterface, a: { answers: Answers; reqs: Re
  */
 let lastHasKey: boolean | null = null
 async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'submit' | 'commit' = 'submit', prevAttached: readonly string[] = [], isPerson = true): Promise<Result | null> {
-  const m0 = await $.clock.now()
+  const m0 = Date.now()
   const marks: Record<string, number> = {}
   if (mode === 'submit') submitMarks = marks
-  const mark = async (k: string) => { marks[k] = (await $.clock.now()) - m0 }
+  const mark = async (k: string) => { marks[k] = Date.now() - m0 }
   const routes = await jevRoutes($, true)
   if (routes.length > 0 !== lastHasKey) {
     lastHasKey = routes.length > 0
@@ -1541,7 +1564,7 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
     // confirmed goal and the confirmed needs ride every request.
     const candidates = pickCandidates(prompt, allCards.filter(c => c.isRule), project, { isEvery: true, max: MAX_RULE_CANDIDATES })
     const attachedBefore = mode === 'draft' ? [] : allCards.filter(c => prevAttached.includes(c.id))
-    if (mode !== 'commit') await update($, view, v => ({ ...v, weighing: candidates.map(c => c.id) }))
+    if (mode !== 'commit') redrawLater(update($, view, v => ({ ...v, weighing: candidates.map(c => c.id) })))
     const reqs = (await loadReqs($, true)).filter(r => r.active >= 0.4 && appliesTo(r, project))
     const state = {
       latest_user_message: prompt.slice(0, MAX_PROMPT_CHARS),
@@ -2506,6 +2529,7 @@ export const register: Register = on => {
     const text = e.text.trim()
     if (!text || text.startsWith('/')) return next(e)
     const tEntry = await $.clock.now()
+    quietUntil = Date.now() + 3_000
     // A scheduled task, a background notice or another session is not the person speaking.
     const isPerson = isPersonOrigin(e.origin as { kind: string; asUser?: boolean } | undefined)
     // What an app, a script or the engine sent (a commit-message helper's role prompt,
