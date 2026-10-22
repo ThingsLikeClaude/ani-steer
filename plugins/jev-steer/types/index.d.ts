@@ -90,7 +90,7 @@ export type View = {
 }
 
 /** What actually went out with the last request: the exact text, or nothing and why. */
-export type Sent = { at: number; prompt: string; text: string | null; lessonIds: string[]; reqIds: string[]; isLate: boolean; ms: number }
+export type Sent = { at: number; prompt: string; text: string | null; lessonIds: string[]; reqIds: string[]; isLate: boolean; ms: number; /** Where the time went, ms: before judging, its phases, waiting on it, attaching. */ marks?: Record<string, number> }
 
 /** One correction, verbatim: the evidence every higher layer points back to. */
 export type Feedback = {

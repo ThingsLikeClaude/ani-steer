@@ -165,6 +165,8 @@ let latestSeq = 0
 /** The draft Jev judged while the person typed, and what it said: reused at submit when the text matches. */
 let drafted: { text: string; result: Result } | null = null
 let draftSeq = 0
+/** Where the time of the request going out went, ms from the start of its judging: kept with the send. */
+let submitMarks: Record<string, number> = {}
 const DRAFT_IDLE_MS = 700
 let lastAnswer = ''
 let attachedReqIds: string[] = []
@@ -1315,6 +1317,10 @@ type Result = { judgments: Judgment[]; candidates: Card[]; reqIds: string[] }
  * commit: the request went out on a draft's judgment; record only, leave the view.
  */
 async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'submit' | 'commit' = 'submit', prevAttached: readonly string[] = [], isPerson = true): Promise<Result | null> {
+  const m0 = await $.clock.now()
+  const marks: Record<string, number> = {}
+  if (mode === 'submit') submitMarks = marks
+  const mark = async (k: string) => { marks[k] = (await $.clock.now()) - m0 }
   const routes = await jevRoutes($, true)
   await update($, hasKey, () => routes.length > 0)
   if (!routes.length) {
@@ -1328,7 +1334,9 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
   // Recorded only when the person typed it in their own session: not the engine's or the app's turn, not a script's.
   const said = mode === 'draft' || isScriptedSession || !isPerson ? '' : personText(prompt)
   try {
+    await mark('setup')
     const allCards = await loadCards($)
+    await mark('cards')
     // Attaching starts at the rule layer: Jev weighs every rule in scope. Lessons
     // change often and are kept and corrected, never attached. Principles, the
     // confirmed goal and the confirmed needs ride every request.
@@ -1344,14 +1352,19 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
       project,
     }
     const questions = buildQuestions(candidates, reqs, attachedBefore)
+    marks.questions = Object.keys(questions).length
+    await mark('ask')
     const send = async (route: JevRoute) => {
       const body = jevBody({ model: route.model, state, questions })
       const headers = { authorization: `Bearer ${route.key}`, 'content-type': 'application/json' }
       // 5xx and 429 are transient on Jev's side: two retries with backoff.
+      marks.tries = (marks.tries ?? 0) + 1
       let res = await $.http.fetch(route.url, { method: 'POST', headers, body })
       for (const wait of [400, 1500]) {
         if (res.ok || !(res.status >= 500 || res.status === 429) || seq !== latestSeq) break
+        marks[`status${marks.tries}`] = res.status
         await $.clock.sleep(wait)
+        marks.tries += 1
         res = await $.http.fetch(route.url, { method: 'POST', headers, body })
       }
       return res
@@ -1364,6 +1377,8 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
       res = await send(route)
     }
     const beatMs = (await $.clock.now()) - started
+    await mark('jev')
+    marks.status = res.status
     await update($, beat, () => ({ ok: res.ok, ms: beatMs, at: started, detail: res.ok ? undefined : `HTTP ${res.status}` }))
     if (!res.ok) {
       await save($, 'lastError', { status: res.status, body: res.text.slice(0, 300), at: started })
@@ -2275,6 +2290,7 @@ export const register: Register = on => {
   on('prompt.submit', async ($, e, next) => {
     const text = e.text.trim()
     if (!text || text.startsWith('/')) return next(e)
+    const tEntry = await $.clock.now()
     // A scheduled task, a background notice or another session is not the person speaking.
     const isPerson = isPersonOrigin(e.origin as { kind: string; asUser?: boolean } | undefined)
     {
@@ -2309,11 +2325,14 @@ export const register: Register = on => {
     await update($, view, v => ({ ...v, isDraft: false }))
     drafted = null
     if (pre) $.clock.after(0, () => analyze($, text, 'commit', prevIds, isPerson))
+    submitMarks = {}
     const result = pre ?? (await Promise.race([analyze($, text, 'submit', prevIds, isPerson), $.clock.sleep(SUBMIT_WAIT_MS).then(() => null)]))
+    const tJudged = await $.clock.now()
+    const judgedMarks = { ...submitMarks }
     const extra = result ? await attachment($, result) : null
     attachedReqIds = extra?.reqIds ?? []
     const at = await $.clock.now()
-    const record = { at, prompt: text.slice(0, 200), text: extra?.text || null, lessonIds: extra?.lessonIds ?? [], reqIds: extra?.reqIds ?? [], isLate: !result, ms: at - t0 }
+    const record = { at, prompt: text.slice(0, 200), text: extra?.text || null, lessonIds: extra?.lessonIds ?? [], reqIds: extra?.reqIds ?? [], isLate: !result, ms: at - t0, marks: { before: t0 - tEntry, ...(pre ? { draft: 1 } : judgedMarks), judged: tJudged - t0, attach: at - tJudged } }
     await update($, sent, () => record)
     if (record.lessonIds.length && (await read($, display)).toast) {
       const first = (await ownCards($)).find(c => c.id === record.lessonIds[0])
