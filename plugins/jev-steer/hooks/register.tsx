@@ -179,8 +179,39 @@ let attachedReqIds: string[] = []
  * card stays on screen until something else redraws it.
  */
 async function save($: EngineInterface, key: string, value: unknown) {
+  hot.set(key, { at: await $.clock.now(), value })
+  if (key === 'cards') aniRows = null
   await $.store.set(key, value)
   $.ui.invalidate('ui.render')
+}
+
+/**
+ * What a request reads, kept in memory: every store read and write goes through
+ * one file of a few MB, and a request must not wait on it (measured: a send spent
+ * 0.2-3 s on the store and the rest of ani's work for a 0.25 s Jev answer). A copy
+ * is served at once and read again in the background once it is HOT_MS old; this
+ * session's own writes update it at once, another session's show within HOT_MS.
+ */
+const HOT_MS = 20_000
+const hot = new Map<string, { at: number; value: unknown }>()
+async function hotGet($: EngineInterface, key: string): Promise<unknown> {
+  const now = await $.clock.now()
+  const h = hot.get(key)
+  if (h) {
+    if (now - h.at > HOT_MS) {
+      h.at = now
+      $.clock.after(0, async () => { hot.set(key, { at: await $.clock.now(), value: await $.store.get(key) }) })
+    }
+    return h.value
+  }
+  const value = await $.store.get(key)
+  hot.set(key, { at: now, value })
+  return value
+}
+/** A write the request does not wait on: the copy changes now, the file after. */
+function saveLater($: EngineInterface, key: string, value: unknown) {
+  hot.set(key, { at: Number.MAX_SAFE_INTEGER / 2, value })
+  $.clock.after(0, () => save($, key, value))
 }
 
 async function ownCards($: EngineInterface): Promise<Card[]> {
@@ -197,22 +228,29 @@ function othersOf(cards: readonly Card[]): Card[] {
 }
 
 /** ani's own stores (read-only here) plus the lessons this mod keeps. */
-async function loadCards($: EngineInterface): Promise<Card[]> {
+async function loadCards($: EngineInterface, isHot = false): Promise<Card[]> {
   // A session opened in the home folder would read the global index twice.
   const stores: [string, Scope][] = [
     ...(isSamePath(root, home) ? [] : [[`${root}/.ani/INDEX.md`, 'team-project'] as [string, Scope]]),
     [`${home}/.ani/INDEX.md`, 'global'],
   ]
-  const ani: Card[] = []
-  for (const [path, scope] of stores) {
-    const text = await $.fs.read(path).catch(() => '')
-    if (text) ani.push(...parseIndex(String(text), scope, project))
+  let ani = isHot ? aniRows : null
+  if (!ani) {
+    ani = []
+    for (const [path, scope] of stores) {
+      const text = await $.fs.read(path).catch(() => '')
+      if (text) ani.push(...parseIndex(String(text), scope, project))
+    }
+    aniRows = ani
   }
   // The lesson this mod keeps wins over ani's index row of the same id: a muted
   // or attached copy stays as the person left it.
   const seen = new Set<string>()
-  return [...(await ownCards($)).filter(c => !c.isArchived), ...ani].filter(c => (seen.has(c.id) ? false : (seen.add(c.id), true)))
+  const own = isHot ? (((await hotGet($, 'cards')) as Card[] | undefined) ?? []) : await ownCards($)
+  return [...own.filter(c => !c.isArchived), ...ani].filter(c => (seen.has(c.id) ? false : (seen.add(c.id), true)))
 }
+/** ani's index rows as last read; read again whenever cards are written or a request finds none. */
+let aniRows: Card[] | null = null
 
 /** The person decided whether another project's lesson or rule rides here too. */
 async function placeCard($: EngineInterface, id: string, isAttached: boolean) {
@@ -1311,6 +1349,50 @@ async function extractRequirements($: EngineInterface, prompt: string, now: numb
 
 type Result = { judgments: Judgment[]; candidates: Card[]; reqIds: string[] }
 
+/** What one Jev answer says to record, written after the request went out. */
+async function recordAnswers($: EngineInterface, a: { answers: Answers; reqs: Requirement[]; candidates: Card[]; attachedBefore: Card[]; said: string; started: number; toast: boolean }) {
+  const { answers, reqs, candidates, attachedBefore, said, started, toast } = a
+  try {
+    // Requirements: Jev scores whether each still holds and whether it bears on
+    // this request. It never deletes one.
+    {
+      const scored = new Map(reqs.map((r, i) => [r.id, noul(answers, `r${i}_active`)]))
+      await setReqs($, rs => rs.map(r => (scored.has(r.id) ? { ...r, active: scored.get(r.id) as number } : r)))
+    }
+    if (said && noul(answers, 'has_requirement') >= 0.6) $.clock.after(0, () => extractRequirements($, said, started))
+
+    // A correction pushing against a lesson attached last turn means Jev attached it wrongly.
+    for (const [i, c] of attachedBefore.entries()) {
+      if (!said || noul(answers, `p${i}_reverses`) < 0.6) continue
+      const labels = ((await $.store.get('labels')) as Label[] | undefined) ?? []
+      await save($, 'labels', [...labels, { cardId: c.id, verdict: 'apply', isRight: false, same: 0, satisfy: 0, flip: 1, ts: started } as Label].slice(-2000))
+      const reversals = (c.reversals ?? 0) + 1
+      await editCard($, c.id, { reversals, ...(reversals >= 2 ? { isMuted: true } : {}) })
+      if (toast) $.ui.toast(reversals >= 2 ? `ani · "${c.short ?? c.lesson ?? c.text}" 반대 피드백 2번 · 이 교훈을 껐어요` : `ani · "${c.short ?? c.lesson ?? c.text}"은 이번엔 잘못 붙였어요 · 기록했어요`, { timeoutMs: 5000 })
+    }
+
+    let recorded: View['recorded'] = null
+    if (said && noul(answers, 'is_correction') >= 0.6) {
+      const card = await remember($, said, answers, candidates, started)
+      if (card) recorded = { cardId: card.id, kind: card.kind, scope: card.scope, until: started }
+      if (recorded) await update($, view, v => ({ ...v, recorded }))
+      if (toast) $.ui.toast(card ? `ani · 같은 판단 ${card.count}번째 — 교훈을 다듬을게요` : `ani · 사례로 기록했어요 · 같은 판단이 한 번 더 나오면 교훈이 돼요`, { timeoutMs: 4000 })
+    }
+
+    if (said && noul(answers, 'is_correction') >= 0.6) {
+      // A correction that points away from the goal counts against it; a value beneath it is not judged by one correction.
+      const gs = await loadGoals($)
+      const goal = gs.find(g => g.status === 'confirmed')
+      if (goal) {
+        const fitAns = await askJev($, { correction: said.slice(0, 1500) }, { fit: { type: 'noul', instructions: `Is this correction consistent with what the user is after when working with an AI: "${goal.text}"`, criteria: { true: 'consistent', false: 'points somewhere else' } } }, { isQuick: true })
+        if (fitAns && noul(fitAns, 'fit') < 0.3) await save($, 'goals', gs.map(g => (g.id === goal.id ? { ...g, misfit: (g.misfit ?? 0) + 1 } : g)))
+      }
+    }
+  } catch {
+    // a record missed is not the request's failure
+  }
+}
+
 /**
  * draft: judging what is being typed; no correction or requirement is recorded.
  * submit: the request going out; everything.
@@ -1335,7 +1417,7 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
   const said = mode === 'draft' || isScriptedSession || !isPerson ? '' : personText(prompt)
   try {
     await mark('setup')
-    const allCards = await loadCards($)
+    const allCards = await loadCards($, true)
     await mark('cards')
     // Attaching starts at the rule layer: Jev weighs every rule in scope. Lessons
     // change often and are kept and corrected, never attached. Principles, the
@@ -1343,7 +1425,7 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
     const candidates = pickCandidates(prompt, allCards.filter(c => c.isRule), project, { isEvery: true, max: MAX_RULE_CANDIDATES })
     const attachedBefore = mode === 'draft' ? [] : allCards.filter(c => prevAttached.includes(c.id))
     if (mode !== 'commit') await update($, view, v => ({ ...v, weighing: candidates.map(c => c.id) }))
-    const reqs = (await loadReqs($)).filter(r => r.active >= 0.4 && appliesTo(r, project))
+    const reqs = (await loadReqs($, true)).filter(r => r.active >= 0.4 && appliesTo(r, project))
     const state = {
       latest_user_message: prompt.slice(0, MAX_PROMPT_CHARS),
       earlier_user_messages: (mode === 'draft' ? recentPrompts.slice(-3) : recentPrompts.slice(-4, -1)).map(p => p.slice(0, 1000)),
@@ -1386,58 +1468,25 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
     }
     const answers = (JSON.parse(res.text) as { answers: Answers }).answers
 
-    // Requirements: Jev scores whether each still holds and whether it bears on
-    // this request. It never deletes one.
-    if (mode !== 'draft') {
-      const scored = new Map(reqs.map((r, i) => [r.id, noul(answers, `r${i}_active`)]))
-      await setReqs($, rs => rs.map(r => (scored.has(r.id) ? { ...r, active: scored.get(r.id) as number } : r)))
-    }
     const reqIds = reqs
       .map((r, i) => ({ r, rel: noul(answers, `r${i}_relevant`), act: noul(answers, `r${i}_active`) }))
       .filter(x => x.rel >= 0.6 && x.act >= 0.4)
       .sort((a, b) => b.rel - a.rel)
       .slice(0, MAX_ATTACHED_REQS)
       .map(x => x.r.id)
-    if (said && noul(answers, 'has_requirement') >= 0.6) $.clock.after(0, () => extractRequirements($, said, started))
-
-    // A correction pushing against a lesson attached last turn means Jev attached it wrongly.
-    for (const [i, c] of attachedBefore.entries()) {
-      if (!said || noul(answers, `p${i}_reverses`) < 0.6) continue
-      const labels = ((await $.store.get('labels')) as Label[] | undefined) ?? []
-      await save($, 'labels', [...labels, { cardId: c.id, verdict: 'apply', isRight: false, same: 0, satisfy: 0, flip: 1, ts: started } as Label].slice(-2000))
-      const reversals = (c.reversals ?? 0) + 1
-      await editCard($, c.id, { reversals, ...(reversals >= 2 ? { isMuted: true } : {}) })
-      if (shown.toast) $.ui.toast(reversals >= 2 ? `ani · "${c.short ?? c.lesson ?? c.text}" 반대 피드백 2번 · 이 교훈을 껐어요` : `ani · "${c.short ?? c.lesson ?? c.text}"은 이번엔 잘못 붙였어요 · 기록했어요`, { timeoutMs: 5000 })
-    }
-
-    let recorded: View['recorded'] = null
-    if (said && noul(answers, 'is_correction') >= 0.6) {
-      const card = await remember($, said, answers, candidates, started)
-      if (card) recorded = { cardId: card.id, kind: card.kind, scope: card.scope, until: started }
-      if (shown.toast) $.ui.toast(card ? `ani · 같은 판단 ${card.count}번째 — 교훈을 다듬을게요` : `ani · 사례로 기록했어요 · 같은 판단이 한 번 더 나오면 교훈이 돼요`, { timeoutMs: 4000 })
-    }
-
-    if (said && noul(answers, 'is_correction') >= 0.6) {
-      // A correction that points away from the goal counts against it; a value beneath it is not judged by one correction.
-      const gs = await loadGoals($)
-      const goal = gs.find(g => g.status === 'confirmed')
-      if (goal) {
-        const fitAns = await askJev($, { correction: said.slice(0, 1500) }, { fit: { type: 'noul', instructions: `Is this correction consistent with what the user is after when working with an AI: "${goal.text}"`, criteria: { true: 'consistent', false: 'points somewhere else' } } }, { isQuick: true })
-        if (fitAns && noul(fitAns, 'fit') < 0.3) await save($, 'goals', gs.map(g => (g.id === goal.id ? { ...g, misfit: (g.misfit ?? 0) + 1 } : g)))
-      }
-    }
-    const judgments = judge(candidates, answers).filter(j => j.id !== recorded?.cardId)
-    if (mode === 'commit') {
-      if (recorded) await update($, view, v => ({ ...v, recorded }))
-      return { judgments, candidates, reqIds }
-    }
+    // What the request needs is known now. What Jev's answer says to record
+    // (requirements still holding, a correction, a rule attached wrongly) is
+    // written after the request goes out: the request never waits on the store.
+    if (mode !== 'draft') $.clock.after(0, () => recordAnswers($, { answers, reqs, candidates, attachedBefore, said, started, toast: shown.toast }))
+    const judgments = judge(candidates, answers)
+    if (mode === 'commit') return { judgments, candidates, reqIds }
     if (seq !== latestSeq) return null // a newer prompt is being judged; drop this stale answer
     const applied = appliedIds(judgments, candidates)
     const lastMs = (await $.clock.now()) - started
     await update($, beat, () => ({ ok: true, ms: lastMs, at: started }))
     await update($, view, v => {
       const kept = Object.fromEntries(Object.entries(v.answers).filter(([id]) => judgments.some(j => j.id === id)))
-      return { isBusy: false, isLabeled: Object.keys(kept).length > 0, answers: kept, judgments, recorded: mode === 'draft' ? v.recorded : recorded, error: null, lastMs, applied, weighing: [], isDraft: mode === 'draft' }
+      return { isBusy: false, isLabeled: Object.keys(kept).length > 0, answers: kept, judgments, recorded: mode === 'draft' ? v.recorded : null, error: null, lastMs, applied, weighing: [], isDraft: mode === 'draft' }
     })
     return { judgments, candidates, reqIds }
   } catch (err) {
@@ -1458,11 +1507,11 @@ function lessonLine(c: Card): string {
 
 /** What rides with the prompt: lessons Jev judged to apply, and the requirements that bear on it. */
 
-async function loadPrinciples($: EngineInterface): Promise<Principle[]> {
-  return ((await $.store.get('principles')) as Principle[] | undefined) ?? []
+async function loadPrinciples($: EngineInterface, isHot = false): Promise<Principle[]> {
+  return ((await (isHot ? hotGet($, 'principles') : $.store.get('principles'))) as Principle[] | undefined) ?? []
 }
-async function loadNeeds($: EngineInterface): Promise<Need[]> {
-  return ((await $.store.get('needs')) as Need[] | undefined) ?? []
+async function loadNeeds($: EngineInterface, isHot = false): Promise<Need[]> {
+  return ((await (isHot ? hotGet($, 'needs') : $.store.get('needs'))) as Need[] | undefined) ?? []
 }
 
 /** The person's keys in the order to try; which service carries what is shown under 설정. */
@@ -1556,8 +1605,8 @@ async function setPrinciple($: EngineInterface, id: string, status: Principle['s
   if (status === 'active') $.clock.after(0, () => proposeGoals($))
 }
 
-async function loadGoals($: EngineInterface): Promise<Goal[]> {
-  return ((await $.store.get('goals')) as Goal[] | undefined) ?? []
+async function loadGoals($: EngineInterface, isHot = false): Promise<Goal[]> {
+  return ((await (isHot ? hotGet($, 'goals') : $.store.get('goals'))) as Goal[] | undefined) ?? []
 }
 
 /** How many principles a goal must serve to stand above them all: four in five, never fewer than two. */
@@ -1787,31 +1836,70 @@ function appliedIds(judgments: readonly Judgment[], candidates: readonly Card[])
   return judgments.filter(j => j.verdict === 'apply' && isRule.has(j.id)).sort((x, y) => y.same - x.same).slice(0, MAX_ATTACHED_RULES).map(j => j.id)
 }
 
+/**
+ * The chores a request used to wait on, run once it has gone out: the person's
+ * own need command, the last case's follow-up words, background tidying, the
+ * toast and the send log.
+ */
+async function afterSend($: EngineInterface, text: string, isPerson: boolean, tEntry: number, record: Sent) {
+  {
+    const m = text.match(/^근원\s*욕구\s*[:：]\s*(.+)$/s)
+    if (m) await writeNeed($, m[1].trim().slice(0, 200))
+  }
+  {
+    // The words that followed the last case, read as it stood before this request (which may itself become one).
+    const own = isScriptedSession || !isPerson ? '' : personText(text)
+    const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+    const last = fb.find(f => f.at < tEntry)
+    if (own && last && !last.fromHistory && !last.aniId && last.text !== own && (last.after?.length ?? 0) < 2) await setFeedback($, last.at, { after: [...(last.after ?? []), excerpt(own, 80)] })
+  }
+  $.clock.after(0, () => importAni($))
+  $.clock.after(0, () => settleReqs($))
+  // Cases written under the 40자 limit are walked back once more, at full length.
+  if (!(await $.store.get('caseV2'))) {
+    await save($, 'caseV2', true)
+    $.clock.after(0, async () => {
+      const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+      for (const f of fb.filter(x => !x.fromHistory && !x.aniId).slice(0, 12)) await enrichFeedback($, f.at, f.text)
+    })
+  }
+  // Lessons still without a short form get one in the background.
+  if (mineOf(await ownCards($)).some(c => c.lesson && !c.short)) $.clock.after(0, () => shorten($))
+  if (record.lessonIds.length && (await read($, display)).toast) {
+    const first = (await ownCards($)).find(c => c.id === record.lessonIds[0])
+    $.ui.toast(record.text
+      ? `ani · 규칙 ${record.lessonIds.length}개를 붙여 보냈어요: ${first?.short ?? first?.lesson ?? ''}`
+      : `ani · 규칙 ${record.lessonIds.length}개는 이미 대화에 있어 다시 붙이지 않았어요`, { timeoutMs: 4000 })
+  }
+  const log = ((await $.store.get('sentLog')) as Sent[] | undefined) ?? []
+  await save($, 'sentLog', [record, ...log].slice(0, 20))
+}
+
 async function attachment($: EngineInterface, r: Result): Promise<{ text: string; lessonIds: string[]; reqIds: string[] } | null> {
   const lessons = appliedIds(r.judgments, r.candidates).map(id => r.candidates.find(c => c.id === id)).filter((c): c is Card => !!c)
-  const reqs = (await loadReqs($)).filter(x => r.reqIds.includes(x.id) && isConcreteRequirement(x.text))
-  const goal = (await loadGoals($)).find(g => g.status === 'confirmed')
+  const reqs = (await loadReqs($, true)).filter(x => r.reqIds.includes(x.id) && isConcreteRequirement(x.text))
+  const goal = (await loadGoals($, true)).find(g => g.status === 'confirmed')
   // The largest need first, then the others the person confirmed.
-  const allNeeds = await loadNeeds($)
+  const allNeeds = await loadNeeds($, true)
   const main = mainNeedOf(allNeeds)
   const needs = [...(main ? [main] : []), ...allNeeds.filter(n => n.status === 'confirmed' && n.id !== main?.id).sort((a, b) => b.ts - a.ts)]
-  const principles = (await loadPrinciples($)).filter(p => p.status === 'active')
+  const principles = (await loadPrinciples($, true)).filter(p => p.status === 'active')
   if (!lessons.length && !reqs.length && !goal && !needs.length && !principles.length) return null
   // Whatever went out in the last few requests is still in the conversation the
   // model reads: saying it again only piles up copies and over-weights it. Repeat
   // only after REATTACH_EVERY requests, or once a compaction has dropped it.
-  const seq = (((await $.store.get('sendSeq')) as number | undefined) ?? 0) + 1
-  const compactSeq = ((await $.store.get('compactSeq')) as number | undefined) ?? 0
-  const lastAt = ((await $.store.get('lastAttached')) as Record<string, number> | undefined) ?? {}
+  const seq = (((await hotGet($, 'sendSeq')) as number | undefined) ?? 0) + 1
+  const compactSeq = ((await hotGet($, 'compactSeq')) as number | undefined) ?? 0
+  const lastAt = ((await hotGet($, 'lastAttached')) as Record<string, number> | undefined) ?? {}
   const isFresh = (id: string) => !(lastAt[id] && lastAt[id] > compactSeq && seq - lastAt[id] < REATTACH_EVERY)
   const ruleLines = lessons.filter(c => c.isRule && isFresh(c.id))
   const freshPrinciples = principles.filter(p => isFresh(p.id))
   const freshGoal = goal && isFresh(goal.id) ? goal : undefined
   const freshNeeds = needs.filter(n => isFresh(n.id))
   const freshReqs = reqs.filter(x => isFresh(x.id))
-  await save($, 'sendSeq', seq)
+  saveLater($, 'sendSeq', seq)
   const sentIds = ruleLines.map(c => c.id).concat(freshPrinciples.map(p => p.id), freshReqs.map(x => x.id), freshGoal ? [freshGoal.id] : [], freshNeeds.map(n => n.id))
-  await save($, 'lastAttached', { ...lastAt, ...Object.fromEntries(sentIds.map(id => [id, seq])) })
+  saveLater($, 'lastAttached', { ...lastAt, ...Object.fromEntries(sentIds.map(id => [id, seq])) })
   if (!ruleLines.length && !freshPrinciples.length && !freshGoal && !freshNeeds.length && !freshReqs.length) {
     // All still in context from earlier requests: nothing new to add, but they still ride.
     return { text: '', lessonIds: lessons.map(c => c.id), reqIds: reqs.map(x => x.id) }
@@ -1992,8 +2080,8 @@ async function setReqs($: EngineInterface, fn: (rs: Requirement[]) => Requiremen
 }
 
 /** Every project's requirements; the caller narrows to this project with `appliesTo`. */
-async function loadReqs($: EngineInterface): Promise<Requirement[]> {
-  const saved = ((await $.store.get('requirements')) as Requirement[] | undefined) ?? []
+async function loadReqs($: EngineInterface, isHot = false): Promise<Requirement[]> {
+  const saved = ((await (isHot ? hotGet($, 'requirements') : $.store.get('requirements'))) as Requirement[] | undefined) ?? []
   return saved.filter(r => r.text.length <= 80 && isConcreteRequirement(r.text))
 }
 
@@ -2243,6 +2331,11 @@ export const register: Register = on => {
       .then(r => (r.exitCode === 0 ? r.stdout : ''))
       .catch(() => '')
     project = await slugOf(remote, root)
+    // What the first request reads, in memory before it is typed.
+    $.clock.after(0, async () => {
+      for (const key of ['requirements', 'principles', 'goals', 'needs', 'sendSeq', 'compactSeq', 'lastAttached']) await hotGet($, key)
+      await loadCards($, true)
+    })
     if ((await read($, sessionStartedAt)) === 0) {
       const now = await $.clock.now()
       await update($, sessionStartedAt, () => now)
@@ -2293,31 +2386,9 @@ export const register: Register = on => {
     const tEntry = await $.clock.now()
     // A scheduled task, a background notice or another session is not the person speaking.
     const isPerson = isPersonOrigin(e.origin as { kind: string; asUser?: boolean } | undefined)
-    {
-      const m = text.match(/^근원\s*욕구\s*[:：]\s*(.+)$/s)
-      if (m) await writeNeed($, m[1].trim().slice(0, 200))
-    }
     if (/(^|[^a-z])(ani|애니)\s*(사이드\s*)?(패널\s*)?(좀\s*)?(열어|띄워|보여|켜)/i.test(text)) await $.ui.open({ id: PANE, title: TITLE })
-    {
-      const own = isScriptedSession || !isPerson ? '' : personText(text)
-      const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
-      const last = fb[0]
-      if (own && last && !last.fromHistory && !last.aniId && last.text !== own && (last.after?.length ?? 0) < 2) await setFeedback($, last.at, { after: [...(last.after ?? []), excerpt(own, 80)] })
-    }
     recentPrompts.push(text)
     if (recentPrompts.length > 6) recentPrompts.shift()
-    $.clock.after(0, () => importAni($))
-    $.clock.after(0, () => settleReqs($))
-    // Cases written under the 40자 limit are walked back once more, at full length.
-    if (!(await $.store.get('caseV2'))) {
-      await save($, 'caseV2', true)
-      $.clock.after(0, async () => {
-        const fb = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
-        for (const f of fb.filter(x => !x.fromHistory && !x.aniId).slice(0, 12)) await enrichFeedback($, f.at, f.text)
-      })
-    }
-    // Lessons still without a short form get one in the background.
-    if (mineOf(await ownCards($)).some(c => c.lesson && !c.short)) $.clock.after(0, () => shorten($))
     const t0 = await $.clock.now()
     const prevIds = (await read($, sent))?.lessonIds ?? []
     draftSeq++
@@ -2326,7 +2397,11 @@ export const register: Register = on => {
     drafted = null
     if (pre) $.clock.after(0, () => analyze($, text, 'commit', prevIds, isPerson))
     submitMarks = {}
-    const result = pre ?? (await Promise.race([analyze($, text, 'submit', prevIds, isPerson), $.clock.sleep(SUBMIT_WAIT_MS).then(() => null)]))
+    // A judging that throws (no key, no host) leaves the request as it was; the chores after it still run.
+    const result = await (pre ? Promise.resolve(pre) : Promise.race([analyze($, text, 'submit', prevIds, isPerson), $.clock.sleep(SUBMIT_WAIT_MS).then(() => null)])).catch(() => {
+      submitMarks.failed = 1
+      return null
+    })
     const tJudged = await $.clock.now()
     const judgedMarks = { ...submitMarks }
     const extra = result ? await attachment($, result) : null
@@ -2334,14 +2409,8 @@ export const register: Register = on => {
     const at = await $.clock.now()
     const record = { at, prompt: text.slice(0, 200), text: extra?.text || null, lessonIds: extra?.lessonIds ?? [], reqIds: extra?.reqIds ?? [], isLate: !result, ms: at - t0, marks: { before: t0 - tEntry, ...(pre ? { draft: 1 } : judgedMarks), judged: tJudged - t0, attach: at - tJudged } }
     await update($, sent, () => record)
-    if (record.lessonIds.length && (await read($, display)).toast) {
-      const first = (await ownCards($)).find(c => c.id === record.lessonIds[0])
-      $.ui.toast(record.text
-        ? `ani · 규칙 ${record.lessonIds.length}개를 붙여 보냈어요: ${first?.short ?? first?.lesson ?? ''}`
-        : `ani · 교훈 ${record.lessonIds.length}개는 이미 대화에 있어 다시 붙이지 않았어요`, { timeoutMs: 4000 })
-    }
-    const log = ((await $.store.get('sentLog')) as (typeof record)[] | undefined) ?? []
-    await save($, 'sentLog', [record, ...log].slice(0, 20))
+    // Everything else waits until the request has gone out.
+    $.clock.after(0, () => afterSend($, text, isPerson, tEntry, record))
     return next(extra?.text ? { ...e, context: [...(e.context ?? []), extra.text] } : e)
   })
 
@@ -2395,7 +2464,7 @@ export const register: Register = on => {
   // A compaction can drop what was attached earlier: from here, attach again.
   on('session.compact', async ($, e, next) => {
     const r = await next(e)
-    await save($, 'compactSeq', ((await $.store.get('sendSeq')) as number | undefined) ?? 0)
+    await save($, 'compactSeq', ((await hotGet($, 'sendSeq')) as number | undefined) ?? 0)
     return r
   })
 
