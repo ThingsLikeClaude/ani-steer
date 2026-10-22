@@ -922,6 +922,7 @@ let casesMtime = 0
 let casesChecked = 0
 let casesWriting: Promise<unknown> = Promise.resolve()
 let casesBackedUp = 0
+let leftoversChecked = 0
 
 async function casesPath($: EngineInterface): Promise<string> {
   if (casesFile) return casesFile
@@ -955,6 +956,17 @@ async function loadCases($: EngineInterface): Promise<Feedback[]> {
   const now = await $.clock.now()
   if (casesMemo && now - casesChecked < CASES_CHECK_MS) return [...casesMemo]
   casesChecked = now
+  // A session still on an older version writes its new cases to the store: they join the file.
+  if (casesMemo && now - leftoversChecked > 60_000) {
+    leftoversChecked = now
+    const left = ((await $.store.get('feedbackLog')) as Feedback[] | undefined) ?? []
+    if (left.length) {
+      const have = new Set(casesMemo.map(f => f.at))
+      await saveCases($, [...casesMemo, ...left.filter(f => !have.has(f.at))])
+      await $.store.delete('feedbackLog')
+      return [...casesMemo]
+    }
+  }
   const stat = await $.fs.stat(path).catch(() => null)
   if (casesMemo && stat && stat.mtimeMs === casesMtime) return [...casesMemo]
   const fromFile = stat ? await readCasesFile($, path) : null

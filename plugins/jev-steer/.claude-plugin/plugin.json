@@ -1,6 +1,6 @@
 {
   "name": "jev-steer",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "ani (Agent Negative Index): 교정을 사례 → 판단 → 교훈 → 규칙 → 원칙 → 상위 목표 → 근원 욕구로 쌓고, Jev가 요청마다 해당되는 규칙을 골라 Claude에게 붙인다. 교훈은 붙이지 않는다.",
   "types": "./types/index.d.ts"
 }

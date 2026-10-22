@@ -332,4 +332,14 @@ test('cases leave the store for a file of their own once; a case another session
   expect(after.some(f => f.text.includes('배경만'))).toBe(true)
   expect(after).toHaveLength(4)
   expect(box.has('feedbackLog')).toBe(false)
+
+  // A session still on an older version records a case in the store: it joins the file within a minute.
+  box.set('feedbackLog', [{ at: 40, text: '옛 버전 세션의 교정', project: 'unknown' }])
+  await clock.advance(61_000)
+  const pane2 = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await pane2.unmount()
+  await clock.settle()
+  expect(casesOn().some(f => f.at === 40)).toBe(true)
+  expect(casesOn()).toHaveLength(5)
+  expect(box.has('feedbackLog')).toBe(false)
 })
