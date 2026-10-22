@@ -208,6 +208,13 @@ async function hotGet($: EngineInterface, key: string): Promise<unknown> {
   hot.set(key, { at: now, value })
   return value
 }
+/**
+ * A state change the request does not wait on: each one redraws the band and the
+ * pane, which took up to 0.8 s on a request (measured). The drawing still follows.
+ */
+function redrawLater<T>(p: Promise<T>) {
+  p.catch(() => undefined)
+}
 /** A write the request does not wait on: the copy changes now, the file after. */
 function saveLater($: EngineInterface, key: string, value: unknown) {
   hot.set(key, { at: Number.MAX_SAFE_INTEGER / 2, value })
@@ -1398,19 +1405,23 @@ async function recordAnswers($: EngineInterface, a: { answers: Answers; reqs: Re
  * submit: the request going out; everything.
  * commit: the request went out on a draft's judgment; record only, leave the view.
  */
+let lastHasKey: boolean | null = null
 async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'submit' | 'commit' = 'submit', prevAttached: readonly string[] = [], isPerson = true): Promise<Result | null> {
   const m0 = await $.clock.now()
   const marks: Record<string, number> = {}
   if (mode === 'submit') submitMarks = marks
   const mark = async (k: string) => { marks[k] = (await $.clock.now()) - m0 }
   const routes = await jevRoutes($, true)
-  await update($, hasKey, () => routes.length > 0)
+  if (routes.length > 0 !== lastHasKey) {
+    lastHasKey = routes.length > 0
+    redrawLater(update($, hasKey, () => routes.length > 0))
+  }
   if (!routes.length) {
     await update($, view, v => ({ ...v, error: 'Jev 키가 없어요 · OPENROUTER_API_KEY 또는 /jev-steer:ani-key로 설정' }))
     return null
   }
   const seq = mode === 'commit' ? latestSeq : ++latestSeq
-  if (mode !== 'commit') await update($, view, v => ({ ...v, isBusy: true, error: null }))
+  if (mode !== 'commit') redrawLater(update($, view, v => ({ ...v, isBusy: true, error: null })))
   const started = await $.clock.now()
   const shown = await read($, display)
   // Recorded only when the person typed it in their own session: not the engine's or the app's turn, not a script's.
@@ -1461,7 +1472,7 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
     const beatMs = (await $.clock.now()) - started
     await mark('jev')
     marks.status = res.status
-    await update($, beat, () => ({ ok: res.ok, ms: beatMs, at: started, detail: res.ok ? undefined : `HTTP ${res.status}` }))
+    redrawLater(update($, beat, () => ({ ok: res.ok, ms: beatMs, at: started, detail: res.ok ? undefined : `HTTP ${res.status}` })))
     if (!res.ok) {
       await save($, 'lastError', { status: res.status, body: res.text.slice(0, 300), at: started })
       throw new Error(res.status >= 500 ? `Jev가 잠시 응답하지 않아요 (${res.status})` : `Jev 오류 ${res.status}`)
@@ -1483,11 +1494,11 @@ async function analyze($: EngineInterface, prompt: string, mode: 'draft' | 'subm
     if (seq !== latestSeq) return null // a newer prompt is being judged; drop this stale answer
     const applied = appliedIds(judgments, candidates)
     const lastMs = (await $.clock.now()) - started
-    await update($, beat, () => ({ ok: true, ms: lastMs, at: started }))
-    await update($, view, v => {
+    redrawLater(update($, beat, () => ({ ok: true, ms: lastMs, at: started })))
+    redrawLater(update($, view, v => {
       const kept = Object.fromEntries(Object.entries(v.answers).filter(([id]) => judgments.some(j => j.id === id)))
       return { isBusy: false, isLabeled: Object.keys(kept).length > 0, answers: kept, judgments, recorded: mode === 'draft' ? v.recorded : null, error: null, lastMs, applied, weighing: [], isDraft: mode === 'draft' }
-    })
+    }))
     return { judgments, candidates, reqIds }
   } catch (err) {
     if (seq !== latestSeq) return null
@@ -1515,11 +1526,16 @@ async function loadNeeds($: EngineInterface, isHot = false): Promise<Need[]> {
 }
 
 /** The person's keys in the order to try; which service carries what is shown under 설정. */
+let lastVia: string | null = null
 async function jevRoutes($: EngineInterface, isRequest: boolean): Promise<JevRoute[]> {
   const keys = { openRouter: await $.env.get('OPENROUTER_API_KEY'), typeSafe: await $.env.get('TYPESAFE_API_KEY') }
   const forRequest = jevRoutesOf(keys, true)[0]?.name
   const forBackground = jevRoutesOf(keys, false)[0]?.name
-  await update($, jevVia, () => (!forRequest ? '' : forRequest === forBackground ? forRequest : `요청 ${forRequest} · 백그라운드 ${forBackground}`))
+  const via = !forRequest ? '' : forRequest === forBackground ? forRequest : `요청 ${forRequest} · 백그라운드 ${forBackground}`
+  if (via !== lastVia) {
+    lastVia = via
+    redrawLater(update($, jevVia, () => via))
+  }
   return jevRoutesOf(keys, isRequest)
 }
 
@@ -2393,7 +2409,7 @@ export const register: Register = on => {
     const prevIds = (await read($, sent))?.lessonIds ?? []
     draftSeq++
     const pre = drafted && drafted.text === text ? drafted.result : null
-    await update($, view, v => ({ ...v, isDraft: false }))
+    redrawLater(update($, view, v => ({ ...v, isDraft: false })))
     drafted = null
     if (pre) $.clock.after(0, () => analyze($, text, 'commit', prevIds, isPerson))
     submitMarks = {}
@@ -2408,7 +2424,7 @@ export const register: Register = on => {
     attachedReqIds = extra?.reqIds ?? []
     const at = await $.clock.now()
     const record = { at, prompt: text.slice(0, 200), text: extra?.text || null, lessonIds: extra?.lessonIds ?? [], reqIds: extra?.reqIds ?? [], isLate: !result, ms: at - t0, marks: { before: t0 - tEntry, ...(pre ? { draft: 1 } : judgedMarks), judged: tJudged - t0, attach: at - tJudged } }
-    await update($, sent, () => record)
+    redrawLater(update($, sent, () => record))
     // Everything else waits until the request has gone out.
     $.clock.after(0, () => afterSend($, text, isPerson, tEntry, record))
     return next(extra?.text ? { ...e, context: [...(e.context ?? []), extra.text] } : e)
